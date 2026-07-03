@@ -660,10 +660,20 @@ export default function App() {
   };
   const addAgent = () => spawnAgent();
 
+  // Focusing a terminal acknowledges its pending notifications.
+  const markNotifsRead = (id) => {
+    setNotifs((list) =>
+      list.some((n) => n.paneId === id && !n.read)
+        ? list.map((n) => (n.paneId === id && !n.read ? { ...n, read: true } : n))
+        : list,
+    );
+  };
+
   // User touched the pane: acknowledge the done/input glow.
   const onActivity = (id) => {
     focusedRef.current = id;
     setFocusedId(id);
+    markNotifsRead(id);
     setStatuses((s) =>
       s[id] === "done" || s[id] === "input" ? { ...s, [id]: "working" } : s,
     );
@@ -723,6 +733,7 @@ export default function App() {
     if (!pane) return;
     focusedRef.current = pane.id;
     setFocusedId(pane.id);
+    markNotifsRead(pane.id);
     const handle = termRefs.current.get(pane.id);
     handle?.focus();
     handle?.scrollIntoView?.();
