@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 pub const IDENTIFIER: &str = "com.connor.agentbench";
 const SCROLLBACK_CAP: usize = 512 * 1024;
@@ -34,6 +35,11 @@ pub struct Core {
     /// until the first message is submitted.
     pub sessions: Mutex<HashMap<u32, Vec<String>>>,
     pub colors: Mutex<HashMap<u32, String>>,
+    /// Per-pane timestamps of the last Stop hook and the last real user
+    /// keystroke. If no input followed the last "done", a needs_input event
+    /// can only be the idle ping — not an actual prompt — so it's squelched.
+    pub last_done: Mutex<HashMap<u32, Instant>>,
+    pub last_input: Mutex<HashMap<u32, Instant>>,
     pub saved: Mutex<Vec<SavedPane>>,
     /// Connected clients; every event line is fanned out to all of them.
     pub subscribers: Mutex<Vec<mpsc::Sender<String>>>,
@@ -65,6 +71,8 @@ impl Core {
             hook_port: AtomicU32::new(0),
             sessions: Mutex::new(HashMap::new()),
             colors: Mutex::new(HashMap::new()),
+            last_done: Mutex::new(HashMap::new()),
+            last_input: Mutex::new(HashMap::new()),
             saved: Mutex::new(load_saved(&config_dir)),
             subscribers: Mutex::new(Vec::new()),
             config_dir,
@@ -315,6 +323,11 @@ pub fn create_pane(
 }
 
 pub fn write_pane(core: &Core, id: u32, data: &str) -> Result<(), String> {
+    // Focus in/out reports (sent when the user merely clicks into the pane)
+    // are not real input; don't let them re-arm the needs_input badge.
+    if data != "\u{1b}[I" && data != "\u{1b}[O" {
+        core.last_input.lock().unwrap().insert(id, Instant::now());
+    }
     let mut panes = core.panes.lock().unwrap();
     let pane = panes.get_mut(&id).ok_or("no such pane")?;
     pane.writer
@@ -479,7 +492,22 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                                     .map(|m| m.contains("waiting for your input"))
                             })
                             .unwrap_or(false);
-                    if !idle && (kind == "done" || kind == "needs_input") {
+                    if kind == "done" {
+                        core.last_done.lock().unwrap().insert(id, Instant::now());
+                    }
+                    // Belt and braces for the idle ping: if the user hasn't
+                    // typed since the turn ended, nothing new can be waiting
+                    // on them — squelch regardless of the message text.
+                    let stale = kind == "needs_input" && {
+                        let done = core.last_done.lock().unwrap().get(&id).copied();
+                        let input = core.last_input.lock().unwrap().get(&id).copied();
+                        match (done, input) {
+                            (Some(d), Some(i)) => i < d,
+                            (Some(_), None) => true,
+                            _ => false,
+                        }
+                    };
+                    if !idle && !stale && (kind == "done" || kind == "needs_input") {
                         core.broadcast(&json!({ "ev": "agent-event", "id": id, "kind": kind }));
                     }
                 }
