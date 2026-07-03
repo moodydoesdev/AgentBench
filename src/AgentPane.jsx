@@ -151,6 +151,14 @@ function XtermInner({ id, initialData, register, sendData, onTitle, termTheme })
     // keydown with stopPropagation), so no custom key handler is needed here.
     term.open(containerRef.current);
 
+    // Size the grid before replaying scrollback — otherwise initialData
+    // reflows at xterm's default 80x24 and restores garbled.
+    try {
+      fit.fit();
+    } catch {
+      /* ignore mid-layout fit races */
+    }
+
     // Re-measure glyphs once the webfont is ready; xterm caches cell
     // metrics at open() and would otherwise keep fallback-font widths.
     document.fonts.load('13px "FiraCode Nerd Font Mono"').then(() => {
@@ -172,15 +180,52 @@ function XtermInner({ id, initialData, register, sendData, onTitle, termTheme })
     });
     term.onTitleChange(onTitle);
 
+    // onResize only fires when dims change, and a single dropped resize_pane
+    // (errors are swallowed broker-side too) leaves the pty permanently
+    // desynced — Claude paints for the wrong width until the user manually
+    // resizes. After each resize storm settles, resend current dims
+    // unconditionally; the pty resize is idempotent.
+    //
+    // Project switches hide panes with display:none. Output written while
+    // hidden lands in a 0x0 renderer, and on reveal fit() resolves to the
+    // same cols/rows — no resize event, so xterm never repaints the stale
+    // rows. On the hidden→visible edge, refresh the viewport AND flap the
+    // pty one row (rows-1 → rows): the SIGWINCH pair makes a TUI whose
+    // screen went bad while hidden repaint itself, same as a manual resize.
+    let resyncTimer = null;
+    let wasHidden = false;
     const ro = new ResizeObserver(() => {
       const el = containerRef.current;
-      if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
-        try {
-          fit.fit();
-        } catch {
-          /* ignore mid-layout fit races */
-        }
+      if (!el) return;
+      if (el.offsetWidth === 0 || el.offsetHeight === 0) {
+        wasHidden = true;
+        return;
       }
+      try {
+        fit.fit();
+      } catch {
+        /* ignore mid-layout fit races */
+      }
+      if (wasHidden) {
+        wasHidden = false;
+        term.refresh(0, term.rows - 1);
+        invoke("resize_pane", {
+          id,
+          cols: term.cols,
+          rows: Math.max(1, term.rows - 1),
+        })
+          .then(() =>
+            invoke("resize_pane", { id, cols: term.cols, rows: term.rows }),
+          )
+          .catch(() => {});
+      }
+      clearTimeout(resyncTimer);
+      resyncTimer = setTimeout(() => {
+        invoke("resize_pane", { id, cols: term.cols, rows: term.rows }).catch(
+          () => {},
+        );
+        term.refresh(0, term.rows - 1);
+      }, 150);
     });
     ro.observe(containerRef.current);
 
@@ -192,6 +237,7 @@ function XtermInner({ id, initialData, register, sendData, onTitle, termTheme })
 
     return () => {
       register(null);
+      clearTimeout(resyncTimer);
       ro.disconnect();
       unlisten.then((f) => f());
       termRef.current = null;
