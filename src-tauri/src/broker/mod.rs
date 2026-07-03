@@ -52,6 +52,7 @@ pub struct Pane {
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     cwd: String,
+    harness: String,
     buffer: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -59,6 +60,46 @@ pub struct Pane {
 pub struct SavedPane {
     pub cwd: String,
     pub session_id: Option<String>,
+    /// Harness id (claude/opencode/custom …); None in old files = claude.
+    #[serde(default)]
+    pub harness: Option<String>,
+}
+
+/// How to launch an agent in a pane. Sent by the frontend on `create`; built
+/// from the presets + user-defined custom harnesses in Settings.
+pub struct HarnessSpec {
+    pub id: String,
+    /// Shell command line, e.g. "claude --dangerously-skip-permissions".
+    pub command: String,
+    /// Resume-args template appended on restore, e.g. "--resume {session_id}".
+    pub resume: Option<String>,
+    /// Claude Code integration: hook settings file, session tracking, theme.
+    pub claude: bool,
+}
+
+impl HarnessSpec {
+    fn from_value(v: &Value) -> Option<HarnessSpec> {
+        let command = v["command"].as_str()?.trim().to_string();
+        if command.is_empty() {
+            return None;
+        }
+        Some(HarnessSpec {
+            id: v["id"].as_str().unwrap_or("custom").to_string(),
+            command,
+            resume: v["resume"].as_str().map(String::from),
+            claude: v["claude"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// Fallback when a client sends no harness (old frontends, restores).
+    fn claude_default() -> HarnessSpec {
+        HarnessSpec {
+            id: "claude".into(),
+            command: "claude --dangerously-skip-permissions".into(),
+            resume: Some("--resume {session_id}".into()),
+            claude: true,
+        }
+    }
 }
 
 impl Core {
@@ -118,6 +159,7 @@ fn persist_panes(core: &Core) {
                     .find(|sid| session_exists(core, &p.cwd, sid))
                     .cloned()
             }),
+            harness: Some(p.harness.clone()),
         })
         .collect();
     let path = core.config_dir.join("panes.json");
@@ -187,41 +229,44 @@ fn write_hook_settings(
     Ok(path)
 }
 
-/// Launch claude through a login shell so it gets the user's real PATH even
-/// when launched from Finder/Explorer.
-fn claude_command(
+/// Launch the harness through a login shell so it gets the user's real PATH
+/// even when launched from Finder/Explorer. `settings_path` is Some only for
+/// Claude — it carries the hook wiring via `--settings`.
+fn harness_command(
     cwd: &str,
-    settings_path: &PathBuf,
+    spec: &HarnessSpec,
+    settings_path: Option<&PathBuf>,
     resume: Option<&str>,
     pane_id: u32,
     hook_port: u16,
 ) -> CommandBuilder {
+    let mut line = spec.command.clone();
+    if let Some(path) = settings_path {
+        #[cfg(unix)]
+        line.push_str(&format!(" --settings '{}'", path.display()));
+        #[cfg(windows)]
+        line.push_str(&format!(" --settings \"{}\"", path.display()));
+    }
     // session ids are uuids from our own hooks; keep shell-safe chars only
-    let resume_arg = resume
-        .filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-        .map(|s| format!(" --resume {}", s))
-        .unwrap_or_default();
+    if let (Some(tpl), Some(sid)) = (&spec.resume, resume) {
+        if sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            line.push(' ');
+            line.push_str(&tpl.replace("{session_id}", sid));
+        }
+    }
     let mut cmd;
     #[cfg(unix)]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         cmd = CommandBuilder::new(shell);
         cmd.arg("-lc");
-        cmd.arg(format!(
-            "exec claude --dangerously-skip-permissions --settings '{}'{}",
-            settings_path.display(),
-            resume_arg
-        ));
+        cmd.arg(format!("exec {}", line));
     }
     #[cfg(windows)]
     {
         cmd = CommandBuilder::new("cmd.exe");
         cmd.arg("/C");
-        cmd.arg(format!(
-            "claude --dangerously-skip-permissions --settings \"{}\"{}",
-            settings_path.display(),
-            resume_arg
-        ));
+        cmd.arg(line);
     }
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
@@ -240,12 +285,19 @@ pub fn create_pane(
     rows: u16,
     resume: Option<String>,
     theme: Option<String>,
+    harness: Option<HarnessSpec>,
 ) -> Result<u32, String> {
+    let spec = harness.unwrap_or_else(HarnessSpec::claude_default);
     let id = core.next_id.fetch_add(1, Ordering::SeqCst);
     let port = core.hook_port.load(Ordering::SeqCst) as u16;
-    let settings_path = write_hook_settings(core, id, port, theme.as_deref())?;
+    // hook wiring is Claude-only; other harnesses get a plain terminal
+    let settings_path = if spec.claude {
+        Some(write_hook_settings(core, id, port, theme.as_deref())?)
+    } else {
+        None
+    };
     // resume only sessions that actually exist on disk; otherwise start fresh
-    let resume = resume.filter(|sid| session_exists(core, &cwd, sid));
+    let resume = resume.filter(|sid| spec.claude && session_exists(core, &cwd, sid));
     // seed the history with the resumed sid so persist_panes doesn't write
     // session_id: null in the window before the first hook event arrives
     if let Some(sid) = &resume {
@@ -264,7 +316,14 @@ pub fn create_pane(
 
     let mut child = pair
         .slave
-        .spawn_command(claude_command(&cwd, &settings_path, resume.as_deref(), id, port))
+        .spawn_command(harness_command(
+            &cwd,
+            &spec,
+            settings_path.as_ref(),
+            resume.as_deref(),
+            id,
+            port,
+        ))
         .map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -315,6 +374,7 @@ pub fn create_pane(
             master: pair.master,
             killer,
             cwd,
+            harness: spec.id,
             buffer,
         },
     );
@@ -365,6 +425,7 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
             json!({
                 "id": id,
                 "cwd": p.cwd,
+                "harness": p.harness,
                 "color": colors.get(id),
                 "buffer": base64::engine::general_purpose::STANDARD.encode(&buf[..]),
             })
@@ -529,6 +590,7 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
                 req["rows"].as_u64().unwrap_or(30) as u16,
                 req["resume"].as_str().map(String::from),
                 req["theme"].as_str().map(String::from),
+                HarnessSpec::from_value(&req["harness"]),
             );
             Some(match res {
                 Ok(id) => json!({ "result": id }),

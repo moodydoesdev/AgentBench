@@ -16,7 +16,14 @@ import AgentPane from "./AgentPane";
 const PlanOverlay = lazy(() => import("./plan/PlanOverlay.jsx"));
 import WindowControls from "./components/WindowControls";
 import { getTheme, terminalThemeFromVars, themeVars } from "./themes";
-import { SETTINGS_KEY, loadSettings } from "./settings";
+import {
+  PROBEABLE,
+  SETTINGS_KEY,
+  getHarness,
+  getHarnesses,
+  harnessBin,
+  loadSettings,
+} from "./settings";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -24,8 +31,14 @@ import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu";
-import { Bell, GearSix, Plus, FileText, X } from "@phosphor-icons/react";
+import { Bell, CaretDown, GearSix, Plus, FileText, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
 import notifyWav from "./assets/notify.wav";
 import Logo from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
@@ -286,17 +299,21 @@ export default function App() {
     let target = panesRef.current.find((p) => p.id === draft.agentId);
     if (!target) {
       try {
+        // plan requests always spawn Claude — the agentbench-plan skill is
+        // Claude-only for now
+        const harness = getHarness(settingsRef.current, "claude");
         const id = await invoke("create_pane", {
           cwd: activePathRef.current,
           cols: 100,
           rows: 30,
           resume: null,
           theme: getTheme(settingsRef.current.theme).claudeTheme ?? null,
+          harness,
         });
         target = {
           id,
           projectPath: activePathRef.current,
-          label: `Agent ${id}`,
+          label: `${harness.name} ${id}`,
         };
         setPanes((p) => [...p, target]);
         setStatuses((s) => ({ ...s, [id]: "working" }));
@@ -346,7 +363,7 @@ export default function App() {
             live.map((p) => ({
               id: p.id,
               projectPath: p.cwd,
-              label: `Agent ${p.id}`,
+              label: `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
             })),
           );
           setStatuses(Object.fromEntries(live.map((p) => [p.id, "working"])));
@@ -356,14 +373,24 @@ export default function App() {
         const restored = [];
         for (const s of saved) {
           try {
+            // resolve against current settings; a deleted custom harness
+            // falls back to Claude
+            const harness = getHarness(settingsRef.current, s.harness ?? "claude");
             const id = await invoke("create_pane", {
               cwd: s.cwd,
               cols: 100,
               rows: 30,
               resume: s.session_id ?? null,
-              theme: getTheme(settingsRef.current.theme).claudeTheme ?? null,
+              theme: harness.claude
+                ? getTheme(settingsRef.current.theme).claudeTheme ?? null
+                : null,
+              harness,
             });
-            restored.push({ id, projectPath: s.cwd, label: `Agent ${id}` });
+            restored.push({
+              id,
+              projectPath: s.cwd,
+              label: `${harness.name} ${id}`,
+            });
           } catch (err) {
             console.error("failed to restore pane in", s.cwd, err);
           }
@@ -496,8 +523,8 @@ export default function App() {
     new WebviewWindow("settings", {
       url: "index.html?window=settings",
       title: "Settings",
-      width: 780,
-      height: 560,
+      width: 1560,
+      height: 910,
       minWidth: 640,
       minHeight: 440,
       dragDropEnabled: false,
@@ -556,19 +583,56 @@ export default function App() {
     });
   };
 
+  // Which harness binaries exist on PATH (Set of bin names); null = unprobed.
+  // Probed at startup and when the harness dropdown opens, so freshly
+  // installed agents lose their badge without an app restart.
+  const [harnessAvail, setHarnessAvail] = useState(null);
+  const harnessMissing = (h) =>
+    harnessAvail != null &&
+    PROBEABLE.test(harnessBin(h)) &&
+    !harnessAvail.has(harnessBin(h));
+  const refreshHarnessAvail = () => {
+    const bins = [
+      ...new Set(
+        getHarnesses(settingsRef.current)
+          .map(harnessBin)
+          .filter((b) => PROBEABLE.test(b)),
+      ),
+    ];
+    if (!bins.length) return;
+    invoke("check_binaries", { bins })
+      .then((found) => setHarnessAvail(new Set(found)))
+      .catch(() => {});
+  };
+  useEffect(refreshHarnessAvail, []);
+
   // Spawn an agent; with a direction, insert it so it lands beside/above/
   // below the focused pane in the grid (Ghostty-style directional splits).
   // Row math mirrors the arrow-key nav: index ± grid columns.
-  const spawnAgent = async (dir) => {
+  const spawnAgent = async (dir, harnessId) => {
     if (!activePath) return;
+    const harness = getHarness(
+      settingsRef.current,
+      harnessId ?? settingsRef.current.defaultHarness,
+    );
+    // missing binary would exec into "command not found" and the pane dies —
+    // route to Settings → Agents instead
+    if (harnessMissing(harness)) {
+      openSettings();
+      return;
+    }
     const id = await invoke("create_pane", {
       cwd: activePath,
       cols: 100,
       rows: 30,
       resume: null,
-      theme: getTheme(settingsRef.current.theme).claudeTheme ?? null,
+      // theme only means something to Claude's settings file
+      theme: harness.claude
+        ? getTheme(settingsRef.current.theme).claudeTheme ?? null
+        : null,
+      harness,
     });
-    const pane = { id, projectPath: activePath, label: `Agent ${id}` };
+    const pane = { id, projectPath: activePath, label: `${harness.name} ${id}` };
     setPanes((p) => {
       const inProject = p.filter((x) => x.projectPath === activePath);
       const pos = inProject.findIndex((x) => x.id === focusedRef.current);
@@ -794,6 +858,20 @@ export default function App() {
     const cmds = [];
     if (activeProject) {
       cmds.push({ id: "new-agent", label: "New Agent", action: addAgent });
+      for (const h of getHarnesses(settings)) {
+        const missing = harnessMissing(h);
+        cmds.push({
+          id: `new-agent-${h.id}`,
+          group: "New Agent",
+          label: h.name,
+          hint: missing
+            ? "install in Settings…"
+            : h.id === (settings.defaultHarness ?? "claude")
+              ? "default"
+              : undefined,
+          action: () => (missing ? openSettings() : spawnAgent(undefined, h.id)),
+        });
+      }
       if (activePanes.length > 0) {
         for (const dir of ["left", "right", "up", "down"]) {
           cmds.push({
@@ -853,7 +931,7 @@ export default function App() {
       });
     }
     return cmds;
-  }, [cmdMenuOpen, activeProject, activePath, projects, activePanes, titles, projectPlans, showPlans, settings.theme]);
+  }, [cmdMenuOpen, activeProject, activePath, projects, activePanes, titles, projectPlans, showPlans, settings.theme, settings.defaultHarness, settings.customHarnesses]);
 
   return (
     <div className="app">
@@ -942,9 +1020,47 @@ export default function App() {
             <GearSix size={15} />
           </button>
           {activeProject && (
-            <button className="btn-new" onClick={addAgent}>
-              <Plus size={13} weight="bold" /> New Agent
-            </button>
+            <div className="btn-new-split">
+              <button className="btn-new" onClick={addAgent}>
+                <Plus size={13} weight="bold" /> New{" "}
+                {getHarness(settings, settings.defaultHarness).name}
+              </button>
+              <DropdownMenu onOpenChange={(o) => o && refreshHarnessAvail()}>
+                <DropdownMenuTrigger asChild>
+                  <button className="btn-new btn-new-caret" title="Spawn a different agent">
+                    <CaretDown size={11} weight="bold" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[190px]">
+                  {getHarnesses(settings).map((h) => {
+                    const missing = harnessMissing(h);
+                    return (
+                      <DropdownMenuItem
+                        key={h.id}
+                        // spawning a missing binary just kills the pane —
+                        // send the user to Settings → Agents to install it
+                        onSelect={() =>
+                          missing ? openSettings() : spawnAgent(undefined, h.id)
+                        }
+                      >
+                        {h.name}
+                        {missing ? (
+                          <span className="ml-auto text-xs opacity-50">
+                            install in Settings…
+                          </span>
+                        ) : (
+                          h.id === (settings.defaultHarness ?? "claude") && (
+                            <span className="ml-auto text-xs opacity-50">
+                              default
+                            </span>
+                          )
+                        )}
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           )}
           {IS_WINDOWS && <WindowControls />}
         </div>
@@ -1036,7 +1152,7 @@ export default function App() {
                 <div className="empty-glyph">▮▮▮</div>
                 <h1>Agent workspace</h1>
                 <p>
-                  Add a project folder, then spawn Claude agents inside it. When
+                  Add a project folder, then spawn coding agents inside it. When
                   an agent finishes or needs you, its pane glows and you hear a
                   ping.
                 </p>

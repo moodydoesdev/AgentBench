@@ -294,6 +294,24 @@ body {
   background: rgba(var(--green), 0.22);
 }
 
+/* split New Agent button: main action + harness-picker caret */
+.btn-new-split {
+  display: inline-flex;
+}
+
+.btn-new-split .btn-new:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: none;
+}
+
+.btn-new-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding: 6px 7px;
+  border-left: 1px solid rgba(var(--green), 0.35);
+}
+
 /* settings */
 .btn-icon {
   display: inline-flex;
@@ -656,6 +674,52 @@ body {
 
 .btn-sm:hover {
   border-color: rgba(var(--hilite), 0.2);
+}
+
+/* Settings → Agents: custom harness editor */
+.harness-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 0;
+}
+
+.harness-row + .harness-row {
+  border-top: 1px solid rgba(var(--hilite), 0.05);
+}
+
+.harness-input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-head);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  outline: none;
+  min-width: 0;
+}
+
+.harness-input:focus {
+  border-color: rgba(var(--hilite), 0.3);
+}
+
+.harness-input.name {
+  flex: 0 0 120px;
+}
+
+.harness-input.cmd {
+  flex: 1;
+}
+
+.harness-status {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.harness-status.ok {
+  color: rgb(var(--green));
 }
 
 .volume-slider {

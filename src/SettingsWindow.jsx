@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -6,10 +7,17 @@ import {
   BellSimple,
   Keyboard,
   PaintBrushBroad,
+  Robot,
   SquaresFour,
 } from "@phosphor-icons/react";
 import { THEMES, themeVars } from "./themes";
-import { SETTINGS_KEY, loadSettings } from "./settings";
+import {
+  PROBEABLE,
+  SETTINGS_KEY,
+  getHarnesses,
+  harnessBin,
+  loadSettings,
+} from "./settings";
 import { themeVarsFromImage } from "./lib/autoTheme";
 import { formatHotkey, hotkeyFromEvent } from "./lib/hotkey";
 import WindowControls from "./components/WindowControls";
@@ -130,6 +138,7 @@ function Slider({ value, min = 0, max = 1, step = 0.05, onChange, onCommit }) {
 const SECTIONS = [
   { id: "appearance", label: "Appearance", icon: PaintBrushBroad },
   { id: "workspace", label: "Workspace", icon: SquaresFour },
+  { id: "agents", label: "Agents", icon: Robot },
   { id: "notifications", label: "Notifications", icon: BellSimple },
   { id: "keyboard", label: "Keyboard", icon: Keyboard },
 ];
@@ -137,12 +146,46 @@ const SECTIONS = [
 export default function SettingsWindow() {
   const [settings, setSettings] = useState(loadSettings);
   const [section, setSection] = useState("appearance");
+  const [avail, setAvail] = useState(null); // Set of bins found on PATH
+  const [installing, setInstalling] = useState({}); // harness id -> true
+  const [installErr, setInstallErr] = useState({}); // harness id -> message
 
   const set = (patch) => {
     const next = { ...settings, ...patch };
     setSettings(next);
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
     emit("settings-changed", next).catch(() => {});
+  };
+
+  const probeHarnesses = () => {
+    const bins = [
+      ...new Set(
+        getHarnesses(loadSettings())
+          .map(harnessBin)
+          .filter((b) => PROBEABLE.test(b)),
+      ),
+    ];
+    if (!bins.length) return;
+    invoke("check_binaries", { bins })
+      .then((found) => setAvail(new Set(found)))
+      .catch(() => {});
+  };
+
+  // probe when the Agents section is opened, not on hidden-window preload
+  useEffect(() => {
+    if (section === "agents") probeHarnesses();
+  }, [section]);
+
+  const installHarness = async (h) => {
+    setInstalling((m) => ({ ...m, [h.id]: true }));
+    setInstallErr(({ [h.id]: _gone, ...rest }) => rest);
+    try {
+      await invoke("install_harness", { command: h.install });
+    } catch (e) {
+      setInstallErr((m) => ({ ...m, [h.id]: String(e) }));
+    }
+    setInstalling((m) => ({ ...m, [h.id]: false }));
+    probeHarnesses();
   };
 
   // Mirror the main window's theming so this window matches instantly.
@@ -404,6 +447,124 @@ export default function SettingsWindow() {
                   ]}
                   onChange={(v) => set({ engine: v })}
                 />
+              </Row>
+            </Card>
+          </section>
+        )}
+
+        {section === "agents" && (
+          <section className="settings-section">
+            <h2>Agents</h2>
+            <Card title="Default agent">
+              <Row
+                title="New Agent spawns"
+                sub="Used by the New Agent button, splits and restored panes. Status glow, resume and plan panes are Claude-only for now — other agents run as plain terminals."
+                stack
+              >
+                <Segmented
+                  value={settings.defaultHarness ?? "claude"}
+                  options={getHarnesses(settings).map((h) => [h.id, h.name])}
+                  onChange={(v) => set({ defaultHarness: v })}
+                />
+              </Row>
+            </Card>
+            <Card title="Installed">
+              {getHarnesses(settings).map((h) => {
+                const bin = harnessBin(h);
+                const probeable = PROBEABLE.test(bin);
+                const ok = !probeable || avail?.has(bin);
+                return (
+                  <Row
+                    key={h.id}
+                    title={h.name}
+                    sub={installErr[h.id] ?? (probeable ? bin : h.command)}
+                  >
+                    {avail == null || ok ? (
+                      <span className="harness-status ok">
+                        {avail == null ? "…" : "installed"}
+                      </span>
+                    ) : h.install ? (
+                      <button
+                        className="btn-sm"
+                        disabled={!!installing[h.id]}
+                        onClick={() => installHarness(h)}
+                      >
+                        {installing[h.id] ? "Installing…" : "Install"}
+                      </button>
+                    ) : (
+                      <span className="harness-status">not found</span>
+                    )}
+                  </Row>
+                );
+              })}
+            </Card>
+            <Card title="Custom agents">
+              {(settings.customHarnesses ?? []).map((h) => (
+                <div className="harness-row" key={h.id}>
+                  <input
+                    className="harness-input name"
+                    value={h.name}
+                    placeholder="Name"
+                    spellCheck={false}
+                    onChange={(ev) =>
+                      set({
+                        customHarnesses: settings.customHarnesses.map((x) =>
+                          x.id === h.id ? { ...x, name: ev.target.value } : x,
+                        ),
+                      })
+                    }
+                  />
+                  <input
+                    className="harness-input cmd"
+                    value={h.command}
+                    placeholder="my-agent --flags"
+                    spellCheck={false}
+                    onChange={(ev) =>
+                      set({
+                        customHarnesses: settings.customHarnesses.map((x) =>
+                          x.id === h.id ? { ...x, command: ev.target.value } : x,
+                        ),
+                      })
+                    }
+                  />
+                  <button
+                    className="btn-sm"
+                    onClick={() => {
+                      const patch = {
+                        customHarnesses: settings.customHarnesses.filter(
+                          (x) => x.id !== h.id,
+                        ),
+                      };
+                      if (settings.defaultHarness === h.id)
+                        patch.defaultHarness = "claude";
+                      set(patch);
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <Row
+                title="Add custom agent"
+                sub="Any CLI on your PATH — launched in a login shell inside the project folder"
+              >
+                <button
+                  className="btn-sm"
+                  onClick={() =>
+                    set({
+                      customHarnesses: [
+                        ...(settings.customHarnesses ?? []),
+                        {
+                          id: `custom-${crypto.randomUUID().slice(0, 8)}`,
+                          name: "",
+                          command: "",
+                        },
+                      ],
+                    })
+                  }
+                >
+                  Add
+                </button>
               </Row>
             </Card>
           </section>

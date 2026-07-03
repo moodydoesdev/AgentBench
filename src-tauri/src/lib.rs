@@ -162,9 +162,11 @@ fn create_pane(
     rows: u16,
     resume: Option<String>,
     theme: Option<String>,
+    harness: Option<Value>,
 ) -> Result<u32, String> {
     let v = client.request(json!({
-        "op": "create", "cwd": cwd, "cols": cols, "rows": rows, "resume": resume, "theme": theme
+        "op": "create", "cwd": cwd, "cols": cols, "rows": rows, "resume": resume,
+        "theme": theme, "harness": harness
     }))?;
     v.as_u64().map(|x| x as u32).ok_or("bad response".into())
 }
@@ -263,6 +265,94 @@ fn read_file_base64(path: String) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Which of `bins` exist on the user's PATH. Probed through a login shell so
+/// the answer matches what a spawned pane would actually find. Returns the
+/// subset that was found.
+#[tauri::command]
+fn check_binaries(bins: Vec<String>) -> Vec<String> {
+    // plain binary names only — no shell metacharacters, no $VARS
+    let safe: Vec<String> = bins
+        .into_iter()
+        .filter(|b| {
+            !b.is_empty()
+                && b.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        })
+        .collect();
+    if safe.is_empty() {
+        return Vec::new();
+    }
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let script = format!(
+            "for b in {}; do command -v \"$b\" >/dev/null 2>&1 && printf '%s\\n' \"$b\"; done",
+            safe.join(" ")
+        );
+        std::process::Command::new(shell)
+            .arg("-lc")
+            .arg(script)
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(windows)]
+    {
+        safe.into_iter()
+            .filter(|b| {
+                std::process::Command::new("where")
+                    .arg(b)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+}
+
+/// Run a harness's install command (Settings → Agents). Login shell so npm/
+/// brew/etc are on PATH. Async: npm installs take a while and must not block
+/// the main thread. Returns combined output on failure so the error is
+/// actionable.
+#[tauri::command]
+async fn install_harness(command: String) -> Result<(), String> {
+    let out;
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        out = std::process::Command::new(shell)
+            .arg("-lc")
+            .arg(&command)
+            .output()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(windows)]
+    {
+        out = std::process::Command::new("cmd.exe")
+            .arg("/C")
+            .arg(&command)
+            .output()
+            .map_err(|e| e.to_string())?;
+    }
+    if out.status.success() {
+        Ok(())
+    } else {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // last lines carry the actual npm/brew error
+        let tail: Vec<&str> = text.lines().rev().take(6).collect();
+        Err(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+    }
+}
+
 /// Install/refresh the bundled plan-authoring skill into ~/.claude/skills so
 /// agents spawned in panes know how to publish visual plans.
 #[tauri::command]
@@ -349,7 +439,9 @@ pub fn run() {
             read_plan,
             list_plans,
             read_file_base64,
-            sync_plan_skill
+            sync_plan_skill,
+            check_binaries,
+            install_harness
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
