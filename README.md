@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-8f4eea">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-8f4eea">
   <img alt="Built with Tauri" src="https://img.shields.io/badge/built%20with-Tauri%202-6a45e7">
   <img alt="React" src="https://img.shields.io/badge/UI-React%2019-4507a1">
 </p>
@@ -48,6 +48,9 @@ miss, and makes everything in between effortless.
   terminal. Review, comment, and send feedback without leaving the app.
 - **Themes** — nine color schemes from Midnight to Solarized Light, applied
   across the whole app *and* inside every terminal.
+- **Auto-updates** — signed updates delivered straight from GitHub Releases.
+  The app checks on launch, installs in place, and restarting brings every
+  agent back exactly where it was.
 
 ## Status at a glance
 

@@ -16,6 +16,11 @@ const PlanTestHarness =
     ? lazy(() => import("./plan/PlanTestHarness.jsx"))
     : null;
 
+// Auto-update: main window only, packaged builds only (dev has no updater).
+if (!view && !import.meta.env.DEV && "__TAURI_INTERNALS__" in window) {
+  import("./lib/updater.js").then(({ checkForUpdates }) => checkForUpdates());
+}
+
 ReactDOM.createRoot(document.getElementById("root")).render(
   <Suspense fallback={null}>
     {PlanTestHarness ? (
