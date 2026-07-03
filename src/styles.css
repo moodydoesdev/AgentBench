@@ -394,10 +394,20 @@ body {
 }
 
 .notif-empty {
-  padding: 18px 12px;
+  padding: 20px 12px;
   text-align: center;
   color: var(--text-dim);
   font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.notif-empty-mark {
+  height: 22px;
+  width: auto;
+  opacity: 0.35;
 }
 
 .notif-item {
@@ -882,6 +892,27 @@ body {
   flex: 1;
   display: grid;
   place-items: center;
+  position: relative;
+  overflow: hidden;
+}
+
+/* soft accent bloom behind the lockup — keeps big empty areas from
+   feeling like a dead void */
+.empty::before {
+  content: "";
+  position: absolute;
+  width: 640px;
+  height: 640px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -58%);
+  background: radial-gradient(
+    circle,
+    rgba(var(--green), 0.07) 0%,
+    rgba(var(--green), 0.025) 40%,
+    transparent 68%
+  );
+  pointer-events: none;
 }
 
 .empty-inner {
@@ -891,13 +922,21 @@ body {
   flex-direction: column;
   gap: 14px;
   align-items: center;
+  position: relative;
 }
 
-.empty-glyph {
-  font-family: var(--font-mono);
-  color: rgb(var(--green));
-  letter-spacing: 0.3em;
-  font-size: 22px;
+.empty-logo {
+  width: min(340px, 70vw);
+  height: auto;
+  margin-bottom: 6px;
+  filter: drop-shadow(0 0 24px rgba(var(--green), 0.18));
+}
+
+.empty-mark {
+  height: 52px;
+  width: auto;
+  margin-bottom: 4px;
+  filter: drop-shadow(0 0 18px rgba(var(--green), 0.25));
 }
 
 .empty h1 {
@@ -1621,10 +1660,21 @@ body.bg-image .pane-term.wterm-host .wterm {
 }
 
 .plan-rail-empty {
-  padding: 14px 10px;
+  padding: 18px 10px;
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.rail-empty-mark {
+  height: 20px;
+  width: auto;
+  opacity: 0.35;
 }
 
 .btn-icon.active {
@@ -1837,4 +1887,87 @@ body.bg-image .pane-term.wterm-host .wterm {
   color: rgb(var(--blue));
   border-color: rgba(var(--blue), 0.5);
   background: rgba(var(--blue), 0.08);
+}
+
+/* ── run commands ─────────────────────────────────── */
+
+/* compact variant of the composer modal for the command editor */
+.composer.runcmd {
+  width: min(620px, calc(100vw - 96px));
+  height: auto;
+  max-height: 80vh;
+}
+
+.runcmd-labels {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  margin-bottom: 6px;
+}
+
+.runcmd-labels :first-child {
+  flex: 0 0 150px;
+}
+
+.runcmd-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.runcmd-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runcmd-name {
+  flex: 0 0 150px;
+}
+
+.runcmd-cmd {
+  flex: 1;
+  font-family: "FiraCode Nerd Font Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.runcmd-row .btn-icon {
+  flex: none;
+}
+
+.runcmd-add {
+  align-self: flex-start;
+  margin-top: 10px;
+}
+
+.runcmd-default {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  flex: none;
+}
+
+/* topbar Run button: green pulse while a hidden run pane is live */
+.run-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgb(var(--green));
+  animation: pulse-dot 2s ease-in-out infinite;
+  margin-left: 2px;
+  flex: none;
+}
+
+/* run pane chrome */
+.pane-run .pane-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pane-run-glyph {
+  color: rgb(var(--green));
+  flex: none;
 }

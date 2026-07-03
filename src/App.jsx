@@ -31,16 +31,18 @@ import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu";
-import { Bell, CaretDown, GearSix, Plus, FileText, X } from "@phosphor-icons/react";
+import { Bell, CaretDown, GearSix, Play, Plus, FileText, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import RunCommandsDialog from "./RunCommandsDialog";
 import notifyWav from "./assets/notify.wav";
-import Logo from "./components/Logo";
+import Logo, { LogoMark } from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
 import PlanComposer from "./PlanComposer";
 import { matchesHotkey } from "./lib/hotkey";
@@ -100,6 +102,7 @@ export default function App() {
   const [cmdMenuOpen, setCmdMenuOpen] = useState(false);
   const [notifs, setNotifs] = useState([]); // {key, paneId, kind, label, project, projectPath, ts, read}
   const [notifOpen, setNotifOpen] = useState(false);
+  const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
   const renameInputRef = useRef(null);
 
   const panesRef = useRef(panes);
@@ -361,11 +364,22 @@ export default function App() {
             ),
           );
           setPanes(
-            live.map((p) => ({
-              id: p.id,
-              projectPath: p.cwd,
-              label: `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
-            })),
+            live.map((p) =>
+              // run panes reattach as run panes — getHarness would fall back
+              // to Claude for the unknown "run:*" id and mislabel them
+              (p.harness ?? "").startsWith("run:")
+                ? {
+                    id: p.id,
+                    projectPath: p.cwd,
+                    label: p.harness.slice(4) || "run",
+                    kind: "run",
+                  }
+                : {
+                    id: p.id,
+                    projectPath: p.cwd,
+                    label: `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
+                  },
+            ),
           );
           setStatuses(Object.fromEntries(live.map((p) => [p.id, "working"])));
         }
@@ -373,6 +387,9 @@ export default function App() {
         const saved = await invoke("saved_panes");
         const restored = [];
         for (const s of saved) {
+          // never auto-restart dev servers on app relaunch (and getHarness
+          // would silently resurrect them as Claude agents)
+          if ((s.harness ?? "").startsWith("run:")) continue;
           try {
             // resolve against current settings; a deleted custom harness
             // falls back to Claude
@@ -497,6 +514,15 @@ export default function App() {
       setStatuses((s) =>
         e.payload.id in s ? { ...s, [e.payload.id]: "exited" } : s,
       );
+      // a run pane that dies while hidden surfaces its crash logs instead of
+      // staying invisible behind a green dot
+      setPanes((ps) =>
+        ps.some((p) => p.id === e.payload.id && p.hidden)
+          ? ps.map((p) =>
+              p.id === e.payload.id ? { ...p, hidden: false } : p,
+            )
+          : ps,
+      );
     });
 
     const unColor = listen("pane-color", (e) => {
@@ -583,6 +609,81 @@ export default function App() {
       if (path === activePath) setActivePath(next[0]?.path);
       return next;
     });
+  };
+
+  const updateProject = (path, patch) =>
+    setProjects((ps) => ps.map((p) => (p.path === path ? { ...p, ...patch } : p)));
+
+  // Run a project command (Settings-free: commands live on the project entry).
+  // A run pane is just a pane with an ad-hoc harness spec — the broker already
+  // launches arbitrary command lines through the login shell, so logs, exit
+  // tracking and kill-on-close all reuse the agent pipeline.
+  const runCommand = async (project, cmd) => {
+    if (!cmd?.command?.trim()) return;
+    const existing = panesRef.current.find(
+      (p) =>
+        p.kind === "run" && p.projectPath === project.path && p.label === cmd.name,
+    );
+    if (existing && statuses[existing.id] !== "exited") {
+      // already running — unhide + focus instead of racing a second server
+      if (existing.hidden) {
+        setPanes((ps) =>
+          ps.map((x) => (x.id === existing.id ? { ...x, hidden: false } : x)),
+        );
+      }
+      setTimeout(() => focusAgent(existing), existing.hidden ? 50 : 0);
+      return;
+    }
+    try {
+      const id = await invoke("create_pane", {
+        cwd: project.path,
+        cols: 100,
+        rows: 30,
+        resume: null,
+        theme: null,
+        // "run:" prefix marks the pane across broker reattach/persist; the
+        // restore path skips these so dev servers never auto-resurrect.
+        // interactive: run through -i shell so .zshrc aliases (pa, etc) work
+        harness: { id: `run:${cmd.name}`, command: cmd.command, interactive: true },
+        shell: settingsRef.current.shell?.trim() || null,
+      });
+      const pane = {
+        id,
+        projectPath: project.path,
+        label: cmd.name,
+        kind: "run",
+        command: cmd.command,
+      };
+      setPanes((ps) =>
+        // restarting an exited run pane replaces it in place (keeps grid slot)
+        existing ? ps.map((x) => (x.id === existing.id ? pane : x)) : [...ps, pane],
+      );
+      setStatuses((s) => {
+        const next = { ...s, [id]: "working" };
+        if (existing) delete next[existing.id];
+        return next;
+      });
+      focusAgent(pane);
+    } catch (err) {
+      console.error("failed to run command", err);
+    }
+  };
+
+  // Hide keeps the process running; the Run caret (green dot) brings it back.
+  const hideRun = (id) =>
+    setPanes((ps) => ps.map((p) => (p.id === id ? { ...p, hidden: true } : p)));
+
+  const restartRun = (pane) => {
+    const project = projects.find((pr) => pr.path === pane.projectPath);
+    // reattached panes lose the command line; recover it from the project entry
+    const command =
+      pane.command ??
+      project?.commands?.find((c) => c.name === pane.label)?.command;
+    if (!command) {
+      setRunDialog(pane.projectPath);
+      return;
+    }
+    runCommand({ path: pane.projectPath }, { name: pane.label, command });
   };
 
   // Which harness binaries exist on PATH (Set of bin names); null = unprobed.
@@ -905,6 +1006,20 @@ export default function App() {
         label: "New plan…",
         action: () => setComposerOpen(true),
       });
+      for (const c of activeProject.commands ?? []) {
+        cmds.push({
+          id: `run-${c.id}`,
+          group: "Run",
+          label: c.name,
+          hint: c.command,
+          action: () => runCommand(activeProject, c),
+        });
+      }
+      cmds.push({
+        id: "edit-run-commands",
+        label: "Run commands…",
+        action: () => setRunDialog(activePath),
+      });
     }
     cmds.push({ id: "add-project", label: "Add project…", action: addProject });
     cmds.push({ id: "settings", label: "Open Settings", action: openSettings });
@@ -1001,7 +1116,10 @@ export default function App() {
                   )}
                 </div>
                 {notifs.length === 0 ? (
-                  <div className="notif-empty">Nothing yet. Agents report here when they finish.</div>
+                  <div className="notif-empty">
+                    <LogoMark className="notif-empty-mark" aria-hidden="true" />
+                    Nothing yet. Agents report here when they finish.
+                  </div>
                 ) : (
                   notifs.map((n) => {
                     const alive = panes.some((p) => p.id === n.paneId);
@@ -1033,6 +1151,63 @@ export default function App() {
           <button className="btn-icon" title="Settings" onClick={openSettings}>
             <GearSix size={15} />
           </button>
+          {activeProject &&
+            ((activeProject.commands?.length ?? 0) === 0 ? (
+              <button
+                className="btn-new"
+                title="Set up run commands for this project"
+                onClick={() => setRunDialog(activePath)}
+              >
+                <Play size={13} weight="fill" /> Run…
+              </button>
+            ) : (
+              <div className="btn-new-split">
+                <button
+                  className="btn-new"
+                  title={activeProject.commands[0].command}
+                  onClick={() => runCommand(activeProject, activeProject.commands[0])}
+                >
+                  <Play size={13} weight="fill" /> Run {activeProject.commands[0].name}
+                  {activePanes.some(
+                    (p) => p.kind === "run" && p.hidden && statuses[p.id] !== "exited",
+                  ) && <span className="run-dot" />}
+                </button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button className="btn-new btn-new-caret" title="Run a different command">
+                      <CaretDown size={11} weight="bold" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-[200px]">
+                    {activeProject.commands.map((c) => {
+                      const pane = activePanes.find(
+                        (p) => p.kind === "run" && p.label === c.name,
+                      );
+                      const st = pane ? statuses[pane.id] : null;
+                      const hint =
+                        pane && st !== "exited"
+                          ? pane.hidden
+                            ? "running — show"
+                            : "running"
+                          : c.command;
+                      return (
+                        <DropdownMenuItem
+                          key={c.id}
+                          onSelect={() => runCommand(activeProject, c)}
+                        >
+                          {c.name}
+                          <span className="ml-auto text-xs opacity-50">{hint}</span>
+                        </DropdownMenuItem>
+                      );
+                    })}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={() => setRunDialog(activePath)}>
+                      Edit commands…
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            ))}
           {activeProject && (
             <div className="btn-new-split">
               <button className="btn-new" onClick={addAgent}>
@@ -1142,6 +1317,9 @@ export default function App() {
                     >
                       Reveal in Finder
                     </ContextMenuItem>
+                    <ContextMenuItem onSelect={() => setRunDialog(p.path)}>
+                      Run commands…
+                    </ContextMenuItem>
                     <ContextMenuSeparator />
                     <ContextMenuItem
                       variant="destructive"
@@ -1163,8 +1341,7 @@ export default function App() {
           {!activeProject ? (
             <div className="empty">
               <div className="empty-inner">
-                <div className="empty-glyph">▮▮▮</div>
-                <h1>Agent workspace</h1>
+                <Logo className="empty-logo" aria-label="AgentBench" />
                 <p>
                   Add a project folder, then spawn coding agents inside it. When
                   an agent finishes or needs you, its pane glows and you hear a
@@ -1178,7 +1355,7 @@ export default function App() {
           ) : activePanes.length === 0 ? (
             <div className="empty">
               <div className="empty-inner">
-                <div className="empty-glyph">▮▮▮</div>
+                <LogoMark className="empty-mark" aria-hidden="true" />
                 <h1>{activeProject.name}</h1>
                 <p className="empty-path">{activeProject.path}</p>
                 <button className="btn-new big" onClick={addAgent}>
@@ -1206,6 +1383,11 @@ export default function App() {
                   <AgentPane
                     key={p.id}
                     id={p.id}
+                    kind={p.kind}
+                    hidden={p.hidden}
+                    command={p.command}
+                    onHide={hideRun}
+                    onRestart={() => restartRun(p)}
                     name={titles[p.id] || p.label}
                     cwd={p.projectPath}
                     status={statuses[p.id] || "working"}
@@ -1293,6 +1475,7 @@ export default function App() {
               })}
               {(projectPlans[activePath] ?? []).length === 0 && (
                 <div className="plan-rail-empty">
+                  <LogoMark className="rail-empty-mark" aria-hidden="true" />
                   No plans yet — ask an agent to plan something and it shows
                   up here.
                 </div>
@@ -1307,6 +1490,17 @@ export default function App() {
         onOpenChange={setCmdMenuOpen}
         commands={commands}
       />
+
+      {runDialog && (
+        <RunCommandsDialog
+          project={projects.find((p) => p.path === runDialog)}
+          onClose={() => setRunDialog(null)}
+          onSave={(commands) => {
+            updateProject(runDialog, { commands });
+            setRunDialog(null);
+          }}
+        />
+      )}
 
       {composerOpen && activeProject && (
         <PlanComposer

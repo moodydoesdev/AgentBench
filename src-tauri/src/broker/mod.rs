@@ -75,6 +75,10 @@ pub struct HarnessSpec {
     pub resume: Option<String>,
     /// Claude Code integration: hook settings file, session tracking, theme.
     pub claude: bool,
+    /// Run through an interactive shell (-i) so .zshrc/.bashrc aliases and
+    /// functions resolve — project run commands are typed by users, who
+    /// expect whatever works in their terminal to work here.
+    pub interactive: bool,
 }
 
 impl HarnessSpec {
@@ -88,6 +92,7 @@ impl HarnessSpec {
             command,
             resume: v["resume"].as_str().map(String::from),
             claude: v["claude"].as_bool().unwrap_or(false),
+            interactive: v["interactive"].as_bool().unwrap_or(false),
         })
     }
 
@@ -98,6 +103,7 @@ impl HarnessSpec {
             command: "claude --dangerously-skip-permissions".into(),
             resume: Some("--resume {session_id}".into()),
             claude: true,
+            interactive: false,
         }
     }
 }
@@ -301,8 +307,16 @@ fn harness_command(
     #[cfg(unix)]
     {
         cmd = CommandBuilder::new(shell);
-        cmd.arg("-lc");
-        cmd.arg(format!("exec {}", line));
+        if spec.interactive {
+            // -i loads .zshrc/.bashrc so user aliases/functions resolve. No
+            // exec: interactive shells don't implicit-exec, and killing the
+            // shell (session leader) HUPs the foreground job anyway.
+            cmd.arg("-ilc");
+            cmd.arg(line);
+        } else {
+            cmd.arg("-lc");
+            cmd.arg(format!("exec {}", line));
+        }
     }
     #[cfg(windows)]
     {

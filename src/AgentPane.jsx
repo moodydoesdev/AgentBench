@@ -3,13 +3,20 @@ import usePaneDrag from "./usePaneDrag";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { homeDir, join } from "@tauri-apps/api/path";
 import { Terminal as WtermTerminal } from "@wterm/react";
 import { GhosttyCore } from "@wterm/ghostty";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { X, ArrowsOutLineHorizontal } from "@phosphor-icons/react";
+import {
+  X,
+  ArrowsOutLineHorizontal,
+  ArrowClockwise,
+  Minus,
+  Play,
+} from "@phosphor-icons/react";
 import "@xterm/xterm/css/xterm.css";
 import "@wterm/dom/css";
 
@@ -121,8 +128,15 @@ function createSyncFilter(write) {
 const FALLBACK_STACK = '"SF Mono", Menlo, Consolas, monospace';
 const FONT_STACK = `"FiraCode Nerd Font Mono", ${FALLBACK_STACK}`;
 
+// File-path shapes in agent output: /abs/path, ~/path, ./rel, ../rel,
+// src/App.jsx — with an optional :line[:col] suffix. Segments end on a
+// non-dot so trailing sentence punctuation stays out of the link.
+const FILE_PATH_RE =
+  /(?:~|\.{1,2})?[\w.@%+-]*(?:\/[\w.@%+-]*[\w@%+-])+(?::\d+(?::\d+)?)?/;
+
 function XtermInner({
   id,
+  cwd,
   initialData,
   register,
   sendData,
@@ -160,12 +174,76 @@ function XtermInner({
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    // clickable URLs — routed through the OS browser, not the webview
+    // Clickable URLs and file paths — ctrl/⌘+click opens them (browser or
+    // default app, which the OS brings to the foreground); plain clicks
+    // stay free for selection.
+    //
+    // macOS quirk: WebKit turns ctrl+left-click into a right-click, so no
+    // mouseup ever reaches xterm's linkifier and activate() never fires.
+    // Track the hovered link and open it from the contextmenu event instead.
+    const hovered = { open: null };
+    const openLink = (uri) =>
+      openUrl(uri).catch((err) => console.error("failed to open url", err));
     term.loadAddon(
-      new WebLinksAddon((ev, uri) => {
-        openUrl(uri).catch((err) => console.error("failed to open url", err));
-      }),
+      new WebLinksAddon(
+        (ev, uri) => {
+          if (ev.ctrlKey || ev.metaKey) openLink(uri);
+        },
+        {
+          hover: (_ev, uri) => (hovered.open = () => openLink(uri)),
+          leave: () => (hovered.open = null),
+        },
+      ),
     );
+    // File paths open with the OS default app; :line[:col] suffixes are
+    // stripped, relative paths resolve against the pane's cwd. Registered
+    // after WebLinksAddon so URLs win where the two overlap.
+    const openFile = async (raw) => {
+      let p = raw.replace(/:\d+(?::\d+)?$/, "");
+      try {
+        if (p.startsWith("~/")) p = await join(await homeDir(), p.slice(2));
+        else if (!p.startsWith("/")) p = await join(cwd, p);
+        await openPath(p);
+      } catch (err) {
+        console.error("failed to open path", err);
+      }
+    };
+    term.registerLinkProvider({
+      // simple 1 char = 1 col mapping; fine for ASCII paths, skips the
+      // wrapped-line stitching the URL addon does
+      provideLinks(y, cb) {
+        const line = term.buffer.active.getLine(y - 1);
+        if (!line) return cb(undefined);
+        const text = line.translateToString(true);
+        const rex = new RegExp(FILE_PATH_RE.source, "g");
+        const links = [];
+        let m;
+        while ((m = rex.exec(text))) {
+          const p = m[0];
+          links.push({
+            range: {
+              start: { x: m.index + 1, y },
+              end: { x: m.index + p.length, y },
+            },
+            text: p,
+            activate: (ev) => {
+              if (ev.ctrlKey || ev.metaKey) openFile(p);
+            },
+            hover: () => (hovered.open = () => openFile(p)),
+            leave: () => (hovered.open = null),
+          });
+        }
+        cb(links.length ? links : undefined);
+      },
+    });
+    const onCtxMenu = (ev) => {
+      if (!ev.ctrlKey || !hovered.open) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      hovered.open();
+    };
+    const containerEl = containerRef.current;
+    containerEl.addEventListener("contextmenu", onCtxMenu, true);
     // Highlight-to-copy, terminal style (Settings → Workspace toggle).
     // onSelectionChange fires on every drag tick, so debounce until the
     // selection settles; empty selections (plain clicks) must not clobber
@@ -283,6 +361,7 @@ function XtermInner({
       clearTimeout(copyTimer);
       clearTimeout(toastTimer);
       ro.disconnect();
+      containerEl.removeEventListener("contextmenu", onCtxMenu, true);
       unlisten.then((f) => f());
       termRef.current = null;
       term.dispose();
@@ -434,6 +513,11 @@ export default memo(function AgentPane({
   id,
   name,
   cwd,
+  kind, // "run" = project run-command pane; undefined = agent pane
+  hidden = false, // run pane hidden while its process keeps running
+  command, // run panes: the command line (shown where agents show cwd)
+  onHide,
+  onRestart,
   status,
   focused,
   agentColor,
@@ -602,12 +686,19 @@ export default memo(function AgentPane({
 
   const isWterm = engine.startsWith("wterm");
   const Inner = isWterm ? WtermInner : XtermInner;
+  const isRun = kind === "run";
 
   return (
     <section
       ref={sectionRef}
-      className={`pane status-${status} ${focused ? "focused" : ""} ${dragOver ? "drag-over" : ""} ${dragging ? "dragging" : ""}`}
-      style={{ gridColumn: `span ${w}`, gridRow: `span ${h}` }}
+      className={`pane status-${status} ${isRun ? "pane-run" : ""} ${focused ? "focused" : ""} ${dragOver ? "drag-over" : ""} ${dragging ? "dragging" : ""}`}
+      // hidden panes stay mounted (same trick as inactive projects) so the
+      // terminal keeps consuming output and reveal is instant
+      style={{
+        gridColumn: `span ${w}`,
+        gridRow: `span ${h}`,
+        display: hidden ? "none" : undefined,
+      }}
       data-pane-id={id}
       onMouseDown={() => onActivity(id)}
       onKeyDownCapture={onWordJumpKey}
@@ -623,11 +714,38 @@ export default memo(function AgentPane({
           }
           title={AGENT_COLORS[agentColor] ? `/color ${agentColor}` : undefined}
         />
-        <span className="pane-title">{name}</span>
-        <span className="pane-status">{STATUS_LABEL[status]}</span>
-        <span className="pane-cwd" title={cwd}>
-          {cwd}
+        <span className="pane-title">
+          {isRun && <Play size={10} weight="fill" className="pane-run-glyph" />}
+          {name}
         </span>
+        <span className="pane-status">{STATUS_LABEL[status]}</span>
+        <span className="pane-cwd" title={command ?? cwd}>
+          {command ?? cwd}
+        </span>
+        {isRun && status === "exited" && (
+          <button
+            className="pane-size"
+            title="Restart command"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              onRestart?.();
+            }}
+          >
+            <ArrowClockwise size={14} weight="bold" />
+          </button>
+        )}
+        {isRun && (
+          <button
+            className="pane-size"
+            title="Hide pane — process keeps running (bring back from the Run menu)"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              onHide?.(id);
+            }}
+          >
+            <Minus size={14} weight="bold" />
+          </button>
+        )}
         <button
           className="pane-size"
           title={`Cycle width: 1 → half → full (now ${w}×${h})`}
@@ -640,7 +758,7 @@ export default memo(function AgentPane({
         </button>
         <button
           className="pane-close"
-          title="Kill agent and close pane"
+          title={isRun ? "Kill process and close pane" : "Kill agent and close pane"}
           onClick={(ev) => {
             ev.stopPropagation();
             onClose(id);
@@ -652,6 +770,7 @@ export default memo(function AgentPane({
       <Inner
         key={engine}
         id={id}
+        cwd={cwd}
         ghostty={engine === "wterm-ghostty"}
         focused={focused}
         termTheme={termTheme}
