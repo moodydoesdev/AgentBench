@@ -1,6 +1,6 @@
 [package]
 name = "agentbench"
-version = "0.1.0"
+version = "0.1.1"
 description = "AgentBench — multi-agent Claude Code workspace"
 authors = ["connor"]
 edition = "2021"
