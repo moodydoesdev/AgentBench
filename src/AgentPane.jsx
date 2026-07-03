@@ -2,6 +2,8 @@ import { memo, useEffect, useRef, useState } from "react";
 import usePaneDrag from "./usePaneDrag";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal as WtermTerminal } from "@wterm/react";
 import { GhosttyCore } from "@wterm/ghostty";
 import { listen } from "@tauri-apps/api/event";
@@ -119,11 +121,23 @@ function createSyncFilter(write) {
 const FALLBACK_STACK = '"SF Mono", Menlo, Consolas, monospace';
 const FONT_STACK = `"FiraCode Nerd Font Mono", ${FALLBACK_STACK}`;
 
-function XtermInner({ id, initialData, register, sendData, onTitle, termTheme }) {
+function XtermInner({
+  id,
+  initialData,
+  register,
+  sendData,
+  onTitle,
+  termTheme,
+  copyOnSelect = true,
+}) {
   const containerRef = useRef(null);
   const termRef = useRef(null);
   const termThemeRef = useRef(termTheme);
   termThemeRef.current = termTheme;
+  // live toggle without remounting the terminal
+  const copyRef = useRef(copyOnSelect);
+  copyRef.current = copyOnSelect;
+  const [copyToast, setCopyToast] = useState(false);
 
   // Theme switches restyle the live terminal — no remount needed.
   useEffect(() => {
@@ -146,6 +160,34 @@ function XtermInner({ id, initialData, register, sendData, onTitle, termTheme })
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    // clickable URLs — routed through the OS browser, not the webview
+    term.loadAddon(
+      new WebLinksAddon((ev, uri) => {
+        openUrl(uri).catch((err) => console.error("failed to open url", err));
+      }),
+    );
+    // Highlight-to-copy, terminal style (Settings → Workspace toggle).
+    // onSelectionChange fires on every drag tick, so debounce until the
+    // selection settles; empty selections (plain clicks) must not clobber
+    // the clipboard.
+    let copyTimer = null;
+    let toastTimer = null;
+    term.onSelectionChange(() => {
+      if (!copyRef.current || !term.getSelection()) return;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => {
+        const sel = term.getSelection();
+        if (!sel) return;
+        navigator.clipboard
+          .writeText(sel)
+          .then(() => {
+            setCopyToast(true);
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => setCopyToast(false), 1300);
+          })
+          .catch(() => {});
+      }, 250);
+    });
     termRef.current = term;
     // Pane-nav hotkeys are intercepted app-wide in App.jsx (capture-phase
     // keydown with stopPropagation), so no custom key handler is needed here.
@@ -238,6 +280,8 @@ function XtermInner({ id, initialData, register, sendData, onTitle, termTheme })
     return () => {
       register(null);
       clearTimeout(resyncTimer);
+      clearTimeout(copyTimer);
+      clearTimeout(toastTimer);
       ro.disconnect();
       unlisten.then((f) => f());
       termRef.current = null;
@@ -245,7 +289,12 @@ function XtermInner({ id, initialData, register, sendData, onTitle, termTheme })
     };
   }, [id]);
 
-  return <div className="pane-term" ref={containerRef} />;
+  return (
+    <>
+      <div className="pane-term" ref={containerRef} />
+      {copyToast && <div className="term-toast">Copied</div>}
+    </>
+  );
 }
 
 // Two wterm cores: the built-in zig core, or libghostty (full VT compliance,
@@ -391,6 +440,7 @@ export default memo(function AgentPane({
   engine = "xterm",
   termTheme,
   wordMod = "ctrl",
+  copyOnSelect = true,
   initialData,
   size,
   gridCols = 3,
@@ -605,6 +655,7 @@ export default memo(function AgentPane({
         ghostty={engine === "wterm-ghostty"}
         focused={focused}
         termTheme={termTheme}
+        copyOnSelect={copyOnSelect}
         initialData={initialData}
         register={register}
         sendData={sendData}

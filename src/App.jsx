@@ -1200,6 +1200,7 @@ export default function App() {
                     engine={settings.engine}
                     termTheme={termTheme}
                     wordMod={settings.wordMod ?? "ctrl"}
+                    copyOnSelect={settings.copyOnSelect !== false}
                     initialData={initialData[p.id]}
                     size={paneSizes[p.id]}
                     gridCols={settings.cols}

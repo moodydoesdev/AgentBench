@@ -448,6 +448,17 @@ export default function SettingsWindow() {
                   onChange={(v) => set({ engine: v })}
                 />
               </Row>
+              <Row
+                title="Copy on select"
+                sub="Highlighting text in a terminal copies it to the clipboard (xterm engine)"
+              >
+                <Toggle
+                  on={settings.copyOnSelect !== false}
+                  onClick={() =>
+                    set({ copyOnSelect: !(settings.copyOnSelect !== false) })
+                  }
+                />
+              </Row>
             </Card>
           </section>
         )}

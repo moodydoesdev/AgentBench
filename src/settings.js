@@ -80,6 +80,7 @@ export const DEFAULT_SETTINGS = {
   engine: "xterm",
   navMod: "off", // modifier for arrow-key pane navigation: off | ctrl | alt | meta
   wordMod: "ctrl", // modifier+←/→ sends ESC b / ESC f (word jump): off | ctrl | meta
+  copyOnSelect: true, // highlighting text in a terminal copies it (xterm engine)
   theme: "midnight",
   bgImage: "", // absolute path to a custom background image ("" = off)
   bgOverlay: 0.85, // opacity of UI surfaces over the background image (0–1)
