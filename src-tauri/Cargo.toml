@@ -1,0 +1,30 @@
+[package]
+name = "agentbench"
+version = "0.1.0"
+description = "AgentBench — multi-agent Claude Code workspace"
+authors = ["connor"]
+edition = "2021"
+default-run = "agentbench"
+
+[lib]
+name = "agentbench_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "agentbench-broker"
+path = "src/bin/broker.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.8"
+tiny_http = "0.12"
+base64 = "0.22"
+dirs = "6"

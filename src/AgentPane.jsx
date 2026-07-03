@@ -1,0 +1,587 @@
+import { memo, useEffect, useRef, useState } from "react";
+import usePaneDrag from "./usePaneDrag";
+import { Terminal as Xterm } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal as WtermTerminal } from "@wterm/react";
+import { GhosttyCore } from "@wterm/ghostty";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { X, ArrowsOutLineHorizontal } from "@phosphor-icons/react";
+import "@xterm/xterm/css/xterm.css";
+import "@wterm/dom/css";
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function strToBytes(s) {
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+
+const STATUS_LABEL = {
+  working: "running",
+  done: "done",
+  input: "needs input",
+  exited: "exited",
+};
+
+// Claude Code's /color palette → dot colors
+const AGENT_COLORS = {
+  red: "#f87171",
+  blue: "#60a5fa",
+  green: "#4ade80",
+  yellow: "#facc15",
+  purple: "#a78bfa",
+  orange: "#fb923c",
+  pink: "#f472b6",
+  cyan: "#22d3ee",
+};
+
+// Claude Code exits on a quick double Ctrl+C. Swallow the repeat so a stray
+// mash can't kill the agent; a single Ctrl+C (interrupt) still goes through.
+const SIGINT_GUARD_MS = 1500;
+
+
+/**
+ * wterm's DOM renderer ignores synchronized-output mode (DEC ?2026), so
+ * Claude Code's mid-frame paints show through (wterm issue #57). Shim it:
+ * buffer everything between BSU and ESU and flush each frame atomically.
+ */
+function createSyncFilter(write) {
+  const PREFIX = "\x1b[?2026";
+  const BSU = "\x1b[?2026h";
+  const ESU = "\x1b[?2026l";
+  let mode = false;
+  let frame = "";
+  let tail = "";
+  let flushTimer = null;
+
+  // longest partial marker at the end of s (full markers are caught by indexOf)
+  const partialSuffixLen = (s) => {
+    for (let k = Math.min(PREFIX.length, s.length); k > 0; k--) {
+      if (s.endsWith(PREFIX.slice(0, k))) return k;
+    }
+    return 0;
+  };
+
+  return (bytes) => {
+    let s = tail;
+    tail = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    if (flushTimer) clearTimeout(flushTimer);
+
+    while (s.length) {
+      if (!mode) {
+        const i = s.indexOf(BSU);
+        if (i === -1) {
+          const keep = partialSuffixLen(s);
+          if (s.length - keep > 0) write(strToBytes(s.slice(0, s.length - keep)));
+          tail = keep ? s.slice(s.length - keep) : "";
+          s = "";
+        } else {
+          if (i > 0) write(strToBytes(s.slice(0, i)));
+          s = s.slice(i + BSU.length);
+          mode = true;
+        }
+      } else {
+        const i = s.indexOf(ESU);
+        if (i === -1) {
+          const keep = partialSuffixLen(s);
+          frame += s.slice(0, s.length - keep);
+          tail = keep ? s.slice(s.length - keep) : "";
+          s = "";
+        } else {
+          frame += s.slice(0, i);
+          write(strToBytes(frame));
+          frame = "";
+          mode = false;
+          s = s.slice(i + ESU.length);
+        }
+      }
+    }
+
+    // Safety valve: never hold a partial frame for long (lost ESU, etc.)
+    if (mode && frame.length) {
+      flushTimer = setTimeout(() => {
+        write(strToBytes(frame));
+        frame = "";
+      }, 80);
+    }
+  };
+}
+
+const FALLBACK_STACK = '"SF Mono", Menlo, Consolas, monospace';
+const FONT_STACK = `"FiraCode Nerd Font Mono", ${FALLBACK_STACK}`;
+
+function XtermInner({ id, initialData, register, sendData, onTitle, termTheme }) {
+  const containerRef = useRef(null);
+  const termRef = useRef(null);
+  const termThemeRef = useRef(termTheme);
+  termThemeRef.current = termTheme;
+
+  // Theme switches restyle the live terminal — no remount needed.
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.theme = termTheme;
+  }, [termTheme]);
+
+  useEffect(() => {
+    const term = new Xterm({
+      fontSize: 13,
+      fontFamily: document.fonts.check('13px "FiraCode Nerd Font Mono"')
+        ? FONT_STACK
+        : FALLBACK_STACK,
+      theme: termThemeRef.current,
+      // needed so a transparent theme bg (custom background image) works
+      allowTransparency: true,
+      cursorBlink: true,
+      cursorInactiveStyle: "none",
+      scrollback: 8000,
+      macOptionIsMeta: true,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    termRef.current = term;
+    // Pane-nav hotkeys are intercepted app-wide in App.jsx (capture-phase
+    // keydown with stopPropagation), so no custom key handler is needed here.
+    term.open(containerRef.current);
+
+    // Re-measure glyphs once the webfont is ready; xterm caches cell
+    // metrics at open() and would otherwise keep fallback-font widths.
+    document.fonts.load('13px "FiraCode Nerd Font Mono"').then(() => {
+      if (term.element && term.options.fontFamily !== FONT_STACK) {
+        term.options.fontFamily = FONT_STACK;
+        try {
+          fit.fit();
+        } catch {
+          /* ignore mid-layout fit races */
+        }
+      }
+    });
+
+    if (initialData) term.write(b64ToBytes(initialData));
+
+    term.onData(sendData);
+    term.onResize(({ cols, rows }) => {
+      invoke("resize_pane", { id, cols, rows }).catch(() => {});
+    });
+    term.onTitleChange(onTitle);
+
+    const ro = new ResizeObserver(() => {
+      const el = containerRef.current;
+      if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+        try {
+          fit.fit();
+        } catch {
+          /* ignore mid-layout fit races */
+        }
+      }
+    });
+    ro.observe(containerRef.current);
+
+    const unlisten = listen("pane-output", (e) => {
+      if (e.payload.id === id) term.write(b64ToBytes(e.payload.data));
+    });
+
+    register({ focus: () => term.focus(), write: (d) => term.write(d) });
+
+    return () => {
+      register(null);
+      ro.disconnect();
+      unlisten.then((f) => f());
+      termRef.current = null;
+      term.dispose();
+    };
+  }, [id]);
+
+  return <div className="pane-term" ref={containerRef} />;
+}
+
+// Two wterm cores: the built-in zig core, or libghostty (full VT compliance,
+// but upstream #78 residue). Sync-output and 256-col shims apply to both.
+function WtermInner({
+  id,
+  ghostty,
+  focused,
+  initialData,
+  register,
+  sendData,
+  onTitle,
+}) {
+  const [core, setCore] = useState(null);
+  const termRef = useRef(null);
+  const readyRef = useRef(false);
+  const queueRef = useRef([]);
+  const coreReady = !ghostty || core;
+
+  // wterm ignores focus-tracking mode (issue #55), so Claude never hides its
+  // drawn cursor in unfocused panes. Shim: watch for ?1004 and synthesize
+  // the CSI I / CSI O focus reports from our own pane focus.
+  const focusedRef = useRef(focused);
+  focusedRef.current = focused;
+  const focusModeRef = useRef(false);
+  const scanTailRef = useRef("");
+
+  const sendFocusReport = (inFocus) =>
+    invoke("write_pane", { id, data: inFocus ? "\x1b[I" : "\x1b[O" }).catch(
+      () => {},
+    );
+
+  useEffect(() => {
+    if (focusModeRef.current) sendFocusReport(focused);
+  }, [focused]);
+
+  useEffect(() => {
+    let alive = true;
+    if (ghostty) {
+      GhosttyCore.load({ wasmPath: "/ghostty-vt.wasm" })
+        .then((c) => alive && setCore(c))
+        .catch((err) => console.error("ghostty core failed to load", err));
+    }
+    return () => {
+      alive = false;
+      register(null);
+    };
+  }, [id, ghostty]);
+
+  useEffect(() => {
+    const write = (bytes) => {
+      if (readyRef.current && termRef.current) termRef.current.write(bytes);
+      else queueRef.current.push(bytes);
+    };
+    const filter = createSyncFilter(write);
+
+    const scanFocusMode = (bytes) => {
+      let s = scanTailRef.current;
+      for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+      if (s.includes("\x1b[?1004h")) {
+        focusModeRef.current = true;
+        sendFocusReport(focusedRef.current);
+      }
+      if (s.lastIndexOf("\x1b[?1004l") > s.lastIndexOf("\x1b[?1004h")) {
+        focusModeRef.current = false;
+      }
+      scanTailRef.current = s.slice(-8);
+    };
+
+    // scrollback may already contain the mode-enable from before a reload
+    if (initialData) scanFocusMode(b64ToBytes(initialData));
+
+    const unlisten = listen("pane-output", (e) => {
+      if (e.payload.id === id) {
+        const bytes = b64ToBytes(e.payload.data);
+        scanFocusMode(bytes);
+        filter(bytes);
+      }
+    });
+    return () => unlisten.then((f) => f());
+  }, [id]);
+
+  // wterm swallows Ctrl+V and waits for a browser paste event that macOS
+  // only fires for Cmd+V, so Claude Code's image paste never reaches the
+  // pty. Send \x16 ourselves; Claude reads the image from the host
+  // clipboard. Cmd+V still does a normal text paste.
+  const handleKeyDownCapture = (ev) => {
+    if (ev.ctrlKey && !ev.metaKey && ev.key === "v") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      sendData("\x16");
+    }
+  };
+
+  return (
+    <div className="pane-term wterm-host" onKeyDownCapture={handleKeyDownCapture}>
+      {coreReady && (
+        <WtermTerminal
+          ref={(h) => {
+            termRef.current = h;
+            register(
+              h && { focus: () => h.focus(), write: (d) => h.write(d) },
+            );
+          }}
+          core={ghostty ? core : undefined}
+          autoResize
+          cursorBlink
+          className="term"
+          onReady={() => {
+            readyRef.current = true;
+            if (initialData) termRef.current?.write(b64ToBytes(initialData));
+            for (const chunk of queueRef.current)
+              termRef.current?.write(chunk);
+            queueRef.current = [];
+          }}
+          onData={sendData}
+          onTitle={onTitle}
+          onResize={(cols, rows) => {
+            if (cols < 2 || rows < 2) return;
+            // wterm clamps its grid at 256 cols (issue #56); keep pty in sync
+            invoke("resize_pane", {
+              id,
+              cols: Math.min(cols, 256),
+              rows: Math.min(rows, 256),
+            }).catch(() => {});
+          }}
+          onError={(err) => console.error(`pane ${id} wterm error`, err)}
+        />
+      )}
+    </div>
+  );
+}
+
+const MAX_ROW_SPAN = 4;
+
+export default memo(function AgentPane({
+  id,
+  name,
+  cwd,
+  status,
+  focused,
+  agentColor,
+  engine = "xterm",
+  termTheme,
+  wordMod = "ctrl",
+  initialData,
+  size,
+  gridCols = 3,
+  onResize,
+  onReorder,
+  onRegister,
+  onActivity,
+  onTitle,
+  onClose,
+}) {
+  const sectionRef = useRef(null);
+  const lastSigintRef = useRef(0);
+  const callbacksRef = useRef({});
+  callbacksRef.current = { onActivity, onRegister, onTitle };
+  const [dragOver, setDragOver] = useState(false);
+  const { dragging, onHeadPointerDown } = usePaneDrag(sectionRef, id, onReorder);
+
+  const w = Math.min(size?.w ?? 1, gridCols);
+  const h = Math.min(size?.h ?? 1, MAX_ROW_SPAN);
+
+  // Drag a grip: snap spans to grid cells based on drag distance. Rows are
+  // fluid (1fr stretches to fill the viewport), so absolute-position math
+  // can put the next row boundary offscreen — deltas keep it reachable.
+  const startResize = (ev, dirs) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const grip = ev.currentTarget;
+    const grid = sectionRef.current.parentElement;
+    const cellW = grid.clientWidth / gridCols;
+    const ROW_UNIT = 340; // matches grid-auto-rows min in styles.css
+    const x0 = ev.clientX;
+    const y0 = ev.clientY;
+    const w0 = w;
+    const h0 = h;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const onMove = (e) => {
+      onResize(id, {
+        w: dirs.includes("e")
+          ? clamp(w0 + Math.round((e.clientX - x0) / cellW), 1, gridCols)
+          : w0,
+        h: dirs.includes("s")
+          ? clamp(h0 + Math.round((e.clientY - y0) / ROW_UNIT), 1, MAX_ROW_SPAN)
+          : h0,
+      });
+    };
+    const onUp = (e) => {
+      try {
+        grip.releasePointerCapture(e.pointerId);
+      } catch {
+        /* already released */
+      }
+      grip.removeEventListener("pointermove", onMove);
+      grip.removeEventListener("pointerup", onUp);
+      grip.removeEventListener("pointercancel", onUp);
+      document.body.style.cursor = "";
+    };
+    // Capture the pointer so every move reaches the grip, even over the
+    // terminal canvas or outside the window.
+    grip.setPointerCapture(ev.pointerId);
+    grip.addEventListener("pointermove", onMove);
+    grip.addEventListener("pointerup", onUp);
+    grip.addEventListener("pointercancel", onUp);
+    document.body.style.cursor =
+      dirs === "se" ? "nwse-resize" : dirs === "e" ? "col-resize" : "row-resize";
+  };
+
+  // 1× → half → full width, then back around.
+  const cycleSize = () => {
+    const steps = [
+      ...new Set([1, Math.max(1, Math.round(gridCols / 2)), gridCols]),
+    ];
+    const next = steps[(steps.indexOf(w) + 1) % steps.length];
+    onResize(id, { w: next, h });
+  };
+
+  const sendData = (data) => {
+    if (data === "\x03") {
+      const now = Date.now();
+      if (now - lastSigintRef.current < SIGINT_GUARD_MS) return;
+      lastSigintRef.current = now;
+    }
+    callbacksRef.current.onActivity(id);
+    invoke("write_pane", { id, data }).catch(() => {});
+  };
+
+  const shellQuote = (p) =>
+    /^[\w./-]+$/.test(p) ? p : `'${p.replaceAll("'", `'\\''`)}'`;
+
+  // OS file drops come via Tauri's native drag-drop event — WKWebView never
+  // exposes real file paths to HTML5 dnd. Every pane gets the event; each
+  // hit-tests the cursor against its own rect (positions are physical px,
+  // getBoundingClientRect is CSS px, so scale by devicePixelRatio).
+  useEffect(() => {
+    const inside = ({ x, y }) => {
+      const el = sectionRef.current;
+      if (!el) return false;
+      const s = window.devicePixelRatio || 1;
+      const r = el.getBoundingClientRect();
+      return x / s >= r.left && x / s < r.right && y / s >= r.top && y / s < r.bottom;
+    };
+    const sub = getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type === "enter" || payload.type === "over") {
+        setDragOver(inside(payload.position));
+      } else if (payload.type === "drop") {
+        setDragOver(false);
+        if (inside(payload.position) && payload.paths.length) {
+          sendData(payload.paths.map(shellQuote).join(" ") + " ");
+        }
+      } else {
+        setDragOver(false); // leave / cancelled
+      }
+    });
+    return () => sub.then((f) => f());
+  }, []);
+
+  const register = (handle) => {
+    callbacksRef.current.onRegister(
+      id,
+      handle && {
+        ...handle,
+        scrollIntoView: () =>
+          sectionRef.current?.scrollIntoView({
+            block: "nearest",
+            behavior: "smooth",
+          }),
+      },
+    );
+  };
+
+  const handleTitle = (title) => {
+    // strip Claude Code's busy-glyph prefix from the session name
+    const clean = title.replace(/^[✳✶✻✽·∗*✢\s]+/u, "").trim();
+    if (clean) callbacksRef.current.onTitle(id, clean);
+  };
+
+  // Modifier + ←/→/Backspace → readline word editing (ESC b / ESC f /
+  // ESC DEL — what zsh/Claude already bind, same bytes as option+key).
+  // Configurable because remapped keyboards (e.g. Karabiner) may emit ⌘
+  // where the user expects Ctrl.
+  const WORD_SEQS = {
+    ArrowLeft: "\x1bb", // backward-word
+    ArrowRight: "\x1bf", // forward-word
+    Backspace: "\x1b\x7f", // backward-kill-word
+  };
+  const onWordJumpKey = (ev) => {
+    const held =
+      wordMod === "ctrl"
+        ? ev.ctrlKey && !ev.metaKey && !ev.altKey
+        : wordMod === "meta"
+          ? ev.metaKey && !ev.ctrlKey && !ev.altKey
+          : false;
+    if (!held) return;
+    const seq = WORD_SEQS[ev.key];
+    if (!seq) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    sendData(seq);
+  };
+
+  const isWterm = engine.startsWith("wterm");
+  const Inner = isWterm ? WtermInner : XtermInner;
+
+  return (
+    <section
+      ref={sectionRef}
+      className={`pane status-${status} ${focused ? "focused" : ""} ${dragOver ? "drag-over" : ""} ${dragging ? "dragging" : ""}`}
+      style={{ gridColumn: `span ${w}`, gridRow: `span ${h}` }}
+      data-pane-id={id}
+      onMouseDown={() => onActivity(id)}
+      onKeyDownCapture={onWordJumpKey}
+      onContextMenu={(ev) => ev.preventDefault()}
+    >
+      <header className="pane-head" onPointerDown={onHeadPointerDown}>
+        <span
+          className={`dot ${status}`}
+          style={
+            AGENT_COLORS[agentColor]
+              ? { background: AGENT_COLORS[agentColor] }
+              : undefined
+          }
+          title={AGENT_COLORS[agentColor] ? `/color ${agentColor}` : undefined}
+        />
+        <span className="pane-title">{name}</span>
+        <span className="pane-status">{STATUS_LABEL[status]}</span>
+        <span className="pane-cwd" title={cwd}>
+          {cwd}
+        </span>
+        <button
+          className="pane-size"
+          title={`Cycle width: 1 → half → full (now ${w}×${h})`}
+          onClick={(ev) => {
+            ev.stopPropagation();
+            cycleSize();
+          }}
+        >
+          <ArrowsOutLineHorizontal size={14} weight="bold" />
+        </button>
+        <button
+          className="pane-close"
+          title="Kill agent and close pane"
+          onClick={(ev) => {
+            ev.stopPropagation();
+            onClose(id);
+          }}
+        >
+          <X size={13} weight="bold" />
+        </button>
+      </header>
+      <Inner
+        key={engine}
+        id={id}
+        ghostty={engine === "wterm-ghostty"}
+        focused={focused}
+        termTheme={termTheme}
+        initialData={initialData}
+        register={register}
+        sendData={sendData}
+        onTitle={handleTitle}
+      />
+      <div
+        className="pane-grip e"
+        title="Drag to resize · double-click to reset"
+        onPointerDown={(ev) => startResize(ev, "e")}
+        onDoubleClick={() => onResize(id, { w: 1, h: 1 })}
+      />
+      <div
+        className="pane-grip s"
+        title="Drag to resize · double-click to reset"
+        onPointerDown={(ev) => startResize(ev, "s")}
+        onDoubleClick={() => onResize(id, { w: 1, h: 1 })}
+      />
+      <div
+        className="pane-grip se"
+        title="Drag to resize · double-click to reset"
+        onPointerDown={(ev) => startResize(ev, "se")}
+        onDoubleClick={() => onResize(id, { w: 1, h: 1 })}
+      />
+    </section>
+  );
+});

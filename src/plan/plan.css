@@ -1,0 +1,1320 @@
+/* Plan pane — everything derives from the app theme tokens set in themes.js */
+
+.plan-pane .plan-head-icon {
+  color: rgb(var(--blue));
+  flex: none;
+}
+
+.plan-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* WKWebView: momentum rubber-band at the bottom edge can mis-restore the
+     scroll offset (jumps ~a page up, worse with the frosted backdrop layer).
+     No bounce → no bogus restore. Chrome is unaffected either way. */
+  overscroll-behavior: none;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.plan-body {
+  container-type: inline-size;
+}
+
+.plan-doc-wrap {
+  flex: 1;
+  display: flex; /* default stretch so the TOC column spans the doc height */
+  gap: 8px;
+}
+
+/* full-window overlay: center the doc column */
+.plan-overlay .plan-doc-wrap {
+  width: 100%;
+  max-width: 1140px;
+  margin: 0 auto;
+}
+
+.plan-doc {
+  flex: 1;
+  min-width: 0;
+  padding: 14px 18px 20px;
+  max-width: 860px;
+}
+
+.plan-toc {
+  display: none;
+}
+
+@container (min-width: 780px) {
+  .plan-toc {
+    display: block;
+    width: 190px;
+    flex: none;
+    padding: 14px 14px 0 0;
+  }
+}
+
+.plan-toc-inner {
+  position: sticky;
+  top: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.plan-toc-head {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.plan-toc-item {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  padding: 2px 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.plan-toc-item.lvl-3 {
+  padding-left: 12px;
+  font-size: 11.5px;
+}
+
+.plan-toc-item:hover {
+  color: var(--text);
+}
+
+/* ---------- typography ---------- */
+
+.plan-doc h1 {
+  font-size: 19px;
+  font-weight: 650;
+  margin: 4px 0 10px;
+  letter-spacing: -0.01em;
+}
+
+.plan-doc h2 {
+  font-size: 15px;
+  font-weight: 650;
+  margin: 22px 0 8px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-doc h3 {
+  font-size: 13px;
+  font-weight: 650;
+  margin: 16px 0 6px;
+}
+
+.plan-doc p {
+  margin: 0 0 10px;
+}
+
+.plan-doc ul,
+.plan-doc ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.plan-doc li {
+  margin: 2px 0;
+}
+
+.plan-doc a {
+  color: rgb(var(--blue));
+  text-decoration: none;
+}
+
+.plan-doc a:hover {
+  text-decoration: underline;
+}
+
+.plan-doc blockquote {
+  margin: 0 0 10px;
+  padding: 2px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
+}
+
+.plan-doc code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--panel-head);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.plan-doc pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.plan-doc table {
+  border-collapse: collapse;
+  margin: 0 0 12px;
+  font-size: 12.5px;
+}
+
+.plan-doc th,
+.plan-doc td {
+  border: 1px solid var(--border);
+  padding: 7px 14px;
+  text-align: left;
+}
+
+.plan-doc th {
+  background: var(--panel-head);
+  font-weight: 600;
+}
+
+.plan-doc hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 16px 0;
+}
+
+.plan-block-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+.plan-block-title.mono {
+  text-transform: none;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.plan-loading {
+  padding: 24px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.c-green { color: rgb(var(--green)); }
+.c-amber { color: rgb(var(--amber)); }
+.c-red { color: rgb(var(--red)); }
+
+/* ---------- errors ---------- */
+
+.plan-error {
+  margin: 14px 18px;
+  border: 1px solid rgba(var(--red), 0.4);
+  background: rgba(var(--red), 0.06);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.plan-error-head {
+  font-weight: 650;
+  color: rgb(var(--red));
+  margin-bottom: 6px;
+}
+
+.plan-error-msg {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  margin: 0 0 8px;
+}
+
+.plan-error details summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* ---------- code ---------- */
+
+.plan-code {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-head);
+}
+
+.plan-code-file {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-code-plain,
+.plan-code-html pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+  background: transparent !important;
+}
+
+.plan-code-html .plan-line-noted {
+  display: inline-block;
+  width: 100%;
+  background: rgba(var(--amber), 0.1);
+}
+
+.plan-code-notes {
+  margin: 0;
+  padding: 8px 12px 8px 28px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.plan-code-noteline {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: rgb(var(--amber));
+  margin-right: 4px;
+}
+
+.plan-diff-add {
+  color: rgb(var(--green));
+  background: rgba(var(--green), 0.07);
+}
+
+.plan-diff-del {
+  color: rgb(var(--red));
+  background: rgba(var(--red), 0.07);
+}
+
+.plan-diff-ctx {
+  color: var(--text-dim);
+}
+
+/* ---------- diagram ---------- */
+
+.plan-diagram {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--panel-head);
+}
+
+.plan-diagram-svg {
+  display: flex;
+  justify-content: center;
+}
+
+.plan-diagram-svg svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.plan-diagram-loading {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 10px 0;
+}
+
+.plan-diagram-error {
+  color: rgb(var(--red));
+}
+
+/* ---------- file tree ---------- */
+
+.plan-filetree {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--panel-head);
+}
+
+.plan-filetree-rows {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.plan-filetree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.plan-filetree-icon {
+  color: var(--text-dim);
+  flex: none;
+}
+
+.plan-filetree-icon.dir {
+  color: rgb(var(--blue));
+}
+
+.plan-filetree-dir {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.plan-filetree-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding-bottom: 7px;
+  margin-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-filetree-counts {
+  display: flex;
+  gap: 8px;
+}
+
+.plan-filetree-file {
+  color: var(--text);
+}
+
+.plan-filetree-badge {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  border-radius: 3px;
+  padding: 1px 4px;
+  margin-left: 2px;
+}
+
+.plan-filetree-desc {
+  margin-left: 8px;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.plan-expand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 5px;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.plan-expand:hover {
+  color: var(--text);
+}
+
+.plan-code .plan-expand {
+  margin-top: 0;
+}
+
+/* ---------- callout (left accent bar note) ---------- */
+
+.plan-callout {
+  margin: 0 0 14px;
+  padding: 12px 14px 12px 16px;
+  border-left: 3px solid;
+  border-radius: 0 8px 8px 0;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
+.plan-callout-title,
+.plan-callout-body strong {
+  font-weight: 650;
+  color: var(--text);
+}
+
+/* flow the bold title into the first paragraph, like a lead-in */
+.plan-callout-body > p:first-of-type {
+  display: inline;
+}
+
+.plan-callout-body p:last-child {
+  margin-bottom: 0;
+}
+
+/* ---------- api endpoint ---------- */
+
+.plan-api {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-head);
+  padding: 10px 12px;
+}
+
+.plan-api-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-api-method {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+}
+
+.plan-api-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.plan-api-desc {
+  margin-top: 6px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.plan-api-desc p:last-child {
+  margin-bottom: 0;
+}
+
+.plan-api-io {
+  margin-top: 8px;
+}
+
+.plan-api-io-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.plan-api-io .plan-code-plain {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-top: 3px;
+}
+
+/* ---------- data model ---------- */
+
+.plan-datamodel {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-head);
+  padding: 12px 14px 14px;
+}
+
+.plan-datamodel-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  border: 1px solid var(--border);
+}
+
+.plan-datamodel-table td {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  vertical-align: top;
+}
+
+.plan-dm-name {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.plan-dm-req {
+  color: rgb(var(--red));
+  margin-left: 2px;
+}
+
+.plan-dm-type {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--blue));
+  white-space: nowrap;
+}
+
+.plan-dm-desc {
+  color: var(--text-dim);
+}
+
+/* ---------- interactive: question / checklist / options ---------- */
+
+.plan-question,
+.plan-checklist,
+.plan-options {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--panel-head);
+}
+
+.plan-question-title {
+  font-weight: 650;
+  padding: 0 4px;
+  margin-left: -4px;
+}
+
+.plan-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.plan-option:hover {
+  background: rgba(var(--hilite), 0.04);
+}
+
+.plan-option.selected {
+  border-color: rgba(var(--blue), 0.5);
+  background: rgba(var(--blue), 0.07);
+}
+
+.plan-option input {
+  margin-top: 3px;
+  accent-color: rgb(var(--blue));
+}
+
+.plan-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.plan-option-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 550;
+}
+
+.plan-option-desc {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.plan-badge {
+  font-size: 9.5px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgb(var(--green));
+  background: rgba(var(--green), 0.1);
+  border: 1px solid rgba(var(--green), 0.3);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.plan-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.plan-check:hover {
+  background: rgba(var(--hilite), 0.04);
+}
+
+.plan-check input {
+  accent-color: rgb(var(--green));
+}
+
+.plan-check-done {
+  color: var(--text-dim);
+  text-decoration: line-through;
+}
+
+.plan-options-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.plan-option-card {
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 11px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plan-option-card:hover {
+  border-color: rgba(var(--hilite), 0.25);
+}
+
+.plan-option-card.selected {
+  border-color: rgba(var(--green), 0.55);
+  background: rgba(var(--green), 0.05);
+}
+
+.plan-option-proscons {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11.5px;
+}
+
+.plan-pro { color: rgb(var(--green)); }
+.plan-con { color: rgb(var(--red)); }
+
+/* ---------- selection comments ---------- */
+
+.plan-select-menu {
+  position: fixed;
+  transform: translate(-50%, calc(-100% - 8px));
+  z-index: 60;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text);
+  background: var(--panel-head);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.plan-select-menu:hover {
+  border-color: rgba(var(--blue), 0.5);
+}
+
+.plan-comment-pop {
+  position: fixed;
+  transform: translate(-50%, calc(-100% - 8px));
+  z-index: 60;
+  width: 300px;
+  background: var(--panel-head);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+
+.plan-comment-pop-quote {
+  font-size: 11px;
+  color: var(--text-dim);
+  border-left: 2px solid rgb(var(--amber));
+  padding-left: 8px;
+  margin-bottom: 8px;
+  line-height: 1.45;
+}
+
+.plan-comment-pop textarea {
+  width: 100%;
+  min-height: 56px;
+  resize: vertical;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 7px 9px;
+}
+
+.plan-comment-pop textarea:focus {
+  outline: none;
+  border-color: rgba(var(--blue), 0.5);
+}
+
+.plan-comment-pop-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.plan-comments {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.plan-comment {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+
+.plan-comment-quote {
+  color: var(--text-dim);
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-comment-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.plan-comment-x {
+  align-self: center;
+  display: inline-flex;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px;
+}
+
+.plan-comment-x:hover {
+  color: rgb(var(--red));
+}
+
+/* ---------- approve bar ---------- */
+
+.plan-approve {
+  position: sticky;
+  bottom: 0;
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: var(--panel-head);
+  padding: 8px 14px;
+}
+
+.plan-approve-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-approve-count {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.plan-note {
+  width: 100%;
+  min-height: 54px;
+  resize: vertical;
+  margin-bottom: 8px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.plan-note:focus {
+  outline: none;
+  border-color: rgba(var(--blue), 0.5);
+}
+
+.plan-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 11px;
+  cursor: pointer;
+}
+
+.plan-btn:hover {
+  border-color: rgba(var(--hilite), 0.25);
+}
+
+.plan-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.plan-btn.approve {
+  color: rgb(var(--green));
+  border-color: rgba(var(--green), 0.45);
+  background: rgba(var(--green), 0.08);
+}
+
+.plan-btn.approve:hover {
+  background: rgba(var(--green), 0.14);
+}
+
+.plan-btn.primary {
+  color: rgb(var(--blue));
+  border-color: rgba(var(--blue), 0.45);
+  background: rgba(var(--blue), 0.08);
+}
+
+/* ---------- wireframe canvas ---------- */
+
+.plan-canvas {
+  margin: 0 0 12px;
+}
+
+/* full-bleed top surface (first non-inline Canvas portals here) */
+.plan-hero:empty {
+  display: none;
+}
+
+.plan-hero {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-canvas.hero {
+  margin: 0;
+}
+
+.plan-canvas.hero .plan-canvas-head {
+  margin-bottom: 0;
+  padding: 9px 14px 5px;
+}
+
+.plan-canvas.hero .plan-board {
+  border: none;
+  border-radius: 0;
+}
+
+.plan-canvas-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.plan-canvas-head .plan-block-title {
+  margin-bottom: 0;
+}
+
+.plan-canvas-head {
+  margin-bottom: 6px;
+}
+
+/* per-artboard Sketch/Clean toggle — appears on hover, top-right of frame */
+.plan-artboard-look {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--text-dim);
+  background: var(--panel-head);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+
+.plan-artboard-frame:hover .plan-artboard-look,
+.plan-artboard-look:focus-visible {
+  opacity: 1;
+}
+
+.plan-artboard-look:hover {
+  color: var(--text);
+  border-color: rgba(var(--hilite), 0.3);
+}
+
+.plan-board-hgrip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 7px;
+  z-index: 6;
+  cursor: row-resize;
+}
+
+.plan-board-hgrip:hover {
+  background: rgba(var(--blue), 0.25);
+}
+
+/* Sketchy look: hand font; CSS borders go transparent and rough.js SVG
+   overlays draw the hand-drawn strokes over the real DOM. */
+.look-sketchy .plan-artboard-inner,
+.look-sketchy .plan-artboard-title,
+.look-sketchy .plan-artboard-notes {
+  font-family: "Shantell Sans", "Chalkboard SE", "Comic Sans MS",
+    "Segoe Print", cursive;
+}
+
+.look-sketchy .plan-artboard-frame,
+.look-sketchy .wf-box,
+.look-sketchy .wf-button,
+.look-sketchy .wf-input,
+.look-sketchy .wf-img,
+.look-sketchy .wf-pill,
+.look-sketchy .wf-urlbar-field {
+  border-color: transparent;
+}
+
+.look-sketchy .wf-divider {
+  border-top-style: dashed;
+}
+
+/* Clean look: real product-mock structure — solid card borders, tinted
+   surfaces, and separator lines between section columns. */
+.plan-artboard:not(.look-sketchy) .wf-box {
+  border-style: solid;
+  background: var(--panel-head);
+  border-radius: 8px;
+}
+
+.plan-artboard:not(.look-sketchy) .wf-img {
+  background-color: var(--panel-head);
+}
+
+.plan-artboard:not(.look-sketchy) .wf-row > .wf-col + .wf-col {
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
+}
+
+.plan-artboard:not(.look-sketchy) .wf-button,
+.plan-artboard:not(.look-sketchy) .wf-input,
+.plan-artboard:not(.look-sketchy) .wf-pill {
+  border-color: rgba(var(--hilite), 0.16);
+}
+
+/* --- pan/zoom board --- */
+
+.plan-board {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: grab;
+  touch-action: none;
+  overscroll-behavior: contain;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.plan-board:active {
+  cursor: grabbing;
+}
+
+.plan-board-grid {
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(
+    rgba(var(--hilite), 0.13) 1px,
+    transparent 1.2px
+  );
+}
+
+.plan-board-world {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  display: flex;
+  gap: 80px;
+  align-items: flex-start;
+  width: max-content;
+  padding: 30px;
+}
+
+.plan-board-controls {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--panel-head);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.plan-board-controls span {
+  min-width: 38px;
+  text-align: center;
+}
+
+.plan-board-controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 20px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.plan-board-controls button:hover {
+  color: var(--text);
+  background: rgba(var(--hilite), 0.07);
+}
+
+.plan-rough-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.plan-artboard-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.plan-artboard-frame {
+  position: relative;
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.plan-artboard-inner {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  background: var(--panel);
+}
+
+.plan-artboard-notes {
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+  max-width: 340px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.plan-artboard-notes li {
+  margin-bottom: 8px;
+}
+
+.wf-note-marker {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgb(var(--amber));
+  color: #000;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-ui);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.wf-note-marker.static {
+  position: static;
+  width: 15px;
+  height: 15px;
+  font-size: 10px;
+  margin-right: 4px;
+}
+
+.wf-urlbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -14px -14px 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-head);
+}
+
+.wf-urlbar-dots {
+  font-size: 8px;
+  color: var(--text-dim);
+  letter-spacing: 2px;
+}
+
+.wf-urlbar-field {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--panel);
+}
+
+.wf-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.wf-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wf-box {
+  border: 1px dashed var(--border);
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wf-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.wf-text {
+  display: block;
+}
+
+.wf-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 550;
+  background: var(--panel-head);
+}
+
+.wf-button.primary {
+  background: rgba(var(--blue), 0.15);
+  border-color: rgba(var(--blue), 0.5);
+  color: rgb(var(--blue));
+}
+
+.wf-input {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--panel);
+}
+
+.wf-img {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background:
+    linear-gradient(to top right, transparent calc(50% - 0.5px), var(--border), transparent calc(50% + 0.5px)),
+    linear-gradient(to bottom right, transparent calc(50% - 0.5px), var(--border), transparent calc(50% + 0.5px));
+}
+
+.wf-pill {
+  display: inline-flex;
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: var(--panel-head);
+}
+
+.wf-divider {
+  display: block;
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
