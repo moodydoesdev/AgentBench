@@ -180,7 +180,10 @@ export default function SettingsWindow() {
     setInstalling((m) => ({ ...m, [h.id]: true }));
     setInstallErr(({ [h.id]: _gone, ...rest }) => rest);
     try {
-      await invoke("install_harness", { command: h.install });
+      await invoke("install_harness", {
+        command: h.install,
+        shell: settings.shell?.trim() || null,
+      });
     } catch (e) {
       setInstallErr((m) => ({ ...m, [h.id]: String(e) }));
     }
@@ -446,6 +449,18 @@ export default function SettingsWindow() {
                     ["wterm-ghostty", "wterm·ghostty"],
                   ]}
                   onChange={(v) => set({ engine: v })}
+                />
+              </Row>
+              <Row
+                title="Shell"
+                sub="Shell agents and Terminal panes run through. Empty = auto ($SHELL on macOS/Linux, pwsh then powershell on Windows)"
+              >
+                <input
+                  className="harness-input cmd"
+                  value={settings.shell ?? ""}
+                  placeholder="auto"
+                  spellCheck={false}
+                  onChange={(ev) => set({ shell: ev.target.value })}
                 />
               </Row>
               <Row

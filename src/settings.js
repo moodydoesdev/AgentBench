@@ -42,10 +42,12 @@ export const BUILTIN_HARNESSES = [
   {
     id: "terminal",
     name: "Terminal",
-    // plain shell pane, no agent — $SHELL expands inside the login shell the
-    // broker launches every harness through (cmd.exe on Windows); no
-    // `install` since there is nothing to install
-    command: navigator.userAgent.includes("Windows") ? "cmd.exe" : "$SHELL -l",
+    // plain shell pane, no agent — on unix $SHELL expands inside the login
+    // shell the broker launches every harness through; on Windows the broker
+    // treats bare "$SHELL" as a sentinel and spawns the configured shell
+    // (Settings → Terminal → Shell, auto = pwsh) interactively. No `install`
+    // since there is nothing to install.
+    command: navigator.userAgent.includes("Windows") ? "$SHELL" : "$SHELL -l",
   },
 ];
 
@@ -81,6 +83,7 @@ export const DEFAULT_SETTINGS = {
   navMod: "off", // modifier for arrow-key pane navigation: off | ctrl | alt | meta
   wordMod: "ctrl", // modifier+←/→ sends ESC b / ESC f (word jump): off | ctrl | meta
   copyOnSelect: true, // highlighting text in a terminal copies it (xterm engine)
+  shell: "", // shell panes/installs run through ("" = auto: $SHELL, pwsh on Windows)
   theme: "midnight",
   bgImage: "", // absolute path to a custom background image ("" = off)
   bgOverlay: 0.85, // opacity of UI surfaces over the background image (0–1)

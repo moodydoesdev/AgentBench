@@ -309,6 +309,7 @@ export default function App() {
           resume: null,
           theme: getTheme(settingsRef.current.theme).claudeTheme ?? null,
           harness,
+          shell: settingsRef.current.shell?.trim() || null,
         });
         target = {
           id,
@@ -385,6 +386,7 @@ export default function App() {
                 ? getTheme(settingsRef.current.theme).claudeTheme ?? null
                 : null,
               harness,
+              shell: settingsRef.current.shell?.trim() || null,
             });
             restored.push({
               id,
@@ -631,6 +633,7 @@ export default function App() {
         ? getTheme(settingsRef.current.theme).claudeTheme ?? null
         : null,
       harness,
+      shell: settingsRef.current.shell?.trim() || null,
     });
     const pane = { id, projectPath: activePath, label: `${harness.name} ${id}` };
     setPanes((p) => {

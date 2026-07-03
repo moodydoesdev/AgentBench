@@ -163,10 +163,11 @@ fn create_pane(
     resume: Option<String>,
     theme: Option<String>,
     harness: Option<Value>,
+    shell: Option<String>,
 ) -> Result<u32, String> {
     let v = client.request(json!({
         "op": "create", "cwd": cwd, "cols": cols, "rows": rows, "resume": resume,
-        "theme": theme, "harness": harness
+        "theme": theme, "harness": harness, "shell": shell
     }))?;
     v.as_u64().map(|x| x as u32).ok_or("bad response".into())
 }
@@ -303,15 +304,30 @@ fn check_binaries(bins: Vec<String>) -> Vec<String> {
     }
     #[cfg(windows)]
     {
-        safe.into_iter()
-            .filter(|b| {
-                std::process::Command::new("where")
-                    .arg(b)
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            })
-            .collect()
+        // one hidden `where` for all bins — one spawn per bin flashed a
+        // console window each time and made startup crawl
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(out) = std::process::Command::new("where")
+            .args(&safe)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            return Vec::new();
+        };
+        // `where` prints full paths for every hit (exit code only says
+        // whether *all* were found); match hits back by file stem
+        let stem = |s: &str| {
+            std::path::Path::new(s)
+                .file_stem()
+                .map(|x| x.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        };
+        let found: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| stem(l.trim()))
+            .collect();
+        safe.into_iter().filter(|b| found.contains(&stem(b))).collect()
     }
 }
 
@@ -320,12 +336,12 @@ fn check_binaries(bins: Vec<String>) -> Vec<String> {
 /// the main thread. Returns combined output on failure so the error is
 /// actionable.
 #[tauri::command]
-async fn install_harness(command: String) -> Result<(), String> {
+async fn install_harness(command: String, shell: Option<String>) -> Result<(), String> {
+    let sh = broker::resolve_shell(shell.as_deref());
     let out;
     #[cfg(unix)]
     {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        out = std::process::Command::new(shell)
+        out = std::process::Command::new(sh)
             .arg("-lc")
             .arg(&command)
             .output()
@@ -333,9 +349,12 @@ async fn install_harness(command: String) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        out = std::process::Command::new("cmd.exe")
-            .arg("/C")
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        out = std::process::Command::new(&sh)
+            .args(broker::shell_command_args(&sh))
             .arg(&command)
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| e.to_string())?;
     }

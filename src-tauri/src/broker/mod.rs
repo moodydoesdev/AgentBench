@@ -229,6 +229,47 @@ fn write_hook_settings(
     Ok(path)
 }
 
+/// Shell to run panes/installs through. `pref` is the user's Settings choice
+/// ("" / None = auto). Auto: $SHELL on unix; pwsh → powershell → cmd on
+/// Windows (PATH scanned directly — spawning `where` flashes a console).
+pub fn resolve_shell(pref: Option<&str>) -> String {
+    if let Some(s) = pref.map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
+    #[cfg(unix)]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+    }
+    #[cfg(windows)]
+    {
+        if let Some(paths) = std::env::var_os("PATH") {
+            for cand in ["pwsh.exe", "powershell.exe"] {
+                for dir in std::env::split_paths(&paths) {
+                    if dir.join(cand).is_file() {
+                        return cand.to_string();
+                    }
+                }
+            }
+        }
+        "cmd.exe".into()
+    }
+}
+
+/// Args that make `shell` run a one-shot command line: cmd /C, pwsh -Command,
+/// posix -c for anything else (e.g. Git bash).
+#[cfg(windows)]
+pub fn shell_command_args(shell: &str) -> &'static [&'static str] {
+    let stem = std::path::Path::new(shell)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match stem.as_str() {
+        "cmd" => &["/C"],
+        "pwsh" | "powershell" => &["-NoLogo", "-Command"],
+        _ => &["-c"],
+    }
+}
+
 /// Launch the harness through a login shell so it gets the user's real PATH
 /// even when launched from Finder/Explorer. `settings_path` is Some only for
 /// Claude — it carries the hook wiring via `--settings`.
@@ -239,6 +280,7 @@ fn harness_command(
     resume: Option<&str>,
     pane_id: u32,
     hook_port: u16,
+    shell_pref: Option<&str>,
 ) -> CommandBuilder {
     let mut line = spec.command.clone();
     if let Some(path) = settings_path {
@@ -254,19 +296,25 @@ fn harness_command(
             line.push_str(&tpl.replace("{session_id}", sid));
         }
     }
+    let shell = resolve_shell(shell_pref);
     let mut cmd;
     #[cfg(unix)]
     {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         cmd = CommandBuilder::new(shell);
         cmd.arg("-lc");
         cmd.arg(format!("exec {}", line));
     }
     #[cfg(windows)]
     {
-        cmd = CommandBuilder::new("cmd.exe");
-        cmd.arg("/C");
-        cmd.arg(line);
+        cmd = CommandBuilder::new(&shell);
+        // "$SHELL" is the Terminal harness sentinel: spawn the shell itself,
+        // interactively, instead of running a command line through it
+        if line.trim() != "$SHELL" {
+            for a in shell_command_args(&shell) {
+                cmd.arg(a);
+            }
+            cmd.arg(line);
+        }
     }
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
@@ -286,6 +334,7 @@ pub fn create_pane(
     resume: Option<String>,
     theme: Option<String>,
     harness: Option<HarnessSpec>,
+    shell: Option<String>,
 ) -> Result<u32, String> {
     let spec = harness.unwrap_or_else(HarnessSpec::claude_default);
     let id = core.next_id.fetch_add(1, Ordering::SeqCst);
@@ -323,6 +372,7 @@ pub fn create_pane(
             resume.as_deref(),
             id,
             port,
+            shell.as_deref(),
         ))
         .map_err(|e| e.to_string())?;
     drop(pair.slave);
@@ -591,6 +641,7 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
                 req["resume"].as_str().map(String::from),
                 req["theme"].as_str().map(String::from),
                 HarnessSpec::from_value(&req["harness"]),
+                req["shell"].as_str().map(String::from),
             );
             Some(match res {
                 Ok(id) => json!({ "result": id }),
