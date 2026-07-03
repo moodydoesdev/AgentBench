@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <b>Run a whole bench of Claude Code agents, side by side.</b><br>
-  A multi-agent workspace that turns one screen into a grid of live coding agents.
+  <b>Run a whole bench of coding agents, side by side.</b><br>
+  Claude Code, Codex, Gemini, opencode and more — one screen, a grid of live agents.
 </p>
 
 <p align="center">
@@ -18,10 +18,18 @@
 
 ---
 
-AgentBench is a desktop app for people who run more than one Claude Code
-session at a time. Instead of juggling terminal tabs, you get a grid of agent
-panes per project — each one a full terminal running `claude` — with the app
-keeping watch so you don't have to.
+<p align="center">
+  <img src="docs/hero.png" alt="AgentBench running a grid of agents across multiple projects" width="900">
+</p>
+
+<p align="center">
+  ▶ <a href="https://youtu.be/GFImlNo6FDk"><b>Watch the demo video</b></a>
+</p>
+
+AgentBench is a desktop app for people who run more than one coding agent at a
+time. Instead of juggling terminal tabs, you get a grid of agent panes per
+project — each one a full terminal running the agent of your choice — with the
+app keeping watch so you don't have to.
 
 ## Why
 
@@ -33,6 +41,10 @@ miss, and makes everything in between effortless.
 
 - **Agent grid** — spawn as many agents as you need per project, arranged in a
   resizable, drag-to-reorder grid. One click to add another.
+- **Any agent, one bench** — Claude Code, opencode, Codex, Gemini CLI, and pi
+  ship as built-in harnesses, plus plain terminal panes and custom harnesses
+  for anything else on your PATH. Missing binary? AgentBench installs it right
+  in the pane, in front of you. Mix harnesses freely in the same grid.
 - **Knows when a turn ends** — panes glow green when an agent finishes and
   pulse amber when one is waiting on your input. No output-scraping guesswork;
   it's wired into Claude Code itself.
@@ -52,6 +64,18 @@ miss, and makes everything in between effortless.
   The app checks on launch, installs in place, and restarting brings every
   agent back exactly where it was.
 
+<p align="center">
+  <img src="docs/plan.png" alt="A visual plan with wireframes, architecture diagram, and file map published by an agent" width="900">
+  <br>
+  <sub>An agent-published visual plan: wireframes, data flow, API contract, and a file-by-file build sequence.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/harness-menu.png" alt="Harness picker: Claude, opencode, Codex, Gemini, pi, Terminal" width="300">
+  <br>
+  <sub>Pick a harness per pane — mix agents freely in one grid.</sub>
+</p>
+
 ## Status at a glance
 
 | Pane          | Meaning                          |
@@ -65,7 +89,10 @@ Click into a pane and the glow clears — you're caught up.
 
 ## Getting started
 
-Prereqs: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` on your PATH), Node 20+, Rust toolchain.
+Prereqs: Node 20+, Rust toolchain, and at least one agent CLI —
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets the deepest
+integration (status glow, session resume, visual plans); Codex, Gemini,
+opencode, and pi run as full terminal harnesses.
 
 ```bash
 npm install
@@ -73,4 +100,5 @@ npm run tauri dev      # run the app
 npm run tauri build    # package it (.app / .msi)
 ```
 
-Add a project, hit **New Agent**, and start delegating.
+Add a project, hit **New Claude** — or pick any other harness from the
+dropdown — and start delegating.
