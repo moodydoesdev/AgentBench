@@ -24,7 +24,8 @@ import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu";
-import { GearSix, Plus, FileText, X } from "@phosphor-icons/react";
+import { Bell, GearSix, Plus, FileText, X } from "@phosphor-icons/react";
+import { Popover } from "radix-ui";
 import notifyWav from "./assets/notify.wav";
 import Logo from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
@@ -47,6 +48,16 @@ function loadJSON(key, fallback) {
 
 function baseName(path) {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function timeAgo(ts) {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 export default function App() {
@@ -74,6 +85,8 @@ export default function App() {
   const [projectPlans, setProjectPlans] = useState({}); // projectPath -> [{path, slug, title, mtime}]
   const [composerOpen, setComposerOpen] = useState(false); // new-plan composer modal
   const [cmdMenuOpen, setCmdMenuOpen] = useState(false);
+  const [notifs, setNotifs] = useState([]); // {key, paneId, kind, label, project, projectPath, ts, read}
+  const [notifOpen, setNotifOpen] = useState(false);
   const renameInputRef = useRef(null);
 
   const panesRef = useRef(panes);
@@ -388,6 +401,23 @@ export default function App() {
       const { id, kind } = e.payload;
       const status = kind === "done" ? "done" : "input";
       setStatuses((s) => (id in s ? { ...s, [id]: status } : s));
+      const pane = panesRef.current.find((p) => p.id === id);
+      const label = titlesRef.current[id] || pane?.label || `Agent ${id}`;
+      setNotifs((list) =>
+        [
+          {
+            key: `${id}-${Date.now()}`,
+            paneId: id,
+            kind,
+            label,
+            project: pane ? baseName(pane.projectPath) : "",
+            projectPath: pane?.projectPath,
+            ts: Date.now(),
+            read: false,
+          },
+          ...list,
+        ].slice(0, 30),
+      );
       const cfg = settingsRef.current;
       if (cfg.sound) {
         ping.volume = cfg.volume ?? 0.8;
@@ -395,8 +425,6 @@ export default function App() {
         ping.play().catch(() => {});
       }
       if (cfg.osNotify && !document.hasFocus()) {
-        const pane = panesRef.current.find((p) => p.id === id);
-        const label = titlesRef.current[id] || pane?.label || `Agent ${id}`;
         sendNotification({
           title: pane ? `${label} · ${baseName(pane.projectPath)}` : label,
           body: kind === "done" ? "Finished its turn." : "Waiting for your input.",
@@ -636,6 +664,19 @@ export default function App() {
     handle?.scrollIntoView?.();
   };
 
+  const openNotification = (n) => {
+    const pane = panesRef.current.find((p) => p.id === n.paneId);
+    if (!pane) return; // agent closed since
+    setNotifOpen(false);
+    if (pane.projectPath !== activePathRef.current) {
+      setActivePath(pane.projectPath);
+      // pane mounts on next render; focus after it exists
+      setTimeout(() => focusAgent(pane), 50);
+    } else {
+      focusAgent(pane);
+    }
+  };
+
   // Command menu hotkey (configurable in Settings → Hotkeys). Capture
   // phase so the terminals never see the keystroke.
   useEffect(() => {
@@ -839,6 +880,64 @@ export default function App() {
               <FileText size={15} />
             </button>
           )}
+          <Popover.Root
+            open={notifOpen}
+            onOpenChange={(o) => {
+              setNotifOpen(o);
+              if (o) setNotifs((l) => l.map((n) => (n.read ? n : { ...n, read: true })));
+            }}
+          >
+            <Popover.Trigger asChild>
+              <button className="btn-icon notif-bell" title="Notifications">
+                <Bell size={15} />
+                {(() => {
+                  const unread = notifs.filter((n) => !n.read).length;
+                  return unread > 0 ? (
+                    <span className="notif-badge">{unread > 9 ? "9+" : unread}</span>
+                  ) : null;
+                })()}
+              </button>
+            </Popover.Trigger>
+            <Popover.Portal>
+              <Popover.Content className="notif-pop" align="end" sideOffset={8}>
+                <div className="notif-head">
+                  <span>Recent activity</span>
+                  {notifs.length > 0 && (
+                    <button className="notif-clear" onClick={() => setNotifs([])}>
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {notifs.length === 0 ? (
+                  <div className="notif-empty">Nothing yet. Agents report here when they finish.</div>
+                ) : (
+                  notifs.map((n) => {
+                    const alive = panes.some((p) => p.id === n.paneId);
+                    return (
+                      <button
+                        key={n.key}
+                        className={`notif-item${alive ? "" : " stale"}`}
+                        onClick={() => openNotification(n)}
+                        title={alive ? "Go to agent" : "Agent closed"}
+                      >
+                        <span className={`notif-dot ${n.kind === "done" ? "done" : "input"}`} />
+                        <span className="notif-body">
+                          <span className="notif-title">
+                            {n.label}
+                            {n.project ? ` · ${n.project}` : ""}
+                          </span>
+                          <span className="notif-sub">
+                            {n.kind === "done" ? "Finished its turn" : "Waiting for your input"} ·{" "}
+                            {timeAgo(n.ts)}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </Popover.Content>
+            </Popover.Portal>
+          </Popover.Root>
           <button className="btn-icon" title="Settings" onClick={openSettings}>
             <GearSix size={15} />
           </button>
