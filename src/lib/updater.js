@@ -1,6 +1,7 @@
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 
 // Checks GitHub releases (latest.json) for a newer signed build. If found,
 // asks the user, downloads + installs in place, then offers a relaunch.
@@ -17,6 +18,10 @@ export async function checkForUpdates({ manual = false } = {}) {
       { title: "Update available", kind: "info", okLabel: "Install", cancelLabel: "Later" },
     );
     if (!wantsIt) return "later";
+
+    // Kill the broker before installing so the old binary isn't locked
+    // (Windows) and the new one starts cleanly on relaunch.
+    await invoke("shutdown_broker").catch(() => {});
 
     await update.downloadAndInstall();
 

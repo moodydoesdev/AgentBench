@@ -54,6 +54,8 @@ const AGENT_COLORS = {
 
 // Claude Code exits on a quick double Ctrl+C. Swallow the repeat so a stray
 // mash can't kill the agent; a single Ctrl+C (interrupt) still goes through.
+// Applies only to Claude panes (sigintGuard prop) — terminal/run panes need
+// repeated ^C to reach the process (e.g. stopping a stubborn dev server).
 const SIGINT_GUARD_MS = 1500;
 
 
@@ -128,6 +130,8 @@ function createSyncFilter(write) {
 const FALLBACK_STACK = '"SF Mono", Menlo, Consolas, monospace';
 const FONT_STACK = `"FiraCode Nerd Font Mono", ${FALLBACK_STACK}`;
 
+const IS_WINDOWS = navigator.userAgent.includes("Windows");
+
 // File-path shapes in agent output: /abs/path, ~/path, ./rel, ../rel,
 // src/App.jsx — with an optional :line[:col] suffix. Segments end on a
 // non-dot so trailing sentence punctuation stays out of the link.
@@ -174,6 +178,30 @@ function XtermInner({
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    // Windows: xterm maps Ctrl+V to the ^V control char (Linux-terminal
+    // convention, paste = Ctrl+Shift+V), so the paste shortcut Windows
+    // users expect does nothing. Intercept it: text in the clipboard →
+    // normal (bracketed) paste; no text (e.g. an image) → forward ^V so
+    // Claude Code's clipboard image paste still works.
+    if (IS_WINDOWS) {
+      term.attachCustomKeyEventHandler((ev) => {
+        if (
+          ev.type === "keydown" &&
+          ev.ctrlKey &&
+          !ev.shiftKey &&
+          !ev.altKey &&
+          !ev.metaKey &&
+          ev.key.toLowerCase() === "v"
+        ) {
+          navigator.clipboard
+            .readText()
+            .then((text) => (text ? term.paste(text) : sendData("\x16")))
+            .catch(() => sendData("\x16"));
+          return false;
+        }
+        return true;
+      });
+    }
     // Clickable URLs and file paths — ctrl/⌘+click opens them (browser or
     // default app, which the OS brings to the foreground); plain clicks
     // stay free for selection.
@@ -523,6 +551,7 @@ export default memo(function AgentPane({
   name,
   cwd,
   kind, // "run" = project run-command pane; undefined = agent pane
+  sigintGuard = false, // swallow rapid repeat Ctrl+C (Claude panes only)
   hidden = false, // run pane hidden while its process keeps running
   command, // run panes: the command line (shown where agents show cwd)
   onHide,
@@ -610,7 +639,7 @@ export default memo(function AgentPane({
   };
 
   const sendData = (data) => {
-    if (data === "\x03") {
+    if (sigintGuard && data === "\x03") {
       const now = Date.now();
       if (now - lastSigintRef.current < SIGINT_GUARD_MS) return;
       lastSigintRef.current = now;

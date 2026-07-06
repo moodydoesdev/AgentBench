@@ -80,8 +80,16 @@ fn handle_client(core: Arc<Core>, stream: TcpStream) {
             }
         };
         if let Some(resp) = broker::handle_request(&core, &req) {
+            let is_shutdown = resp["result"] == "bye";
             if tx.send(resp.to_string()).is_err() {
                 break;
+            }
+            if is_shutdown {
+                // Give the reply time to flush, then exit the process.
+                // Other threads (listener, pty readers) hold the process
+                // alive, so process::exit is the clean way out.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::process::exit(0);
             }
         }
     }

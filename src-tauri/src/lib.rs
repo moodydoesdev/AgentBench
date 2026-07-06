@@ -202,6 +202,14 @@ fn saved_panes(client: State<'_, Arc<BrokerClient>>) -> Result<Value, String> {
     client.request(json!({ "op": "saved" }))
 }
 
+/// Ask the broker to kill all panes and exit. Called before an in-place
+/// update so the old binary isn't locked (Windows) and the new broker
+/// binary starts cleanly on relaunch.
+#[tauri::command]
+fn shutdown_broker(client: State<'_, Arc<BrokerClient>>) -> Result<(), String> {
+    client.request(json!({ "op": "shutdown" })).map(|_| ())
+}
+
 /// Read a plan MDX file for the plan pane. Returns content + mtime (ms) so
 /// the frontend can cheaply poll for changes.
 #[tauri::command]
@@ -462,7 +470,8 @@ pub fn run() {
             read_file_base64,
             sync_plan_skill,
             check_binaries,
-            install_harness
+            install_harness,
+            shutdown_broker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

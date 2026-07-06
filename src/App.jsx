@@ -1433,6 +1433,7 @@ export default function App() {
                     key={p.id}
                     id={p.id}
                     kind={p.kind}
+                    sigintGuard={!!p.harness?.claude}
                     hidden={p.hidden}
                     command={p.command}
                     onHide={hideRun}

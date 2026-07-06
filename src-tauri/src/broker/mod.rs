@@ -686,6 +686,17 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
         Some("list") => Some(json!({ "result": list_panes(core) })),
         Some("saved") => Some(json!({ "result": saved_panes(core) })),
         Some("ping") => Some(json!({ "result": "pong" })),
+        Some("shutdown") => {
+            // Kill all panes, remove the broker file, then exit.
+            // Used before an in-place update so the old binary isn't locked.
+            let ids: Vec<u32> = core.panes.lock().unwrap().keys().copied().collect();
+            for id in ids {
+                kill_pane(core, id);
+            }
+            let _ = std::fs::remove_file(broker_file());
+            // Reply so the caller knows we're going down, then exit.
+            return Some(json!({ "result": "bye" }));
+        }
         _ => Some(json!({ "error": "unknown op" })),
     }
 }
