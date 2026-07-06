@@ -1009,6 +1009,27 @@ body {
   white-space: nowrap;
 }
 
+/* per-project custom color (context menu → Color) */
+.project.colored .project-name {
+  color: var(--proj-color);
+}
+
+.project.colored.active {
+  border-left-color: var(--proj-color);
+}
+
+.color-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.color-swatch-none {
+  border: 1px solid var(--border);
+}
+
 .project-count {
   font-family: var(--font-mono);
   font-size: 11px;

@@ -30,6 +30,9 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubTrigger,
+  ContextMenuSubContent,
 } from "@/components/ui/context-menu";
 import { Bell, CaretDown, GearSix, Play, Plus, FileText, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
@@ -52,6 +55,18 @@ const ping = new Audio(notifyWav);
 
 const IS_MAC = navigator.userAgent.includes("Mac");
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
+
+// Preset swatches for per-project sidebar colors (context menu → Color).
+const PROJECT_COLORS = [
+  { name: "Red", value: "#f87171" },
+  { name: "Orange", value: "#fb923c" },
+  { name: "Amber", value: "#fbbf24" },
+  { name: "Green", value: "#4ade80" },
+  { name: "Teal", value: "#2dd4bf" },
+  { name: "Blue", value: "#60a5fa" },
+  { name: "Purple", value: "#a78bfa" },
+  { name: "Pink", value: "#f472b6" },
+];
 
 function loadJSON(key, fallback) {
   try {
@@ -1268,7 +1283,8 @@ export default function App() {
                 <ContextMenu key={p.path}>
                   <ContextMenuTrigger asChild>
                     <div
-                      className={`project ${p.path === activePath ? "active" : ""} attn-${st}`}
+                      className={`project ${p.path === activePath ? "active" : ""} attn-${st} ${p.color ? "colored" : ""}`}
+                      style={p.color ? { "--proj-color": p.color } : undefined}
                       title={p.path}
                       onClick={() => setActivePath(p.path)}
                     >
@@ -1320,6 +1336,39 @@ export default function App() {
                     <ContextMenuItem onSelect={() => setRunDialog(p.path)}>
                       Run commands…
                     </ContextMenuItem>
+                    <ContextMenuSub>
+                      <ContextMenuSubTrigger>Color</ContextMenuSubTrigger>
+                      <ContextMenuSubContent className="min-w-[140px]">
+                        {PROJECT_COLORS.map((c) => (
+                          <ContextMenuItem
+                            key={c.value}
+                            onSelect={() =>
+                              updateProject(p.path, { color: c.value })
+                            }
+                          >
+                            <span
+                              className="color-swatch"
+                              style={{ background: c.value }}
+                            />
+                            {c.name}
+                            {p.color === c.value && (
+                              <span className="ml-auto text-xs opacity-50">
+                                ✓
+                              </span>
+                            )}
+                          </ContextMenuItem>
+                        ))}
+                        <ContextMenuSeparator />
+                        <ContextMenuItem
+                          onSelect={() =>
+                            updateProject(p.path, { color: undefined })
+                          }
+                        >
+                          <span className="color-swatch color-swatch-none" />
+                          Default
+                        </ContextMenuItem>
+                      </ContextMenuSubContent>
+                    </ContextMenuSub>
                     <ContextMenuSeparator />
                     <ContextMenuItem
                       variant="destructive"
