@@ -4,17 +4,19 @@ import { ask } from "@tauri-apps/plugin-dialog";
 
 // Checks GitHub releases (latest.json) for a newer signed build. If found,
 // asks the user, downloads + installs in place, then offers a relaunch.
-// Fails silently — an offline user should never see an updater error.
-export async function checkForUpdates() {
+// Auto-check (launch) fails silently — an offline user should never see an
+// updater error. Manual checks (Settings button) throw instead, so the UI
+// can show what happened. Returns "none" | "later" | "installed".
+export async function checkForUpdates({ manual = false } = {}) {
   try {
     const update = await check();
-    if (!update) return;
+    if (!update) return "none";
 
     const wantsIt = await ask(
       `AgentBench ${update.version} is available.\n\n${update.body ?? ""}`.trim(),
       { title: "Update available", kind: "info", okLabel: "Install", cancelLabel: "Later" },
     );
-    if (!wantsIt) return;
+    if (!wantsIt) return "later";
 
     await update.downloadAndInstall();
 
@@ -23,7 +25,10 @@ export async function checkForUpdates() {
       { title: "Restart to update", okLabel: "Restart", cancelLabel: "Later" },
     );
     if (restartNow) await relaunch();
+    return "installed";
   } catch (e) {
     console.warn("update check failed:", e);
+    if (manual) throw e;
+    return "none";
   }
 }

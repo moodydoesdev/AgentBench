@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -175,6 +176,24 @@ export default function SettingsWindow() {
   useEffect(() => {
     if (section === "agents") probeHarnesses();
   }, [section]);
+
+  // Settings → Workspace → Updates
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+  const [updateState, setUpdateState] = useState(null); // null | "checking" | "none" | "error"
+  const checkUpdates = async () => {
+    setUpdateState("checking");
+    try {
+      // dynamic import keeps the updater plugin out of the settings chunk
+      const { checkForUpdates } = await import("./lib/updater.js");
+      const res = await checkForUpdates({ manual: true });
+      setUpdateState(res === "none" ? "none" : null);
+    } catch {
+      setUpdateState("error");
+    }
+  };
 
   const installHarness = async (h) => {
     setInstalling((m) => ({ ...m, [h.id]: true }));
@@ -473,6 +492,28 @@ export default function SettingsWindow() {
                     set({ copyOnSelect: !(settings.copyOnSelect !== false) })
                   }
                 />
+              </Row>
+            </Card>
+            <Card title="Updates">
+              <Row
+                title={appVersion ? `AgentBench ${appVersion}` : "AgentBench"}
+                sub={
+                  updateState === "none"
+                    ? "You're on the latest version"
+                    : updateState === "error"
+                      ? "Update check failed — check your connection and try again"
+                      : "Updates are checked automatically at launch (packaged builds)"
+                }
+              >
+                <button
+                  className="btn-sm"
+                  onClick={checkUpdates}
+                  disabled={updateState === "checking"}
+                >
+                  {updateState === "checking"
+                    ? "Checking…"
+                    : "Check for updates"}
+                </button>
               </Row>
             </Card>
           </section>
