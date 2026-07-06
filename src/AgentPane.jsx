@@ -341,6 +341,15 @@ function XtermInner({
       }
       clearTimeout(resyncTimer);
       resyncTimer = setTimeout(() => {
+        // Re-fit once layout has settled: fit() above can throw (or compute
+        // stale dims) mid-reflow, and if that was the storm's last RO tick
+        // the grid stays too tall and the bottom rows clip. fit() is cheap
+        // and a no-op when dims already match.
+        try {
+          fit.fit();
+        } catch {
+          /* ignore */
+        }
         invoke("resize_pane", { id, cols: term.cols, rows: term.rows }).catch(
           () => {},
         );
