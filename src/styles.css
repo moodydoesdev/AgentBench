@@ -1435,13 +1435,13 @@ body {
   flex: 1;
   min-height: 0;
   background: var(--theme-term-bg);
-  /* Extra bottom clearance: xterm's cell height is fractional, so
-     FitAddon's floor(height / cellHeight) can leave the last row a few px
-     taller than the viewport. In alt-screen TUIs (Claude's status/prompt
-     line, the agent-manage list) there's no scrollback to absorb it and the
-     row gets clipped at the pane edge. The buffer both trims the height
-     FitAddon measures and gives the last row room to paint. */
-  padding: 8px 0 16px 10px;
+  /* content-box is load-bearing: FitAddon sizes the grid from
+     getComputedStyle(parent).height, which under the app-wide border-box
+     reset includes this padding — it over-counted rows by one and the
+     bottom row (Claude's status/prompt line) clipped at the pane edge.
+     content-box makes the computed height the true content area. */
+  box-sizing: content-box;
+  padding: 8px 0 10px 10px;
 }
 
 .pane-term .xterm {

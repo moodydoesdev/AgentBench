@@ -324,6 +324,21 @@ fn harness_command(
         // "$SHELL" is the Terminal harness sentinel: spawn the shell itself,
         // interactively, instead of running a command line through it
         if line.trim() != "$SHELL" {
+            // ConPTY transcodes pty traffic through the console codepage
+            // (OEM 437 by default) and substitutes '?' for anything it can't
+            // map — Claude's "⏵⏵ bypass permissions" indicator arrives as
+            // "??". Flip the pane's console to UTF-8 before the harness runs.
+            let stem = std::path::Path::new(&shell)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let line = match stem.as_str() {
+                "cmd" => format!("chcp 65001 >nul & {line}"),
+                "pwsh" | "powershell" => format!("chcp 65001 | Out-Null; {line}"),
+                // bash-alikes (Git bash): chcp.com may be absent; redirects
+                // swallow both its output and the not-found complaint
+                _ => format!("chcp.com 65001 >/dev/null 2>/dev/null; {line}"),
+            };
             for a in shell_command_args(&shell) {
                 cmd.arg(a);
             }

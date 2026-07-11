@@ -193,6 +193,11 @@ function XtermInner({
           !ev.metaKey &&
           ev.key.toLowerCase() === "v"
         ) {
+          // Suppress the browser's native paste: returning false only skips
+          // xterm's key handling, so WebView2 still fires a paste event that
+          // xterm's textarea listener services — pasting a second copy on
+          // top of the term.paste() below.
+          ev.preventDefault();
           navigator.clipboard
             .readText()
             .then((text) => (text ? term.paste(text) : sendData("\x16")))
