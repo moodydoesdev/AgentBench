@@ -17,6 +17,7 @@ import {
   Minus,
   Play,
 } from "@phosphor-icons/react";
+import ChatView from "./chat/ChatView";
 import "@xterm/xterm/css/xterm.css";
 import "@wterm/dom/css";
 
@@ -555,8 +556,12 @@ export default memo(function AgentPane({
   id,
   name,
   cwd,
-  kind, // "run" = project run-command pane; undefined = agent pane
+  kind, // "run" = project run-command pane; "chat" = headless Claude; undefined = agent pane
   sigintGuard = false, // swallow rapid repeat Ctrl+C (Claude panes only)
+  claude = false, // Claude harness — enables the Term ⇄ Chat view toggle
+  view = "term", // "term" | "chat" (read-along transcript view)
+  onViewChange,
+  initialLines, // chat panes: replayed stream-json lines from reattach
   hidden = false, // run pane hidden while its process keeps running
   command, // run panes: the command line (shown where agents show cwd)
   onHide,
@@ -683,11 +688,23 @@ export default memo(function AgentPane({
     return () => sub.then((f) => f());
   }, []);
 
-  const register = (handle) => {
+  // Terminal and chat view can be mounted at once (chat overlays a hidden
+  // terminal); publish one handle that routes focus to whichever is visible,
+  // so app-level focus never types into a hidden pty.
+  const termHandleRef = useRef(null);
+  const chatHandleRef = useRef(null);
+  const chatVisibleRef = useRef(false);
+
+  const publishHandle = () => {
+    const any = termHandleRef.current || chatHandleRef.current;
     callbacksRef.current.onRegister(
       id,
-      handle && {
-        ...handle,
+      any && {
+        focus: () =>
+          chatVisibleRef.current && chatHandleRef.current
+            ? chatHandleRef.current.focus()
+            : (termHandleRef.current ?? chatHandleRef.current)?.focus(),
+        write: (d) => termHandleRef.current?.write?.(d),
         scrollIntoView: () =>
           sectionRef.current?.scrollIntoView({
             block: "nearest",
@@ -695,6 +712,16 @@ export default memo(function AgentPane({
           }),
       },
     );
+  };
+
+  const register = (handle) => {
+    termHandleRef.current = handle;
+    publishHandle();
+  };
+
+  const registerChat = (handle) => {
+    chatHandleRef.current = handle;
+    publishHandle();
   };
 
   const handleTitle = (title) => {
@@ -730,6 +757,31 @@ export default memo(function AgentPane({
   const isWterm = engine.startsWith("wterm");
   const Inner = isWterm ? WtermInner : XtermInner;
   const isRun = kind === "run";
+  const isChat = kind === "chat"; // headless — no pty, no terminal view
+  const showToggle = claude && !isRun && !isChat;
+  const chatVisible = isChat || (showToggle && view === "chat");
+  chatVisibleRef.current = chatVisible;
+  // once opened, chat stays mounted (hidden) across toggles — unmounting
+  // would drop its store, losing pending echoes and scroll position
+  const chatOpenedRef = useRef(false);
+  if (chatVisible) chatOpenedRef.current = true;
+
+  // Read-along composer: same bracketed-paste-then-Enter path as plan
+  // feedback, so the text lands in the pty exactly like a user paste.
+  const sendChatToPty = (text) => {
+    callbacksRef.current.onActivity(id);
+    invoke("write_pane", { id, data: `\x1b[200~${text}\x1b[201~` }).catch(() => {});
+    setTimeout(() => {
+      invoke("write_pane", { id, data: "\r" }).catch(() => {});
+    }, 150);
+  };
+
+  // Headless composer: plain text — the broker wraps it into a stream-json
+  // user message on the harness's stdin.
+  const sendChatToStream = (text) => {
+    callbacksRef.current.onActivity(id);
+    invoke("write_pane", { id, data: text }).catch(() => {});
+  };
 
   return (
     <section
@@ -765,6 +817,30 @@ export default memo(function AgentPane({
         <span className="pane-cwd" title={command ?? cwd}>
           {command ?? cwd}
         </span>
+        {showToggle && (
+          <div className="pane-view-toggle">
+            <button
+              className={!chatVisible ? "on" : ""}
+              title="Terminal view"
+              onClick={(ev) => {
+                ev.stopPropagation();
+                onViewChange?.(id, "term");
+              }}
+            >
+              Term
+            </button>
+            <button
+              className={chatVisible ? "on" : ""}
+              title="Chat view — rendered transcript, native select/copy"
+              onClick={(ev) => {
+                ev.stopPropagation();
+                onViewChange?.(id, "chat");
+              }}
+            >
+              Chat
+            </button>
+          </div>
+        )}
         {isRun && status === "exited" && (
           <button
             className="pane-size"
@@ -810,19 +886,51 @@ export default memo(function AgentPane({
           <X size={13} weight="bold" />
         </button>
       </header>
-      <Inner
-        key={engine}
-        id={id}
-        cwd={cwd}
-        ghostty={engine === "wterm-ghostty"}
-        focused={focused}
-        termTheme={termTheme}
-        copyOnSelect={copyOnSelect}
-        initialData={initialData}
-        register={register}
-        sendData={sendData}
-        onTitle={handleTitle}
-      />
+      {isChat ? (
+        <ChatView
+          id={id}
+          cwd={cwd}
+          mode="stream"
+          initialLines={initialLines}
+          onSend={sendChatToStream}
+          onStop={() => invoke("interrupt_pane", { id }).catch(() => {})}
+          status={status}
+          register={registerChat}
+        />
+      ) : (
+        <>
+          {/* terminal stays mounted under the chat view so scrollback and
+              the pty keep flowing; toggling back is instant and lossless */}
+          <div className={`pane-inner${chatVisible ? " chat-hidden" : ""}`}>
+            <Inner
+              key={engine}
+              id={id}
+              cwd={cwd}
+              ghostty={engine === "wterm-ghostty"}
+              focused={focused}
+              termTheme={termTheme}
+              copyOnSelect={copyOnSelect}
+              initialData={initialData}
+              register={register}
+              sendData={sendData}
+              onTitle={handleTitle}
+            />
+          </div>
+          {chatOpenedRef.current && (
+            <div className={`pane-inner${chatVisible ? "" : " chat-hidden"}`}>
+              <ChatView
+                id={id}
+                cwd={cwd}
+                mode="transcript"
+                onSend={sendChatToPty}
+                onStop={() => invoke("interrupt_pane", { id }).catch(() => {})}
+                status={status}
+                register={registerChat}
+              />
+            </div>
+          )}
+        </>
+      )}
       <div
         className="pane-grip e"
         title="Drag to resize · double-click to reset"

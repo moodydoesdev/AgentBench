@@ -106,6 +106,10 @@ export default function App() {
   const [paneSizes, setPaneSizes] = useState(() =>
     loadJSON("agentbench.paneSizes", {}),
   ); // id -> {w, h} grid spans
+  const [paneViews, setPaneViews] = useState(() =>
+    loadJSON("agentbench.paneViews", {}),
+  ); // id -> "term" | "chat" (Claude panes' read-along toggle)
+  const [chatLines, setChatLines] = useState({}); // id -> replayed stream-json lines
   const [settings, setSettings] = useState(loadSettings);
   const [focusedId, setFocusedId] = useState(null);
   const [renaming, setRenaming] = useState(null); // project path being renamed
@@ -217,6 +221,13 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("agentbench.paneSizes", JSON.stringify(paneSizes));
   }, [paneSizes]);
+
+  useEffect(() => {
+    localStorage.setItem("agentbench.paneViews", JSON.stringify(paneViews));
+  }, [paneViews]);
+
+  const setPaneView = (id, view) =>
+    setPaneViews((v) => (v[id] === view ? v : { ...v, [id]: view }));
 
   // OS file drops are handled natively (dragDropEnabled: true → Tauri's
   // onDragDropEvent in AgentPane). Belt-and-braces: block any HTML5 drop
@@ -333,6 +344,7 @@ export default function App() {
           id,
           projectPath: activePathRef.current,
           label: `${harness.name} ${id}`,
+          claude: true,
         };
         setPanes((p) => [...p, target]);
         setStatuses((s) => ({ ...s, [id]: "working" }));
@@ -378,6 +390,11 @@ export default function App() {
               live.filter((p) => p.color).map((p) => [p.id, p.color]),
             ),
           );
+          setChatLines(
+            Object.fromEntries(
+              live.filter((p) => p.kind === "chat").map((p) => [p.id, p.lines ?? []]),
+            ),
+          );
           setPanes(
             live.map((p) =>
               // run panes reattach as run panes — getHarness would fall back
@@ -389,11 +406,19 @@ export default function App() {
                     label: p.harness.slice(4) || "run",
                     kind: "run",
                   }
-                : {
-                    id: p.id,
-                    projectPath: p.cwd,
-                    label: `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
-                  },
+                : p.kind === "chat"
+                  ? {
+                      id: p.id,
+                      projectPath: p.cwd,
+                      label: `Claude Chat ${p.id}`,
+                      kind: "chat",
+                    }
+                  : {
+                      id: p.id,
+                      projectPath: p.cwd,
+                      label: `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
+                      claude: !!getHarness(settingsRef.current, p.harness ?? "claude").claude,
+                    },
             ),
           );
           setStatuses(Object.fromEntries(live.map((p) => [p.id, "working"])));
@@ -406,6 +431,20 @@ export default function App() {
           // would silently resurrect them as Claude agents)
           if ((s.harness ?? "").startsWith("run:")) continue;
           try {
+            if (s.harness === "claude-chat") {
+              const id = await invoke("create_chat_pane", {
+                cwd: s.cwd,
+                resume: s.session_id ?? null,
+                shell: settingsRef.current.shell?.trim() || null,
+              });
+              restored.push({
+                id,
+                projectPath: s.cwd,
+                label: `Claude Chat ${id}`,
+                kind: "chat",
+              });
+              continue;
+            }
             // resolve against current settings; a deleted custom harness
             // falls back to Claude
             const harness = getHarness(settingsRef.current, s.harness ?? "claude");
@@ -424,6 +463,7 @@ export default function App() {
               id,
               projectPath: s.cwd,
               label: `${harness.name} ${id}`,
+              claude: !!harness.claude,
             });
           } catch (err) {
             console.error("failed to restore pane in", s.cwd, err);
@@ -751,7 +791,12 @@ export default function App() {
       harness,
       shell: settingsRef.current.shell?.trim() || null,
     });
-    const pane = { id, projectPath: activePath, label: `${harness.name} ${id}` };
+    const pane = {
+      id,
+      projectPath: activePath,
+      label: `${harness.name} ${id}`,
+      claude: !!harness.claude,
+    };
     setPanes((p) => {
       const inProject = p.filter((x) => x.projectPath === activePath);
       const pos = inProject.findIndex((x) => x.id === focusedRef.current);
@@ -778,6 +823,31 @@ export default function App() {
     if (dir) focusAgent(pane);
   };
   const addAgent = () => spawnAgent();
+
+  // Headless Claude pane: stream-json over pipes, rendered as chat — no
+  // terminal at all. Suits fire-and-forget workers; interactive affordances
+  // (plan mode UI, dialogs) need a regular Claude pane.
+  const spawnChatAgent = async () => {
+    if (!activePath) return;
+    try {
+      const id = await invoke("create_chat_pane", {
+        cwd: activePath,
+        resume: null,
+        shell: settingsRef.current.shell?.trim() || null,
+      });
+      const pane = {
+        id,
+        projectPath: activePath,
+        label: `Claude Chat ${id}`,
+        kind: "chat",
+      };
+      setPanes((p) => [...p, pane]);
+      setStatuses((s) => ({ ...s, [id]: "working" }));
+      focusAgent(pane);
+    } catch (err) {
+      console.error("failed to spawn chat agent", err);
+    }
+  };
 
   // Focusing a terminal acknowledges its pending notifications.
   const markNotifsRead = (id) => {
@@ -813,6 +883,8 @@ export default function App() {
     setPanes((p) => p.filter((pane) => pane.id !== id));
     setStatuses(({ [id]: _gone, ...rest }) => rest);
     setPaneSizes(({ [id]: _gone, ...rest }) => rest);
+    setPaneViews(({ [id]: _gone, ...rest }) => rest);
+    setChatLines(({ [id]: _gone, ...rest }) => rest);
   };
 
   // Drag-drop reorder: move dragged pane to the drop target's slot.
@@ -1002,6 +1074,13 @@ export default function App() {
           action: () => (missing ? openSettings() : spawnAgent(undefined, h.id)),
         });
       }
+      cmds.push({
+        id: "new-agent-claude-chat",
+        group: "New Agent",
+        label: "Claude (Chat)",
+        hint: "headless — chat UI, no terminal",
+        action: spawnChatAgent,
+      });
       if (activePanes.length > 0) {
         for (const dir of ["left", "right", "up", "down"]) {
           cmds.push({
@@ -1038,6 +1117,20 @@ export default function App() {
     }
     cmds.push({ id: "add-project", label: "Add project…", action: addProject });
     cmds.push({ id: "settings", label: "Open Settings", action: openSettings });
+    cmds.push({
+      id: "restart-broker",
+      label: "Restart broker",
+      hint: "stops all agents — sessions resume",
+      action: async () => {
+        try {
+          await invoke("shutdown_broker");
+        } catch {
+          /* already down */
+        }
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        relaunch().catch(() => {});
+      },
+    });
     projects.forEach((p, i) => {
       if (p.path === activePath) return;
       cmds.push({
@@ -1262,6 +1355,11 @@ export default function App() {
                       </DropdownMenuItem>
                     );
                   })}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={spawnChatAgent}>
+                    Claude (Chat)
+                    <span className="ml-auto text-xs opacity-50">headless</span>
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -1433,7 +1531,11 @@ export default function App() {
                     key={p.id}
                     id={p.id}
                     kind={p.kind}
-                    sigintGuard={!!p.harness?.claude}
+                    sigintGuard={!!p.harness?.claude || !!p.claude}
+                    claude={!!p.claude}
+                    view={paneViews[p.id] ?? settings.defaultPaneView ?? "term"}
+                    onViewChange={setPaneView}
+                    initialLines={chatLines[p.id]}
                     hidden={p.hidden}
                     command={p.command}
                     onHide={hideRun}

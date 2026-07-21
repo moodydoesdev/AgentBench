@@ -83,6 +83,7 @@ export const DEFAULT_SETTINGS = {
   navMod: "off", // modifier for arrow-key pane navigation: off | ctrl | alt | meta
   wordMod: "ctrl", // modifier+←/→ sends ESC b / ESC f (word jump): off | ctrl | meta
   copyOnSelect: true, // highlighting text in a terminal copies it (xterm engine)
+  defaultPaneView: "term", // Claude panes open in "term" or "chat" view
   shell: "", // shell panes/installs run through ("" = auto: $SHELL, pwsh on Windows)
   theme: "midnight",
   bgImage: "", // absolute path to a custom background image ("" = off)

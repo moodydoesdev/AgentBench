@@ -27,6 +27,41 @@ import notifyWav from "./assets/notify.wav";
 const IS_MAC = navigator.userAgent.includes("Mac");
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
+// Restart the broker daemon (kills all agent panes, saved sessions resume).
+// shutdown → relaunch: the fresh app spawns a fresh broker from its bundle —
+// needed after updates, since the daemon outlives installs by design.
+function RestartBrokerButton() {
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      className="btn-sm"
+      disabled={busy}
+      onClick={async () => {
+        if (!armed) {
+          setArmed(true);
+          setTimeout(() => setArmed(false), 4000);
+          return;
+        }
+        setBusy(true);
+        try {
+          await invoke("shutdown_broker");
+        } catch {
+          /* already down — relaunch anyway */
+        }
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        relaunch().catch(() => setBusy(false));
+      }}
+    >
+      {busy
+        ? "Restarting…"
+        : armed
+          ? "Really? Stops all agents"
+          : "Restart broker"}
+    </button>
+  );
+}
+
 // Constructed on first preview so the wav isn't fetched at window load.
 let ping = null;
 
@@ -493,6 +528,19 @@ export default function SettingsWindow() {
                   }
                 />
               </Row>
+              <Row
+                title="Claude pane view"
+                sub="View Claude panes open in — each pane's Term/Chat toggle still overrides"
+              >
+                <Segmented
+                  value={settings.defaultPaneView ?? "term"}
+                  options={[
+                    ["term", "Terminal"],
+                    ["chat", "Chat"],
+                  ]}
+                  onChange={(v) => set({ defaultPaneView: v })}
+                />
+              </Row>
             </Card>
             <Card title="Updates">
               <Row
@@ -514,6 +562,12 @@ export default function SettingsWindow() {
                     ? "Checking…"
                     : "Check for updates"}
                 </button>
+              </Row>
+              <Row
+                title="Restart broker"
+                sub="Stops all agent panes and relaunches the app with a fresh broker daemon. Claude sessions resume automatically. Needed after an update — the broker outlives installs."
+              >
+                <RestartBrokerButton />
               </Row>
             </Card>
           </section>

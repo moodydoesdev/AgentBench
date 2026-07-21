@@ -5,8 +5,8 @@
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -43,8 +43,27 @@ pub struct Core {
     pub saved: Mutex<Vec<SavedPane>>,
     /// Connected clients; every event line is fanned out to all of them.
     pub subscribers: Mutex<Vec<mpsc::Sender<String>>>,
+    /// Transcript tails for panes with an open chat view; generalizes the
+    /// color watcher — same tail-poll, but streams every new line.
+    pub watched: Mutex<HashMap<u32, Watch>>,
+    /// Headless Claude panes: stream-json over pipes, no pty.
+    pub chat_panes: Mutex<HashMap<u32, ChatPane>>,
     pub config_dir: PathBuf,
     pub home_dir: PathBuf,
+}
+
+pub struct Watch {
+    sid: Option<String>,
+    offset: u64,
+}
+
+pub struct ChatPane {
+    stdin: std::process::ChildStdin,
+    child: Arc<Mutex<std::process::Child>>,
+    cwd: String,
+    /// Replayable history for reattach — complete stream-json lines only
+    /// (partial-message events are transient and dropped).
+    buffer: Arc<Mutex<VecDeque<String>>>,
 }
 
 pub struct Pane {
@@ -122,12 +141,15 @@ impl Core {
             last_input: Mutex::new(HashMap::new()),
             saved: Mutex::new(load_saved(&config_dir)),
             subscribers: Mutex::new(Vec::new()),
+            watched: Mutex::new(HashMap::new()),
+            chat_panes: Mutex::new(HashMap::new()),
             config_dir,
             home_dir: dirs::home_dir().expect("no home dir"),
         });
         let port = start_hook_server(core.clone());
         core.hook_port.store(port as u32, Ordering::SeqCst);
         start_color_watcher(core.clone());
+        start_transcript_watcher(core.clone());
         core
     }
 
@@ -155,18 +177,27 @@ fn load_saved(config_dir: &PathBuf) -> Vec<SavedPane> {
 /// broker can restore them with `claude --resume`.
 fn persist_panes(core: &Core) {
     let panes = core.panes.lock().unwrap();
+    let chat_panes = core.chat_panes.lock().unwrap();
     let sessions = core.sessions.lock().unwrap();
+    let resumable = |id: &u32, cwd: &str| {
+        sessions.get(id).and_then(|hist| {
+            hist.iter()
+                .find(|sid| session_exists(core, cwd, sid))
+                .cloned()
+        })
+    };
     let entries: Vec<SavedPane> = panes
         .iter()
         .map(|(id, p)| SavedPane {
             cwd: p.cwd.clone(),
-            session_id: sessions.get(id).and_then(|hist| {
-                hist.iter()
-                    .find(|sid| session_exists(core, &p.cwd, sid))
-                    .cloned()
-            }),
+            session_id: resumable(id, &p.cwd),
             harness: Some(p.harness.clone()),
         })
+        .chain(chat_panes.iter().map(|(id, p)| SavedPane {
+            cwd: p.cwd.clone(),
+            session_id: resumable(id, &p.cwd),
+            harness: Some("claude-chat".into()),
+        }))
         .collect();
     let path = core.config_dir.join("panes.json");
     let _ = std::fs::write(path, serde_json::to_string_pretty(&entries).unwrap());
@@ -442,6 +473,7 @@ pub fn create_pane(
         exit_core.panes.lock().unwrap().remove(&id);
         exit_core.sessions.lock().unwrap().remove(&id);
         exit_core.colors.lock().unwrap().remove(&id);
+        exit_core.watched.lock().unwrap().remove(&id);
         persist_panes(&exit_core);
         exit_core.broadcast(&json!({ "ev": "pane-exit", "id": id, "code": code }));
     });
@@ -467,11 +499,17 @@ pub fn write_pane(core: &Core, id: u32, data: &str) -> Result<(), String> {
     if data != "\u{1b}[I" && data != "\u{1b}[O" {
         core.last_input.lock().unwrap().insert(id, Instant::now());
     }
-    let mut panes = core.panes.lock().unwrap();
-    let pane = panes.get_mut(&id).ok_or("no such pane")?;
-    pane.writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())
+    {
+        let mut panes = core.panes.lock().unwrap();
+        if let Some(pane) = panes.get_mut(&id) {
+            return pane
+                .writer
+                .write_all(data.as_bytes())
+                .map_err(|e| e.to_string());
+        }
+    }
+    // headless chat pane: raw text in, stream-json user message out
+    write_chat_pane(core, id, data)
 }
 
 pub fn resize_pane(core: &Core, id: u32, cols: u16, rows: u16) -> Result<(), String> {
@@ -491,11 +529,15 @@ pub fn kill_pane(core: &Core, id: u32) {
     if let Some(pane) = core.panes.lock().unwrap().get_mut(&id) {
         let _ = pane.killer.kill();
     }
+    if let Some(pane) = core.chat_panes.lock().unwrap().get(&id) {
+        let _ = pane.child.lock().unwrap().kill();
+    }
 }
 
 /// Live panes with scrollback so a (re)connecting client can reattach.
 pub fn list_panes(core: &Core) -> Vec<Value> {
     let panes = core.panes.lock().unwrap();
+    let chat_panes = core.chat_panes.lock().unwrap();
     let colors = core.colors.lock().unwrap();
     let mut out: Vec<_> = panes
         .iter()
@@ -509,6 +551,16 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
                 "buffer": base64::engine::general_purpose::STANDARD.encode(&buf[..]),
             })
         })
+        .chain(chat_panes.iter().map(|(id, p)| {
+            let buf = p.buffer.lock().unwrap();
+            json!({
+                "id": id,
+                "cwd": p.cwd,
+                "harness": "claude-chat",
+                "kind": "chat",
+                "lines": buf.iter().collect::<Vec<_>>(),
+            })
+        }))
         .collect();
     out.sort_by_key(|v| v["id"].as_u64());
     out
@@ -571,6 +623,314 @@ fn start_color_watcher(core: Arc<Core>) {
             }
         }
     });
+}
+
+/// Newest session id for a pane whose transcript actually exists on disk.
+fn newest_session(core: &Core, id: u32, cwd: &str) -> Option<String> {
+    let sessions = core.sessions.lock().unwrap();
+    sessions
+        .get(&id)?
+        .iter()
+        .find(|sid| session_exists(core, cwd, sid))
+        .cloned()
+}
+
+/// Start tailing a pane's transcript for its chat view. Returns the current
+/// session id plus the full transcript so far; the watcher streams every
+/// line written after this snapshot as `transcript-lines` events.
+pub fn watch_transcript(core: &Core, id: u32) -> Result<Value, String> {
+    let cwd = core
+        .panes
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|p| p.cwd.clone())
+        .ok_or("no such pane")?;
+    let sid = newest_session(core, id, &cwd);
+    let (text, offset) = match &sid {
+        Some(sid) => {
+            let raw = std::fs::read(transcript_path(core, &cwd, sid)).unwrap_or_default();
+            let len = raw.len() as u64;
+            (String::from_utf8_lossy(&raw).into_owned(), len)
+        }
+        // session id not hooked yet — watcher picks the file up when it lands
+        None => (String::new(), 0),
+    };
+    core.watched
+        .lock()
+        .unwrap()
+        .insert(id, Watch { sid: sid.clone(), offset });
+    Ok(json!({ "sid": sid, "text": text }))
+}
+
+pub fn unwatch_transcript(core: &Core, id: u32) {
+    core.watched.lock().unwrap().remove(&id);
+}
+
+/// Tail-poll every watched transcript and stream new complete lines. Also
+/// follows session switches (/clear, resume forks): when a pane's newest
+/// on-disk session changes, the chat view is told to reset and the new file
+/// streams from the top.
+fn start_transcript_watcher(core: Arc<Core>) {
+    use std::io::{Seek, SeekFrom};
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let ids: Vec<u32> = core.watched.lock().unwrap().keys().copied().collect();
+        for id in ids {
+            let Some(cwd) = core.panes.lock().unwrap().get(&id).map(|p| p.cwd.clone()) else {
+                core.watched.lock().unwrap().remove(&id);
+                continue;
+            };
+            let newest = newest_session(&core, id, &cwd);
+            let mut reset = false;
+            {
+                let mut watched = core.watched.lock().unwrap();
+                let Some(w) = watched.get_mut(&id) else { continue };
+                if w.sid != newest {
+                    w.sid = newest.clone();
+                    w.offset = 0;
+                    reset = true;
+                }
+            }
+            if reset {
+                core.broadcast(&json!({ "ev": "transcript-reset", "id": id }));
+            }
+            let Some(sid) = newest else { continue };
+            let offset = match core.watched.lock().unwrap().get(&id) {
+                Some(w) => w.offset,
+                None => continue,
+            };
+            let path = transcript_path(&core, &cwd, &sid);
+            let Ok(mut f) = std::fs::File::open(&path) else { continue };
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if len < offset {
+                // truncated/replaced — start over
+                if let Some(w) = core.watched.lock().unwrap().get_mut(&id) {
+                    w.offset = 0;
+                }
+                core.broadcast(&json!({ "ev": "transcript-reset", "id": id }));
+                continue;
+            }
+            if len == offset {
+                continue;
+            }
+            if f.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            let mut raw = Vec::new();
+            if f.read_to_end(&mut raw).is_err() {
+                continue;
+            }
+            // only complete lines; a partial record stays for the next tick
+            let Some(last_nl) = raw.iter().rposition(|&b| b == b'\n') else {
+                continue;
+            };
+            let consumed = (last_nl + 1) as u64;
+            let lines: Vec<String> = String::from_utf8_lossy(&raw[..last_nl])
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(String::from)
+                .collect();
+            if let Some(w) = core.watched.lock().unwrap().get_mut(&id) {
+                w.offset = offset + consumed;
+            }
+            if !lines.is_empty() {
+                core.broadcast(&json!({ "ev": "transcript-lines", "id": id, "lines": lines }));
+            }
+        }
+    });
+}
+
+const CHAT_BUFFER_CAP: usize = 4000;
+
+/// Spawn a headless Claude pane: stream-json over stdio pipes, no pty. The
+/// same login-shell trick as `harness_command` so PATH matches a terminal.
+pub fn create_chat_pane(
+    core: &Arc<Core>,
+    cwd: String,
+    resume: Option<String>,
+    shell_pref: Option<&str>,
+) -> Result<u32, String> {
+    let id = core.next_id.fetch_add(1, Ordering::SeqCst);
+    let port = core.hook_port.load(Ordering::SeqCst) as u16;
+    let mut line = "claude -p --input-format stream-json --output-format stream-json \
+                    --include-partial-messages --verbose --dangerously-skip-permissions"
+        .to_string();
+    let resume = resume.filter(|sid| {
+        sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && session_exists(core, &cwd, sid)
+    });
+    if let Some(sid) = &resume {
+        line.push_str(&format!(" --resume {sid}"));
+        core.sessions.lock().unwrap().insert(id, vec![sid.clone()]);
+    }
+
+    let shell = resolve_shell(shell_pref);
+    let mut cmd;
+    #[cfg(unix)]
+    {
+        cmd = std::process::Command::new(shell);
+        cmd.arg("-lc").arg(format!("exec {line}"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd = std::process::Command::new(&shell);
+        for a in shell_command_args(&shell) {
+            cmd.arg(a);
+        }
+        cmd.arg(&line);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.current_dir(&cwd)
+        .env("AGENTBENCH_PANE_ID", id.to_string())
+        .env("AGENTBENCH_HOOK_PORT", port.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+    let child = Arc::new(Mutex::new(child));
+    let buffer = Arc::new(Mutex::new(VecDeque::new()));
+
+    // stdout: one stream-json record per line
+    let out_core = core.clone();
+    let out_buffer = buffer.clone();
+    let out_child = child.clone();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut is_partial = false;
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                is_partial = v["type"] == "stream_event";
+                if let Some(sid) = v["session_id"].as_str() {
+                    let changed = {
+                        let mut sessions = out_core.sessions.lock().unwrap();
+                        let hist = sessions.entry(id).or_default();
+                        if hist.first().map(String::as_str) != Some(sid) {
+                            hist.retain(|s| s != sid);
+                            hist.insert(0, sid.to_string());
+                            hist.truncate(8);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        persist_panes(&out_core);
+                    }
+                }
+                if v["type"] == "result" {
+                    out_core.last_done.lock().unwrap().insert(id, Instant::now());
+                    out_core.broadcast(&json!({ "ev": "agent-event", "id": id, "kind": "done" }));
+                }
+            }
+            if !is_partial {
+                let mut b = out_buffer.lock().unwrap();
+                b.push_back(line.clone());
+                while b.len() > CHAT_BUFFER_CAP {
+                    b.pop_front();
+                }
+            }
+            out_core.broadcast(&json!({ "ev": "stream-json", "id": id, "line": line }));
+        }
+        // stdout closed — the process is going down; reap and clean up
+        let code = out_child.lock().unwrap().wait().ok().and_then(|s| s.code()).map(|c| c as u32);
+        out_core.chat_panes.lock().unwrap().remove(&id);
+        out_core.sessions.lock().unwrap().remove(&id);
+        out_core.last_done.lock().unwrap().remove(&id);
+        persist_panes(&out_core);
+        out_core.broadcast(&json!({ "ev": "pane-exit", "id": id, "code": code }));
+    });
+
+    // stderr: surface as synthetic records so failures show in the chat
+    let err_core = core.clone();
+    let err_buffer = buffer.clone();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec = json!({ "type": "x-stderr", "text": line }).to_string();
+            {
+                let mut b = err_buffer.lock().unwrap();
+                b.push_back(rec.clone());
+                while b.len() > CHAT_BUFFER_CAP {
+                    b.pop_front();
+                }
+            }
+            err_core.broadcast(&json!({ "ev": "stream-json", "id": id, "line": rec }));
+        }
+    });
+
+    core.chat_panes.lock().unwrap().insert(
+        id,
+        ChatPane {
+            stdin,
+            child,
+            cwd,
+            buffer,
+        },
+    );
+    persist_panes(core);
+    Ok(id)
+}
+
+/// Stop the current turn. Pty panes get a bare ESC (Claude Code's interrupt
+/// key); headless panes get a stream-json control_request.
+pub fn interrupt_pane(core: &Arc<Core>, id: u32) {
+    static REQ: AtomicU32 = AtomicU32::new(1);
+    {
+        let mut panes = core.panes.lock().unwrap();
+        if let Some(pane) = panes.get_mut(&id) {
+            let _ = pane.writer.write_all(b"\x1b");
+            // Interrupting restores any queued (chat-sent) messages into the
+            // TUI's input buffer unsubmitted; a follow-up Enter pushes them
+            // through. Harmless no-op when the buffer is empty.
+            let enter_core = core.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = write_pane(&enter_core, id, "\r");
+            });
+            return;
+        }
+    }
+    let mut chat = core.chat_panes.lock().unwrap();
+    if let Some(pane) = chat.get_mut(&id) {
+        let msg = json!({
+            "type": "control_request",
+            "request_id": format!("interrupt-{}", REQ.fetch_add(1, Ordering::SeqCst)),
+            "request": { "subtype": "interrupt" }
+        });
+        let _ = pane
+            .stdin
+            .write_all(msg.to_string().as_bytes())
+            .and_then(|_| pane.stdin.write_all(b"\n"))
+            .and_then(|_| pane.stdin.flush());
+    }
+}
+
+/// Composer text → a stream-json user message on the harness's stdin.
+fn write_chat_pane(core: &Core, id: u32, text: &str) -> Result<(), String> {
+    let mut chat = core.chat_panes.lock().unwrap();
+    let pane = chat.get_mut(&id).ok_or("no such pane")?;
+    let msg = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
+    });
+    pane.stdin
+        .write_all(msg.to_string().as_bytes())
+        .and_then(|_| pane.stdin.write_all(b"\n"))
+        .and_then(|_| pane.stdin.flush())
+        .map_err(|e| e.to_string())
 }
 
 /// Local sink for Claude Code hook events: POST /event/{pane_id}/{kind}
@@ -698,13 +1058,47 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
             kill_pane(core, req["id"].as_u64().unwrap_or(0) as u32);
             Some(json!({ "result": null }))
         }
+        Some("create-chat") => {
+            let res = create_chat_pane(
+                core,
+                req["cwd"].as_str().unwrap_or_default().to_string(),
+                req["resume"].as_str().map(String::from),
+                req["shell"].as_str(),
+            );
+            Some(match res {
+                Ok(id) => json!({ "result": id }),
+                Err(e) => json!({ "error": e }),
+            })
+        }
+        Some("watch") => {
+            let res = watch_transcript(core, req["id"].as_u64().unwrap_or(0) as u32);
+            Some(match res {
+                Ok(v) => json!({ "result": v }),
+                Err(e) => json!({ "error": e }),
+            })
+        }
+        Some("unwatch") => {
+            unwatch_transcript(core, req["id"].as_u64().unwrap_or(0) as u32);
+            None
+        }
+        Some("interrupt") => {
+            interrupt_pane(core, req["id"].as_u64().unwrap_or(0) as u32);
+            None
+        }
         Some("list") => Some(json!({ "result": list_panes(core) })),
         Some("saved") => Some(json!({ "result": saved_panes(core) })),
         Some("ping") => Some(json!({ "result": "pong" })),
         Some("shutdown") => {
             // Kill all panes, remove the broker file, then exit.
             // Used before an in-place update so the old binary isn't locked.
-            let ids: Vec<u32> = core.panes.lock().unwrap().keys().copied().collect();
+            let ids: Vec<u32> = core
+                .panes
+                .lock()
+                .unwrap()
+                .keys()
+                .chain(core.chat_panes.lock().unwrap().keys())
+                .copied()
+                .collect();
             for id in ids {
                 kill_pane(core, id);
             }

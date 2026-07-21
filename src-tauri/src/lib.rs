@@ -177,6 +177,38 @@ fn write_pane(client: State<'_, Arc<BrokerClient>>, id: u32, data: String) -> Re
     client.send(json!({ "op": "write", "id": id, "data": data }))
 }
 
+/// Headless Claude pane: stream-json over pipes instead of a pty.
+#[tauri::command]
+fn create_chat_pane(
+    client: State<'_, Arc<BrokerClient>>,
+    cwd: String,
+    resume: Option<String>,
+    shell: Option<String>,
+) -> Result<u32, String> {
+    let v = client.request(json!({
+        "op": "create-chat", "cwd": cwd, "resume": resume, "shell": shell
+    }))?;
+    v.as_u64().map(|x| x as u32).ok_or("bad response".into())
+}
+
+/// Start tailing a pane's transcript for its chat view; returns
+/// { sid, text } — the session id and the transcript so far.
+#[tauri::command]
+fn watch_transcript(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<Value, String> {
+    client.request(json!({ "op": "watch", "id": id }))
+}
+
+#[tauri::command]
+fn unwatch_transcript(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<(), String> {
+    client.send(json!({ "op": "unwatch", "id": id }))
+}
+
+/// Stop the current turn (chat view's Stop button).
+#[tauri::command]
+fn interrupt_pane(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<(), String> {
+    client.send(json!({ "op": "interrupt", "id": id }))
+}
+
 #[tauri::command]
 fn resize_pane(
     client: State<'_, Arc<BrokerClient>>,
@@ -262,6 +294,68 @@ fn list_plans(project: String) -> Result<Value, String> {
     }
     out.sort_by(|a, b| b["mtime"].as_u64().cmp(&a["mtime"].as_u64()));
     Ok(json!(out))
+}
+
+/// Slash commands available to a Claude session in `project`, for the chat
+/// composer's autocomplete: user + project custom commands (.claude/commands
+/// /*.md) and skills (.claude/skills/*/SKILL.md). Built-ins live frontend-side.
+#[tauri::command]
+fn list_slash_commands(project: String) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+
+    // description: from SKILL.md / command frontmatter, first match wins
+    fn frontmatter_desc(path: &std::path::Path) -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        text.lines()
+            .take(40)
+            .find_map(|l| l.strip_prefix("description:"))
+            .map(|d| {
+                let d = d.trim().trim_matches('"');
+                d.chars().take(120).collect()
+            })
+    }
+
+    let mut push_commands = |dir: std::path::PathBuf, source: &str| {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                    if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
+                        out.push(json!({
+                            "name": stem,
+                            "desc": frontmatter_desc(&p),
+                            "source": source,
+                        }));
+                    }
+                }
+            }
+        }
+    };
+    let home = dirs::home_dir().unwrap_or_default();
+    let proj = std::path::Path::new(&project);
+    push_commands(home.join(".claude").join("commands"), "user");
+    push_commands(proj.join(".claude").join("commands"), "project");
+
+    let mut push_skills = |dir: std::path::PathBuf, source: &str| {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let skill = e.path().join("SKILL.md");
+                if skill.is_file() {
+                    if let Some(name) = e.file_name().to_str() {
+                        out.push(json!({
+                            "name": name,
+                            "desc": frontmatter_desc(&skill),
+                            "source": source,
+                        }));
+                    }
+                }
+            }
+        }
+    };
+    push_skills(home.join(".claude").join("skills"), "skill");
+    push_skills(proj.join(".claude").join("skills"), "skill");
+
+    out
 }
 
 /// Raw file bytes as base64 — used by the auto-theme wallpaper sampler,
@@ -461,12 +555,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_pane,
             write_pane,
+            create_chat_pane,
+            watch_transcript,
+            unwatch_transcript,
+            interrupt_pane,
             resize_pane,
             kill_pane,
             list_panes,
             saved_panes,
             read_plan,
             list_plans,
+            list_slash_commands,
             read_file_base64,
             sync_plan_skill,
             check_binaries,

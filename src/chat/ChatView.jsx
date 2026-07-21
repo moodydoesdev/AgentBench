@@ -1,0 +1,447 @@
+import { memo, useEffect, useReducer, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { ArrowUp, CaretUp, Robot, Stop } from "@phosphor-icons/react";
+import { createChatStore, applyLines, applyLine, addLocalUser } from "./records";
+import Markdown from "./Markdown";
+import ToolCard from "./ToolCard";
+
+// Older sessions can be thousands of messages; mount only the recent tail
+// and let "Show earlier" page backwards. content-visibility handles paint,
+// this handles mount + markdown-parse cost.
+const TAIL = 250;
+const PAGE = 500;
+
+// Claude Code built-ins worth surfacing in the composer's "/" autocomplete;
+// custom commands + skills are merged in from list_slash_commands.
+const BUILTIN_COMMANDS = [
+  ["clear", "Start a fresh session"],
+  ["compact", "Compact the conversation to free context"],
+  ["resume", "Resume a previous session"],
+  ["model", "Switch model"],
+  ["review", "Review a pull request"],
+  ["init", "Generate CLAUDE.md for this project"],
+  ["memory", "Edit memory files"],
+  ["context", "Show context usage"],
+  ["cost", "Show token usage and cost"],
+  ["agents", "Manage subagents"],
+  ["mcp", "Manage MCP servers"],
+  ["permissions", "View or update permissions"],
+  ["hooks", "Manage hooks"],
+  ["todos", "Show the todo list"],
+  ["add-dir", "Add a working directory"],
+  ["export", "Export the conversation"],
+  ["statusline", "Configure the status line"],
+  ["doctor", "Diagnose installation issues"],
+  ["help", "Show help"],
+].map(([name, desc]) => ({ name, desc, source: "built-in" }));
+
+// Rows re-render only when their message's rev changes — messages mutate in
+// place (tool results, draft tokens), so identity alone isn't enough.
+const Row = memo(
+  function Row({ msg }) {
+    if (msg.kind === "tool") return <ToolCard tool={msg.tool} rev={msg.rev} />;
+    if (msg.kind === "thinking") return <ThinkingRow msg={msg} />;
+    if (msg.kind === "error") return <pre className="chat-error">{msg.text}</pre>;
+    if (msg.kind === "command")
+      return <div className="chat-user chat-cmd-chip">{msg.text}</div>;
+    if (msg.role === "user")
+      return (
+        <div className={`chat-user${msg.local ? " pending" : ""}`}>
+          {msg.text}
+          {msg.local && <span className="chat-user-spin" aria-label="sending" />}
+        </div>
+      );
+    if (msg.kind === "draft") {
+      // plain text while streaming — markdown-parsing a growing message on
+      // every token is O(n²) and was the original perf sink
+      return <div className="chat-assistant streaming">{msg.text}</div>;
+    }
+    return (
+      <div className="chat-assistant">
+        <Markdown text={msg.text} />
+      </div>
+    );
+  },
+  // prev.rev is the render-time snapshot; msg.rev mutates in place, so the
+  // prop pair is the only reliable change signal
+  (prev, next) => prev.msg === next.msg && prev.rev === next.rev,
+);
+
+function ThinkingRow({ msg }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="chat-thinking">
+      <button onClick={() => setOpen((o) => !o)}>thought for a moment</button>
+      {open && <div className="chat-thinking-text">{msg.text}</div>}
+    </div>
+  );
+}
+
+function SidechainGroup({ items }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="chat-sidechain">
+      <button className="chat-sidechain-head" onClick={() => setOpen((o) => !o)}>
+        <Robot size={11} />
+        worked in background · {items.length} step{items.length === 1 ? "" : "s"}
+      </button>
+      {open && items.map((m) => <Row key={m.key} msg={m} rev={m.rev} />)}
+    </div>
+  );
+}
+
+// user/text stand alone; consecutive tool calls stack into one activity
+// block; sidechain runs fold behind a single row.
+function groupMessages(messages) {
+  const out = [];
+  for (const m of messages) {
+    const last = out[out.length - 1];
+    if (m.sidechain) {
+      if (last?.type === "sidechain") last.items.push(m);
+      else out.push({ type: "sidechain", key: `g-${m.key}`, items: [m] });
+    } else if (m.kind === "tool") {
+      if (last?.type === "tools") last.items.push(m);
+      else out.push({ type: "tools", key: `t-${m.key}`, items: [m] });
+    } else {
+      out.push({ type: "msg", key: m.key, msg: m });
+    }
+  }
+  return out;
+}
+
+/**
+ * Chat-rendered Claude session.
+ *  mode "transcript": read-along beside a pty — backfill + tail via the
+ *    broker's transcript watcher (watch_transcript / transcript-lines).
+ *  mode "stream": headless pane — initialLines from reattach, live lines
+ *    from stream-json events.
+ * onSend(text) delivers composer input; the caller owns the write path.
+ */
+export default memo(function ChatView({
+  id,
+  cwd,
+  mode,
+  initialLines,
+  onSend,
+  onStop,
+  status,
+  register,
+}) {
+  const storeRef = useRef(null);
+  if (!storeRef.current) storeRef.current = createChatStore();
+  const [, forceRender] = useReducer((n) => n + 1, 0);
+  const [waiting, setWaiting] = useState(mode === "transcript");
+  const [watchError, setWatchError] = useState(null);
+  const [tailCap, setTailCap] = useState(TAIL);
+  const listRef = useRef(null);
+  const atBottomRef = useRef(true);
+  const inputRef = useRef(null);
+  const rafRef = useRef(0);
+  const lastRevRef = useRef(0);
+
+  // "/" autocomplete: query is the token after a leading slash, null = closed
+  const [cmdQuery, setCmdQuery] = useState(null);
+  const [cmdIndex, setCmdIndex] = useState(0);
+  const commandsRef = useRef(null); // merged builtin + custom, fetched once
+
+  const loadCommands = () => {
+    if (commandsRef.current) return;
+    commandsRef.current = BUILTIN_COMMANDS;
+    invoke("list_slash_commands", { project: cwd ?? "" })
+      .then((custom) => {
+        const seen = new Set(custom.map((c) => c.name));
+        commandsRef.current = [
+          ...custom,
+          ...BUILTIN_COMMANDS.filter((b) => !seen.has(b.name)),
+        ];
+      })
+      .catch(() => {});
+  };
+
+  const cmdMatches =
+    cmdQuery != null
+      ? (commandsRef.current ?? BUILTIN_COMMANDS)
+          .filter((c) => c.name.toLowerCase().startsWith(cmdQuery.toLowerCase()))
+          .slice(0, 10)
+      : [];
+
+  const applyCommand = (cmd) => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.value = `/${cmd.name} `;
+    setCmdQuery(null);
+    el.focus();
+  };
+
+  const syncCmdMenu = (value) => {
+    // menu only while typing the command token itself: "/que", not "/cmd arg"
+    const m = /^\/([\w:-]*)$/.exec(value);
+    if (m) {
+      loadCommands();
+      setCmdQuery(m[1]);
+      setCmdIndex(0);
+    } else if (cmdQuery != null) {
+      setCmdQuery(null);
+    }
+  };
+
+  // events arrive per token in stream mode — coalesce renders per frame
+  const bump = () => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      forceRender();
+    });
+  };
+
+  const onScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  };
+
+  // pin to bottom, but only when content actually changed
+  useEffect(() => {
+    const store = storeRef.current;
+    if (store.rev === lastRevRef.current) return;
+    lastRevRef.current = store.rev;
+    if (atBottomRef.current && listRef.current) {
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+    }
+  });
+
+  // Opening the pane starts pinned, but content keeps growing after the
+  // first paint (async shiki highlights, lazy row sizing) — re-snap to the
+  // bottom on any size change while pinned, so "open chat" always lands at
+  // the latest message.
+  useEffect(() => {
+    const list = listRef.current;
+    const col = list?.firstElementChild;
+    if (!list || !col) return;
+    const ro = new ResizeObserver(() => {
+      if (atBottomRef.current) list.scrollTop = list.scrollHeight;
+    });
+    ro.observe(col);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const store = storeRef.current;
+    let dead = false;
+    const unlistens = [];
+
+    if (mode === "transcript") {
+      invoke("watch_transcript", { id })
+        .then((res) => {
+          if (dead) return;
+          setWaiting(!res?.sid);
+          if (res?.text) {
+            applyLines(store, res.text.split("\n"));
+            bump();
+          }
+        })
+        .catch((err) => {
+          // an old broker answers "unknown op" — surface it, don't spin
+          if (!dead) setWatchError(String(err));
+        });
+      unlistens.push(
+        listen("transcript-lines", (e) => {
+          if (e.payload.id !== id) return;
+          setWaiting(false);
+          if (applyLines(store, e.payload.lines)) bump();
+        }),
+        listen("transcript-reset", (e) => {
+          if (e.payload.id !== id) return;
+          storeRef.current = createChatStore();
+          bump();
+        }),
+      );
+      return () => {
+        dead = true;
+        invoke("unwatch_transcript", { id }).catch(() => {});
+        unlistens.forEach((u) => u.then((f) => f()));
+      };
+    }
+
+    // stream mode
+    if (initialLines?.length) {
+      applyLines(store, initialLines);
+      bump();
+    }
+    unlistens.push(
+      listen("stream-json", (e) => {
+        if (e.payload.id !== id) return;
+        if (applyLine(store, e.payload.line)) bump();
+      }),
+    );
+    return () => {
+      dead = true;
+      unlistens.forEach((u) => u.then((f) => f()));
+    };
+  }, [id, mode]);
+
+  useEffect(() => {
+    register?.({ focus: () => inputRef.current?.focus() });
+    return () => register?.(null);
+  }, [id]);
+
+  const submit = () => {
+    const el = inputRef.current;
+    const text = el?.value.trim();
+    if (!text) return;
+    el.value = "";
+    el.style.height = "";
+    setCmdQuery(null);
+    addLocalUser(storeRef.current, text);
+    onSend(text);
+    atBottomRef.current = true;
+    bump();
+  };
+
+  const store = storeRef.current;
+  const hiddenCount = Math.max(0, store.messages.length - tailCap);
+  const visible = hiddenCount ? store.messages.slice(hiddenCount) : store.messages;
+  const groups = groupMessages(visible);
+  // Turn-activity comes from the message flow itself — the app-level pane
+  // status idles at "working" between events, so it can't gate the stop
+  // button. Active: streaming draft, an unfinished tool, or the user just
+  // sent and nothing has come back yet.
+  const last = store.messages[store.messages.length - 1];
+  const working =
+    !!store.draft ||
+    (last &&
+      (last.kind === "draft" ||
+        (last.kind === "tool" && !last.tool.done) ||
+        last.role === "user"));
+
+  return (
+    <div className="chat-view">
+      <div className="chat-list" ref={listRef} onScroll={onScroll}>
+        <div className="chat-col">
+          {watchError && (
+            <pre className="chat-error">
+              {`chat view couldn't reach the transcript watcher (${watchError}).\nThe broker probably predates this build — use Settings → Workspace →\nRestart broker (or the command menu's "Restart broker").`}
+            </pre>
+          )}
+          {waiting && !watchError && groups.length === 0 && (
+            <div className="chat-waiting">
+              waiting for session… (starts with the first message)
+            </div>
+          )}
+          {hiddenCount > 0 && (
+            <button
+              className="chat-earlier"
+              onClick={() => {
+                atBottomRef.current = false;
+                setTailCap((c) => c + PAGE);
+              }}
+            >
+              <CaretUp size={11} weight="bold" /> Show {Math.min(hiddenCount, PAGE)}{" "}
+              earlier message{hiddenCount === 1 ? "" : "s"}
+            </button>
+          )}
+          {groups.map((g) =>
+            g.type === "sidechain" ? (
+              <SidechainGroup key={g.key} items={g.items} />
+            ) : g.type === "tools" ? (
+              <div key={g.key} className="chat-tools">
+                {g.items.map((m) => (
+                  <ToolCard key={m.key} tool={m.tool} rev={m.rev} />
+                ))}
+              </div>
+            ) : (
+              <Row key={g.key} msg={g.msg} rev={g.msg.rev} />
+            ),
+          )}
+          {working && last?.kind !== "draft" && (
+            <div className="chat-dots" aria-label="working">
+              <span /><span /><span />
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="chat-composer">
+        <div className="chat-composer-card">
+          {cmdQuery != null && cmdMatches.length > 0 && (
+            <div className="chat-cmd-menu">
+              {cmdMatches.map((c, i) => (
+                <button
+                  key={`${c.source}-${c.name}`}
+                  className={`chat-cmd-item${i === cmdIndex ? " sel" : ""}`}
+                  onMouseEnter={() => setCmdIndex(i)}
+                  // mousedown so the textarea never loses focus
+                  onMouseDown={(ev) => {
+                    ev.preventDefault();
+                    applyCommand(c);
+                  }}
+                >
+                  <span className="chat-cmd-name">/{c.name}</span>
+                  {c.desc && <span className="chat-cmd-desc">{c.desc}</span>}
+                  <span className="chat-cmd-src">{c.source}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <textarea
+            ref={inputRef}
+            rows={1}
+            placeholder="Message Claude…  ( / for commands )"
+            onKeyDown={(ev) => {
+              ev.stopPropagation();
+              if (cmdQuery != null && cmdMatches.length > 0) {
+                if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+                  ev.preventDefault();
+                  const d = ev.key === "ArrowDown" ? 1 : -1;
+                  setCmdIndex(
+                    (i) => (i + d + cmdMatches.length) % cmdMatches.length,
+                  );
+                  return;
+                }
+                if (ev.key === "Tab" || ev.key === "Enter") {
+                  ev.preventDefault();
+                  applyCommand(cmdMatches[cmdIndex]);
+                  return;
+                }
+                if (ev.key === "Escape") {
+                  ev.preventDefault();
+                  setCmdQuery(null);
+                  return;
+                }
+              }
+              if (ev.key === "Enter" && !ev.shiftKey) {
+                ev.preventDefault();
+                submit();
+              }
+              // Esc interrupts, mirroring the terminal
+              if (ev.key === "Escape" && working) onStop?.();
+            }}
+            onInput={(ev) => {
+              const el = ev.currentTarget;
+              el.style.height = "";
+              el.style.height = Math.min(el.scrollHeight, 160) + "px";
+              syncCmdMenu(el.value);
+            }}
+          />
+          <div className="chat-composer-bar">
+            <span className="chat-composer-hint">
+              {working ? "working — esc to stop" : "enter to send"}
+            </span>
+            {working && (
+              <button
+                className="chat-stop"
+                title="Stop the current turn (Esc)"
+                onClick={() => onStop?.()}
+              >
+                <Stop size={12} weight="fill" />
+              </button>
+            )}
+            <button className="chat-send" title="Send (Enter)" onClick={submit}>
+              <ArrowUp size={14} weight="bold" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
