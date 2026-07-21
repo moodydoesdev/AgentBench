@@ -80,6 +80,25 @@ function commandChip(text) {
   return args ? `${name} ${args}` : name;
 }
 
+// A command typed in the composer left a pending echo; its transcript record
+// comes back as a chip, so confirm-and-morph the echo instead of stacking a
+// second, forever-spinning copy.
+function pushCommandChip(store, chip, sidechain) {
+  const first = chip.trim().split(/\s+/)[0];
+  const i = store.pending.findIndex(
+    (p) => p.text.trim() === chip.trim() || p.text.trim().split(/\s+/)[0] === first,
+  );
+  if (i !== -1) {
+    const [msg] = store.pending.splice(i, 1);
+    msg.kind = "command";
+    msg.text = chip;
+    msg.local = false;
+    msg.rev = ++store.rev;
+    return;
+  }
+  push(store, { role: "user", kind: "command", text: chip, sidechain });
+}
+
 /** Apply one parsed record. Returns true when the visible list changed. */
 export function applyRecord(store, rec) {
   if (!rec || typeof rec !== "object") return false;
@@ -169,7 +188,7 @@ function applyUser(store, rec) {
       } else if (b.type === "text" && b.text?.trim()) {
         const chip = commandChip(b.text);
         if (chip) {
-          push(store, { role: "user", kind: "command", text: chip, sidechain });
+          pushCommandChip(store, chip, sidechain);
           changed = true;
         } else if (!isNoiseUserText(b.text)) {
           if (!confirmLocalUser(store, b.text)) {
@@ -185,7 +204,7 @@ function applyUser(store, rec) {
   } else if (typeof content === "string" && content.trim()) {
     const chip = commandChip(content);
     if (chip) {
-      push(store, { role: "user", kind: "command", text: chip, sidechain });
+      pushCommandChip(store, chip, sidechain);
       changed = true;
     } else if (!isNoiseUserText(content)) {
       if (!confirmLocalUser(store, content)) {
