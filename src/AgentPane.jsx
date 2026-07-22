@@ -922,6 +922,7 @@ export default memo(function AgentPane({
                 mode="transcript"
                 onSend={sendChatToPty}
                 onStop={() => invoke("interrupt_pane", { id }).catch(() => {})}
+                onNeedsTerm={() => onViewChange?.(id, "term")}
                 status={status}
                 register={registerChat}
               />

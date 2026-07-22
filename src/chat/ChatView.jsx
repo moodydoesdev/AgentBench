@@ -13,28 +13,37 @@ const TAIL = 250;
 const PAGE = 500;
 
 // Claude Code built-ins worth surfacing in the composer's "/" autocomplete;
-// custom commands + skills are merged in from list_slash_commands.
+// custom commands + skills are merged in from list_slash_commands. `tui`
+// marks commands that open a full-screen terminal dialog — the pane flips
+// to Term view when one is sent (and they're hidden on headless panes,
+// where there is no terminal to flip to).
 const BUILTIN_COMMANDS = [
   ["clear", "Start a fresh session"],
   ["compact", "Compact the conversation to free context"],
-  ["resume", "Resume a previous session"],
-  ["model", "Switch model"],
+  ["resume", "Resume a previous session", true],
+  ["model", "Switch model", true],
+  ["usage", "Show plan usage limits", true],
   ["review", "Review a pull request"],
   ["init", "Generate CLAUDE.md for this project"],
-  ["memory", "Edit memory files"],
+  ["memory", "Edit memory files", true],
   ["context", "Show context usage"],
   ["cost", "Show token usage and cost"],
-  ["agents", "Manage subagents"],
-  ["mcp", "Manage MCP servers"],
-  ["permissions", "View or update permissions"],
-  ["hooks", "Manage hooks"],
+  ["agents", "Manage subagents", true],
+  ["mcp", "Manage MCP servers", true],
+  ["permissions", "View or update permissions", true],
+  ["hooks", "Manage hooks", true],
+  ["config", "Open settings", true],
   ["todos", "Show the todo list"],
   ["add-dir", "Add a working directory"],
-  ["export", "Export the conversation"],
-  ["statusline", "Configure the status line"],
-  ["doctor", "Diagnose installation issues"],
+  ["export", "Export the conversation", true],
+  ["statusline", "Configure the status line", true],
+  ["doctor", "Diagnose installation issues", true],
   ["help", "Show help"],
-].map(([name, desc]) => ({ name, desc, source: "built-in" }));
+].map(([name, desc, tui]) => ({ name, desc, source: "built-in", tui: !!tui }));
+
+const TUI_COMMANDS = new Set(
+  BUILTIN_COMMANDS.filter((c) => c.tui).map((c) => c.name),
+);
 
 // Rows re-render only when their message's rev changes — messages mutate in
 // place (tool results, draft tokens), so identity alone isn't enough.
@@ -145,6 +154,7 @@ export default memo(function ChatView({
   initialLines,
   onSend,
   onStop,
+  onNeedsTerm,
   status,
   register,
 }) {
@@ -185,6 +195,8 @@ export default memo(function ChatView({
     cmdQuery != null
       ? (commandsRef.current ?? BUILTIN_COMMANDS)
           .filter((c) => c.name.toLowerCase().startsWith(cmdQuery.toLowerCase()))
+          // no terminal behind a headless pane — hide dialog-only commands
+          .filter((c) => !(mode === "stream" && c.tui))
           .slice(0, 10)
       : [];
 
@@ -261,7 +273,7 @@ export default memo(function ChatView({
           setDiag(res);
           if (res?.text) {
             try {
-              applyLines(store, res.text.split("\n"));
+              applyLines(storeRef.current, res.text.split("\n"));
             } catch (err) {
               setWatchError(`backfill parse failed: ${err}`);
             }
@@ -273,10 +285,13 @@ export default memo(function ChatView({
           if (!dead) setWatchError(String(err));
         });
       unlistens.push(
+        // storeRef.current, NOT a captured store: transcript-reset swaps the
+        // store, and writing into the orphaned one left the pane blank until
+        // a remount (the Windows "works after Ctrl+R" bug)
         listen("transcript-lines", (e) => {
           if (e.payload.id !== id) return;
           setWaiting(false);
-          if (applyLines(store, e.payload.lines)) bump();
+          if (applyLines(storeRef.current, e.payload.lines)) bump();
         }),
         listen("transcript-reset", (e) => {
           if (e.payload.id !== id) return;
@@ -299,7 +314,7 @@ export default memo(function ChatView({
     unlistens.push(
       listen("stream-json", (e) => {
         if (e.payload.id !== id) return;
-        if (applyLine(store, e.payload.line)) bump();
+        if (applyLine(storeRef.current, e.payload.line)) bump();
       }),
     );
     return () => {
@@ -320,8 +335,13 @@ export default memo(function ChatView({
     el.value = "";
     el.style.height = "";
     setCmdQuery(null);
-    addLocalUser(storeRef.current, text);
+    // dialog commands (/resume, /usage, /model…) render in the terminal —
+    // flip to Term view so the dialog is actually visible
+    const tok = text.startsWith("/") ? text.slice(1).split(/\s+/)[0] : null;
+    const opensDialog = tok != null && TUI_COMMANDS.has(tok);
+    if (!opensDialog) addLocalUser(storeRef.current, text);
     onSend(text);
+    if (opensDialog && mode === "transcript") onNeedsTerm?.();
     atBottomRef.current = true;
     bump();
   };
@@ -443,7 +463,9 @@ export default memo(function ChatView({
                 >
                   <span className="chat-cmd-name">/{c.name}</span>
                   {c.desc && <span className="chat-cmd-desc">{c.desc}</span>}
-                  <span className="chat-cmd-src">{c.source}</span>
+                  <span className="chat-cmd-src">
+                    {c.tui ? "opens in Term" : c.source}
+                  </span>
                 </button>
               ))}
             </div>
