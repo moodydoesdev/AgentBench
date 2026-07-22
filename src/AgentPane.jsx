@@ -18,6 +18,7 @@ import {
   Play,
 } from "@phosphor-icons/react";
 import ChatView from "./chat/ChatView";
+import { pasteAndSubmit } from "./lib/ptyPaste";
 import "@xterm/xterm/css/xterm.css";
 import "@wterm/dom/css";
 
@@ -770,10 +771,7 @@ export default memo(function AgentPane({
   // feedback, so the text lands in the pty exactly like a user paste.
   const sendChatToPty = (text) => {
     callbacksRef.current.onActivity(id);
-    invoke("write_pane", { id, data: `\x1b[200~${text}\x1b[201~` }).catch(() => {});
-    setTimeout(() => {
-      invoke("write_pane", { id, data: "\r" }).catch(() => {});
-    }, 150);
+    pasteAndSubmit(id, text);
   };
 
   // Headless composer: plain text — the broker wraps it into a stream-json

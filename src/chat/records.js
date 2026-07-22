@@ -20,6 +20,7 @@ export function createChatStore() {
     pending: [], // optimistic local user echoes awaiting their real record
     nextKey: 0,
     rev: 0, // bumped on every visible change — cheap render/scroll guard
+    typeCounts: {}, // raw record types seen — for the debug panel
   };
 }
 
@@ -102,6 +103,9 @@ function pushCommandChip(store, chip, sidechain) {
 /** Apply one parsed record. Returns true when the visible list changed. */
 export function applyRecord(store, rec) {
   if (!rec || typeof rec !== "object") return false;
+  if (rec.type) {
+    store.typeCounts[rec.type] = (store.typeCounts[rec.type] ?? 0) + 1;
+  }
 
   // transcript backfill overlaps the live tail; uuids dedupe the seam
   if (rec.uuid) {

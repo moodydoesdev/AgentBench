@@ -2064,12 +2064,8 @@ body.bg-image .pane-term.wterm-host .wterm {
   color: var(--text);
 }
 
-/* rows render lazily — keeps 1k+ message sessions smooth without a
-   virtualization dep */
-.chat-col > * {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 40px;
-}
+/* NOTE: no content-visibility here — WebView2 (Windows) culled the rows to
+   blank spacers. Scroll perf comes from the tail cap + memoized rows. */
 
 .chat-earlier {
   align-self: center;
@@ -2539,6 +2535,26 @@ button.chat-question-opt.clickable:hover {
 }
 .chat-question-opt.picked {
   border-left-color: rgb(var(--green));
+}
+
+.chat-debug-btn {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-dim);
+  opacity: 0.5;
+  cursor: pointer;
+}
+.chat-debug-btn:hover, .chat-debug-btn.on { opacity: 1; }
+
+.chat-diag-panel {
+  max-width: 760px;
+  margin: 0 auto 6px;
 }
 
 /* broker diagnostics shown when the list is unexpectedly empty */

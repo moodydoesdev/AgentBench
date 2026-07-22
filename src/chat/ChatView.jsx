@@ -1,7 +1,7 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUp, CaretUp, Robot, Stop } from "@phosphor-icons/react";
+import { ArrowUp, CaretUp, Info, Robot, Stop } from "@phosphor-icons/react";
 import { createChatStore, applyLines, applyLine, addLocalUser } from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
@@ -154,6 +154,7 @@ export default memo(function ChatView({
   const [waiting, setWaiting] = useState(mode === "transcript");
   const [watchError, setWatchError] = useState(null);
   const [diag, setDiag] = useState(null); // broker's view of sid/path/exists
+  const [showDebug, setShowDebug] = useState(false);
   const [tailCap, setTailCap] = useState(TAIL);
   const listRef = useRef(null);
   const atBottomRef = useRef(true);
@@ -411,6 +412,21 @@ export default memo(function ChatView({
         </div>
       </div>
       <div className="chat-composer">
+        {showDebug && (
+          <pre className="chat-diag chat-diag-panel">
+            {[
+              `mode: ${mode} · messages: ${store.messages.length} · groups: ${groups.length} · rev: ${store.rev}`,
+              `record types: ${JSON.stringify(store.typeCounts)}`,
+              `pending echoes: ${store.pending.length} · working: ${working ? "yes" : "no"}`,
+              diag
+                ? `sid: ${diag.sid ?? "none"} · hist: ${diag.hist} · exists: ${diag.exists}\npath: ${diag.path}\ncwd: ${diag.cwd}`
+                : "no watch response yet",
+              watchError ? `error: ${watchError}` : null,
+            ]
+              .filter(Boolean)
+              .join("\n")}
+          </pre>
+        )}
         <div className="chat-composer-card">
           {cmdQuery != null && cmdMatches.length > 0 && (
             <div className="chat-cmd-menu">
@@ -476,6 +492,13 @@ export default memo(function ChatView({
             <span className="chat-composer-hint">
               {working ? "working — esc to stop" : "enter to send"}
             </span>
+            <button
+              className={`chat-debug-btn${showDebug ? " on" : ""}`}
+              title="Chat pipeline debug info"
+              onClick={() => setShowDebug((s) => !s)}
+            >
+              <Info size={13} />
+            </button>
             {working && (
               <button
                 className="chat-stop"

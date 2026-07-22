@@ -49,6 +49,7 @@ import Logo, { LogoMark } from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
 import PlanComposer from "./PlanComposer";
 import { matchesHotkey } from "./lib/hotkey";
+import { pasteAndSubmit } from "./lib/ptyPaste";
 import { THEMES } from "./themes";
 
 const ping = new Audio(notifyWav);
@@ -299,13 +300,7 @@ export default function App() {
       agents.find((a) => a.id === focusedRef.current) ||
       agents[0];
     if (!target) return;
-    invoke("write_pane", {
-      id: target.id,
-      data: `\x1b[200~${text}\x1b[201~`,
-    }).catch(() => {});
-    setTimeout(() => {
-      invoke("write_pane", { id: target.id, data: "\r" }).catch(() => {});
-    }, 150);
+    pasteAndSubmit(target.id, text);
   };
 
   // Composer submit: serialize the scoped brief as a [plan-request] and
@@ -354,13 +349,7 @@ export default function App() {
         return;
       }
     }
-    invoke("write_pane", {
-      id: target.id,
-      data: `\x1b[200~${text}\x1b[201~`,
-    }).catch(() => {});
-    setTimeout(() => {
-      invoke("write_pane", { id: target.id, data: "\r" }).catch(() => {});
-    }, 150);
+    pasteAndSubmit(target.id, text);
     focusAgent(target);
   };
 
