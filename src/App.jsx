@@ -466,6 +466,16 @@ export default function App() {
           }));
         }
 
+        // Pane ids restart per broker run; stale per-pane view choices from
+        // a previous run would shadow Settings' default view on recycled ids.
+        const liveIds = new Set([...live.map((p) => p.id), ...restored.map((r) => r.id)]);
+        setPaneViews((v) => {
+          const next = Object.fromEntries(
+            Object.entries(v).filter(([k]) => liveIds.has(Number(k))),
+          );
+          return Object.keys(next).length === Object.keys(v).length ? v : next;
+        });
+
         const allCwds = [...live.map((p) => p.cwd), ...restored.map((r) => r.projectPath)];
         if (allCwds.length) {
           setProjects((ps) => {

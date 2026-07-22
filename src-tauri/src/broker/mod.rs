@@ -73,6 +73,10 @@ pub struct Pane {
     cwd: String,
     harness: String,
     buffer: Arc<Mutex<Vec<u8>>>,
+    /// When the harness was spawned — lets the transcript watcher adopt a
+    /// session by file mtime when the hooks never deliver a session id
+    /// (observed on Windows).
+    spawned: std::time::SystemTime,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -238,10 +242,17 @@ fn write_hook_settings(
 ) -> Result<PathBuf, String> {
     let dir = core.config_dir.join("hooks");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // "curl.exe" on Windows: if Claude runs the hook through PowerShell,
+    // bare `curl` is an alias for Invoke-WebRequest and dies on these flags —
+    // silently, so the broker just never hears about sessions.
+    #[cfg(windows)]
+    let curl_bin = "curl.exe";
+    #[cfg(unix)]
+    let curl_bin = "curl";
     let curl = |kind: &str| {
         format!(
-            "curl -sf -m 3 -X POST -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:{}/event/{}/{}",
-            port, pane_id, kind
+            "{} -sf -m 3 -X POST -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:{}/event/{}/{}",
+            curl_bin, port, pane_id, kind
         )
     };
     let mut settings = json!({
@@ -487,6 +498,7 @@ pub fn create_pane(
             cwd,
             harness: spec.id,
             buffer,
+            spawned: std::time::SystemTime::now(),
         },
     );
     persist_panes(core);
@@ -691,6 +703,60 @@ pub fn unwatch_transcript(core: &Core, id: u32) {
     core.watched.lock().unwrap().remove(&id);
 }
 
+/// Hook-independent fallback: when the hooks never deliver a session id
+/// (observed on Windows), adopt the project's newest transcript written
+/// since this pane spawned that no other pane has claimed.
+fn adopt_session(core: &Core, id: u32, cwd: &str, spawned: std::time::SystemTime) -> Option<String> {
+    let dir = core
+        .home_dir
+        .join(".claude")
+        .join("projects")
+        .join(cwd_slug(cwd));
+    let claimed: std::collections::HashSet<String> = core
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    let cutoff = spawned
+        .checked_sub(std::time::Duration::from_secs(5))
+        .unwrap_or(spawned);
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(sid) = p.file_stem().and_then(|x| x.to_str()).map(String::from) else {
+            continue;
+        };
+        if claimed.contains(&sid) {
+            continue;
+        }
+        let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if mtime < cutoff {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(bm, _)| mtime > *bm) {
+            best = Some((mtime, sid));
+        }
+    }
+    let (_, sid) = best?;
+    {
+        let mut sessions = core.sessions.lock().unwrap();
+        let hist = sessions.entry(id).or_default();
+        hist.retain(|s| s != &sid);
+        hist.insert(0, sid.clone());
+        hist.truncate(8);
+    }
+    persist_panes(core);
+    Some(sid)
+}
+
 /// Tail-poll every watched transcript and stream new complete lines. Also
 /// follows session switches (/clear, resume forks): when a pane's newest
 /// on-disk session changes, the chat view is told to reset and the new file
@@ -701,11 +767,20 @@ fn start_transcript_watcher(core: Arc<Core>) {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let ids: Vec<u32> = core.watched.lock().unwrap().keys().copied().collect();
         for id in ids {
-            let Some(cwd) = core.panes.lock().unwrap().get(&id).map(|p| p.cwd.clone()) else {
+            let Some((cwd, spawned)) = core
+                .panes
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|p| (p.cwd.clone(), p.spawned))
+            else {
                 core.watched.lock().unwrap().remove(&id);
                 continue;
             };
-            let newest = newest_session(&core, id, &cwd);
+            let mut newest = newest_session(&core, id, &cwd);
+            if newest.is_none() {
+                newest = adopt_session(&core, id, &cwd, spawned);
+            }
             let mut reset = false;
             {
                 let mut watched = core.watched.lock().unwrap();
