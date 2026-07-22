@@ -1,4 +1,5 @@
 import { memo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowsClockwise,
   FileText,
@@ -31,27 +32,67 @@ const TOOL_ICONS = {
 
 // AskUserQuestion is a picker in the terminal TUI — the transcript only has
 // the questions (input) and, once answered, the answers (result). Render a
-// real question card instead of a mute activity row.
-function QuestionCard({ tool }) {
+// real question card, and for a single single-select question, answer it
+// from chat by driving the picker: N×↓ then Enter. (The picker starts on
+// option 1; if the user already arrowed around in Term view, the indices
+// are off — the card notes that clicking assumes an untouched picker.)
+function QuestionCard({ tool, paneId, canAnswer }) {
+  const [picked, setPicked] = useState(null);
   const questions = Array.isArray(tool.input?.questions) ? tool.input.questions : [];
+  const clickable =
+    canAnswer &&
+    !tool.done &&
+    picked == null &&
+    questions.length === 1 &&
+    !questions[0]?.multiSelect &&
+    Array.isArray(questions[0]?.options);
+
+  const answer = (j) => {
+    setPicked(j);
+    const keys = "\x1b[B".repeat(j) + "\r";
+    invoke("write_pane", { id: paneId, data: keys }).catch(() => {});
+  };
+
   return (
     <div className="chat-question">
       {questions.map((q, i) => (
         <div key={i} className="chat-question-block">
           <div className="chat-question-title">{q.question}</div>
           {Array.isArray(q.options) &&
-            q.options.map((o, j) => (
-              <div key={j} className="chat-question-opt">
-                <span className="chat-question-opt-label">{o.label}</span>
-                {o.description && (
-                  <span className="chat-question-opt-desc">{o.description}</span>
-                )}
-              </div>
-            ))}
+            q.options.map((o, j) =>
+              clickable ? (
+                <button
+                  key={j}
+                  className="chat-question-opt clickable"
+                  onClick={() => answer(j)}
+                >
+                  <span className="chat-question-opt-label">{o.label}</span>
+                  {o.description && (
+                    <span className="chat-question-opt-desc">{o.description}</span>
+                  )}
+                </button>
+              ) : (
+                <div
+                  key={j}
+                  className={`chat-question-opt${picked === j ? " picked" : ""}`}
+                >
+                  <span className="chat-question-opt-label">{o.label}</span>
+                  {o.description && (
+                    <span className="chat-question-opt-desc">{o.description}</span>
+                  )}
+                </div>
+              ),
+            )}
         </div>
       ))}
       {tool.done ? (
         <div className="chat-question-answer">{tool.result}</div>
+      ) : picked != null ? (
+        <div className="chat-question-hint">answer sent…</div>
+      ) : clickable ? (
+        <div className="chat-question-hint">
+          click an option to answer (assumes the Term picker is untouched)
+        </div>
       ) : (
         <div className="chat-question-hint">
           waiting for your answer — switch to Term view to pick
@@ -64,9 +105,10 @@ function QuestionCard({ tool }) {
 // Slim activity row, t3code-style: icon + summary + mono detail on one 12px
 // line; click expands input/diff/result. Rows stack inside .chat-tools.
 export default memo(
-  function ToolCard({ tool }) {
+  function ToolCard({ tool, paneId, canAnswer }) {
     const [open, setOpen] = useState(false);
-    if (tool.name === "AskUserQuestion") return <QuestionCard tool={tool} />;
+    if (tool.name === "AskUserQuestion")
+      return <QuestionCard tool={tool} paneId={paneId} canAnswer={canAnswer} />;
     const { label, detail } = toolSummary(tool);
     const diff = open ? toolDiff(tool) : null;
     const status = !tool.done ? "running" : tool.isError ? "error" : "ok";

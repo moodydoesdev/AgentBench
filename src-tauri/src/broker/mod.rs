@@ -660,7 +660,31 @@ pub fn watch_transcript(core: &Core, id: u32) -> Result<Value, String> {
         .lock()
         .unwrap()
         .insert(id, Watch { sid: sid.clone(), offset });
-    Ok(json!({ "sid": sid, "text": text }))
+    // diagnostics: enough to debug "blank chat" from a screenshot — which
+    // session ids the hooks delivered, where we looked, what we found
+    let hist_len = core.sessions.lock().unwrap().get(&id).map_or(0, |h| h.len());
+    let (path, exists) = match &sid {
+        Some(s) => {
+            let p = transcript_path(core, &cwd, s);
+            (p.display().to_string(), p.exists())
+        }
+        None => {
+            let probe = core
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&id)
+                .and_then(|h| h.first().cloned());
+            match probe {
+                Some(s) => (transcript_path(core, &cwd, &s).display().to_string(), false),
+                None => (String::new(), false),
+            }
+        }
+    };
+    Ok(json!({
+        "sid": sid, "text": text,
+        "path": path, "exists": exists, "hist": hist_len, "cwd": cwd,
+    }))
 }
 
 pub fn unwatch_transcript(core: &Core, id: u32) {

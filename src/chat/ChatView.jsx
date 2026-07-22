@@ -1,4 +1,4 @@
-import { memo, useEffect, useReducer, useRef, useState } from "react";
+import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowUp, CaretUp, Robot, Stop } from "@phosphor-icons/react";
@@ -68,6 +68,26 @@ const Row = memo(
   (prev, next) => prev.msg === next.msg && prev.rev === next.rev,
 );
 
+// A platform-specific render crash must show itself in the pane, not blank
+// it (or take the whole app down) — debugging "completely blank" over chat
+// screenshots is how the Windows launch went.
+class ChatErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <pre className="chat-error">
+          {`chat view crashed: ${this.state.error}\n${this.state.error?.stack?.split("\n").slice(0, 4).join("\n") ?? ""}`}
+        </pre>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function ThinkingRow({ msg }) {
   const [open, setOpen] = useState(false);
   return (
@@ -133,6 +153,7 @@ export default memo(function ChatView({
   const [, forceRender] = useReducer((n) => n + 1, 0);
   const [waiting, setWaiting] = useState(mode === "transcript");
   const [watchError, setWatchError] = useState(null);
+  const [diag, setDiag] = useState(null); // broker's view of sid/path/exists
   const [tailCap, setTailCap] = useState(TAIL);
   const listRef = useRef(null);
   const atBottomRef = useRef(true);
@@ -236,8 +257,13 @@ export default memo(function ChatView({
         .then((res) => {
           if (dead) return;
           setWaiting(!res?.sid);
+          setDiag(res);
           if (res?.text) {
-            applyLines(store, res.text.split("\n"));
+            try {
+              applyLines(store, res.text.split("\n"));
+            } catch (err) {
+              setWatchError(`backfill parse failed: ${err}`);
+            }
             bump();
           }
         })
@@ -319,6 +345,7 @@ export default memo(function ChatView({
     <div className="chat-view">
       <div className="chat-list" ref={listRef} onScroll={onScroll}>
         <div className="chat-col">
+          <ChatErrorBoundary>
           {watchError && (
             <pre className="chat-error">
               {`chat view couldn't reach the transcript watcher (${watchError}).\nThe broker probably predates this build — use Settings → Workspace →\nRestart broker (or the command menu's "Restart broker").`}
@@ -328,6 +355,21 @@ export default memo(function ChatView({
             <div className="chat-waiting">
               waiting for session… (starts with the first message)
             </div>
+          )}
+          {/* empty list + a watch response = something's off; show the
+              broker's view so a screenshot is enough to debug */}
+          {groups.length === 0 && !watchError && diag && (
+            <pre className="chat-diag">
+              {[
+                `sid: ${diag.sid ?? "none yet"}`,
+                `sessions seen: ${diag.hist ?? 0}`,
+                diag.path ? `transcript: ${diag.path}` : "transcript: (no session id from hooks yet)",
+                diag.path ? `exists: ${diag.exists ? "yes" : "NO — path mismatch?"}` : null,
+                `cwd: ${diag.cwd ?? ""}`,
+              ]
+                .filter(Boolean)
+                .join("\n")}
+            </pre>
           )}
           {hiddenCount > 0 && (
             <button
@@ -347,7 +389,13 @@ export default memo(function ChatView({
             ) : g.type === "tools" ? (
               <div key={g.key} className="chat-tools">
                 {g.items.map((m) => (
-                  <ToolCard key={m.key} tool={m.tool} rev={m.rev} />
+                  <ToolCard
+                    key={m.key}
+                    tool={m.tool}
+                    rev={m.rev}
+                    paneId={id}
+                    canAnswer={mode === "transcript"}
+                  />
                 ))}
               </div>
             ) : (
@@ -359,6 +407,7 @@ export default memo(function ChatView({
               <span /><span /><span />
             </div>
           )}
+          </ChatErrorBoundary>
         </div>
       </div>
       <div className="chat-composer">
