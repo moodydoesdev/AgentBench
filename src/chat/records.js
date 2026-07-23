@@ -72,6 +72,28 @@ function isNoiseUserText(text) {
   );
 }
 
+// The harness injects wrapped machine messages into the user turn — background
+// task updates, hook output, etc. They aren't the user talking, so they must
+// not render as a right-aligned user bubble (which reads as "someone sent
+// this"). Parse the ones worth surfacing into a plain-language system notice;
+// return null for anything we'd rather leave to isNoiseUserText to hide.
+function harnessNotice(text) {
+  const t = text.trimStart();
+  if (t.startsWith("<task-notification>")) {
+    const status = /<status>\s*([^<]*?)\s*<\/status>/.exec(text)?.[1];
+    const summary = /<summary>\s*([\s\S]*?)\s*<\/summary>/.exec(text)?.[1];
+    const ids = (text.match(/<task-id>/g) ?? []).length;
+    const count = ids === 1 ? "1 background task" : `${ids} background tasks`;
+    const head = status ? `${count} · ${status}` : count;
+    return {
+      title: "Background update",
+      head,
+      body: summary?.trim() || null,
+    };
+  }
+  return null;
+}
+
 // Slash-command records carry <command-name>/<command-args> tags plus the
 // command's whole expanded body — render just "/name args" as a chip.
 function commandChip(text) {
@@ -190,8 +212,12 @@ function applyUser(store, rec) {
           changed = true;
         }
       } else if (b.type === "text" && b.text?.trim()) {
+        const notice = harnessNotice(b.text);
         const chip = commandChip(b.text);
-        if (chip) {
+        if (notice) {
+          push(store, { role: "system", kind: "notice", notice, sidechain });
+          changed = true;
+        } else if (chip) {
           pushCommandChip(store, chip, sidechain);
           changed = true;
         } else if (!isNoiseUserText(b.text)) {
@@ -206,8 +232,12 @@ function applyUser(store, rec) {
       }
     }
   } else if (typeof content === "string" && content.trim()) {
+    const notice = harnessNotice(content);
     const chip = commandChip(content);
-    if (chip) {
+    if (notice) {
+      push(store, { role: "system", kind: "notice", notice, sidechain });
+      changed = true;
+    } else if (chip) {
       pushCommandChip(store, chip, sidechain);
       changed = true;
     } else if (!isNoiseUserText(content)) {

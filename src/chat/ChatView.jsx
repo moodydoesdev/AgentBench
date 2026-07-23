@@ -1,7 +1,7 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUp, CaretUp, ImageSquare, Info, Robot, Stop } from "@phosphor-icons/react";
+import { ArrowUp, Bell, CaretUp, ImageSquare, Info, Robot, Stop, Terminal } from "@phosphor-icons/react";
 import { createChatStore, applyLines, applyLine, addLocalUser } from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
@@ -52,8 +52,31 @@ const Row = memo(
     if (msg.kind === "tool") return <ToolCard tool={msg.tool} rev={msg.rev} />;
     if (msg.kind === "thinking") return <ThinkingRow msg={msg} />;
     if (msg.kind === "error") return <pre className="chat-error">{msg.text}</pre>;
+    if (msg.kind === "notice")
+      return (
+        <div className="chat-notice">
+          <span className="chat-notice-head">
+            <Bell size={11} weight="fill" />
+            {msg.notice.title}
+            {msg.notice.head && (
+              <span className="chat-notice-meta"> · {msg.notice.head}</span>
+            )}
+          </span>
+          {msg.notice.body && (
+            <span className="chat-notice-body">{msg.notice.body}</span>
+          )}
+        </div>
+      );
+    // a slash command in the transcript is an event, not something the user
+    // "said" — some (auto-compact) the harness runs on its own, so it's shown
+    // as a centered command pill, never a right-aligned user bubble
     if (msg.kind === "command")
-      return <div className="chat-user chat-cmd-chip">{msg.text}</div>;
+      return (
+        <div className="chat-cmd-event">
+          <Terminal size={11} weight="bold" />
+          <code>/{msg.text}</code>
+        </div>
+      );
     if (msg.role === "user")
       return (
         <div className={`chat-user${msg.local ? " pending" : ""}`}>

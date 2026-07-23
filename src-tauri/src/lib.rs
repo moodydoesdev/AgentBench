@@ -358,6 +358,94 @@ fn list_slash_commands(project: String) -> Vec<Value> {
     out
 }
 
+/// Resumable Claude sessions for a project: scan its transcript dir
+/// (~/.claude/projects/<slug>/*.jsonl) and return { sid, mtime, preview, msgs }
+/// newest-first, so the UI can offer "resume a previous session". The slug is
+/// Claude Code's own: every non-alphanumeric char in cwd replaced by '-'.
+#[tauri::command]
+fn list_sessions(project: String) -> Vec<Value> {
+    let slug: String = project
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claude")
+        .join("projects")
+        .join(slug);
+
+    // first human-authored user line — skips harness plumbing (<tag>…, Caveat:)
+    fn preview_of(path: &std::path::Path) -> (Option<String>, u64) {
+        let Ok(f) = std::fs::File::open(path) else {
+            return (None, 0);
+        };
+        let mut msgs = 0u64;
+        let mut preview = None;
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            msgs += 1;
+            if preview.is_some() {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if rec["type"].as_str() != Some("user") || rec["isMeta"].as_bool() == Some(true) {
+                continue;
+            }
+            let text = match &rec["message"]["content"] {
+                Value::String(s) => s.clone(),
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .find_map(|b| {
+                        (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("").to_string())
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let t = text.trim_start();
+            if t.is_empty() || t.starts_with('<') || t.starts_with("Caveat:") {
+                continue;
+            }
+            preview = Some(t.chars().take(140).collect::<String>());
+        }
+        (preview, msgs)
+    }
+
+    let mut out: Vec<(std::time::SystemTime, Value)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(sid) = p.file_stem().and_then(|x| x.to_str()).map(String::from) else {
+            continue;
+        };
+        let meta = e.metadata().ok();
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        let mtime_ms = mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let (preview, msgs) = preview_of(&p);
+        // an empty transcript (0 messages) can't be resumed to anything useful
+        if msgs == 0 {
+            continue;
+        }
+        out.push((
+            mtime.unwrap_or(std::time::UNIX_EPOCH),
+            json!({ "sid": sid, "mtime": mtime_ms, "preview": preview, "msgs": msgs }),
+        ));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
 /// Raw file bytes as base64 — used by the auto-theme wallpaper sampler,
 /// which needs canvas-safe pixel access (asset:// images can taint canvas).
 #[tauri::command]
@@ -566,6 +654,7 @@ pub fn run() {
             read_plan,
             list_plans,
             list_slash_commands,
+            list_sessions,
             read_file_base64,
             sync_plan_skill,
             check_binaries,

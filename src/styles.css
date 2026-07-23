@@ -1925,6 +1925,77 @@ body.bg-image .pane-term.wterm-host .wterm {
   max-height: 80vh;
 }
 
+/* ---- resume-session picker ---- */
+.composer.sessions {
+  width: min(640px, calc(100vw - 96px));
+  height: auto;
+  max-height: 80vh;
+}
+.composer.sessions .composer-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.composer.sessions .composer-sub code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 0 3px;
+}
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+  overflow-y: auto;
+}
+.sessions-empty {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  padding: 18px 4px;
+  text-align: center;
+}
+.sessions-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+  color: var(--text);
+}
+.sessions-row:hover {
+  border-color: rgba(var(--hilite), 0.5);
+  background: rgba(var(--hilite), 0.04);
+}
+.sessions-preview {
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessions-noprev {
+  color: var(--text-dim);
+  font-style: italic;
+}
+.sessions-meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.sessions-go {
+  color: var(--text-dim);
+  flex: none;
+}
+.sessions-row:hover .sessions-go {
+  color: var(--text);
+}
+
 .runcmd-labels {
   display: flex;
   gap: 8px;
@@ -2104,12 +2175,58 @@ body.bg-image .pane-term.wterm-host .wterm {
 /* optimistic echo, not yet confirmed by the transcript */
 .chat-user.pending { opacity: 0.6; }
 
-/* slash-command chip — the expanded command body stays hidden */
-.chat-user.chat-cmd-chip {
-  font: 11.5px var(--font-mono);
+/* slash command as a centered event row — not a user bubble, since the
+   harness runs some (auto-compact) on its own */
+.chat-cmd-event {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(var(--hilite), 0.03);
   color: var(--text-dim);
-  background: rgba(var(--hilite), 0.04);
-  padding: 4px 10px;
+}
+.chat-cmd-event code {
+  font: 11.5px var(--font-mono);
+  color: var(--text);
+}
+
+/* harness-injected notice (background task updates, etc.) — a quiet centered
+   card, visibly distinct from anything the user typed */
+.chat-notice {
+  align-self: center;
+  max-width: 88%;
+  margin-top: 10px;
+  padding: 7px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid rgba(var(--hilite), 0.4);
+  background: rgba(var(--hilite), 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.chat-notice-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+.chat-notice-meta {
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.chat-notice-body {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .chat-user-spin {
@@ -2535,6 +2652,103 @@ button.chat-question-opt.clickable:hover {
 }
 .chat-question-opt.picked {
   border-left-color: rgb(var(--green));
+}
+
+/* selectable option (radio / checkbox) form */
+button.chat-question-opt.choice {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  font: inherit;
+  color: inherit;
+  border: none;
+  border-left: 2px solid rgba(var(--blue), 0.25);
+  border-radius: 0 6px 6px 0;
+  padding: 5px 8px 5px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+button.chat-question-opt.choice:disabled { cursor: default; }
+button.chat-question-opt.choice.clickable:hover {
+  background: rgba(var(--blue), 0.1);
+}
+button.chat-question-opt.choice.on {
+  border-left-color: rgb(var(--green));
+  background: rgba(var(--green), 0.06);
+}
+
+.chat-question-mark {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid rgba(var(--hilite), 0.35);
+  color: var(--bg);
+}
+.chat-question-mark.box { border-radius: 4px; }
+.chat-question-mark.radio { border-radius: 50%; }
+.chat-question-mark.on {
+  background: rgb(var(--green));
+  border-color: rgb(var(--green));
+}
+
+.chat-question-badge {
+  margin-left: 8px;
+  font: 500 9.5px var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 6px;
+  vertical-align: middle;
+}
+
+.chat-question-other {
+  width: 100%;
+  margin-top: 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 9px;
+}
+.chat-question-other:focus {
+  outline: none;
+  border-color: rgba(var(--blue), 0.6);
+}
+.chat-question-other:disabled { opacity: 0.5; }
+
+.chat-question-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.chat-question-submit {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: 600 12px var(--font-ui);
+  color: #fff;
+  background: rgb(var(--blue));
+  border: none;
+  border-radius: 7px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.chat-question-submit:hover { filter: brightness(1.08); }
+.chat-question-submit:disabled {
+  opacity: 0.4;
+  cursor: default;
+  filter: none;
 }
 
 .chat-img-chips {

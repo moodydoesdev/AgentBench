@@ -44,6 +44,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import RunCommandsDialog from "./RunCommandsDialog";
+import SessionsDialog from "./SessionsDialog";
 import notifyWav from "./assets/notify.wav";
 import Logo, { LogoMark } from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
@@ -123,6 +124,7 @@ export default function App() {
   const [notifs, setNotifs] = useState([]); // {key, paneId, kind, label, project, projectPath, ts, read}
   const [notifOpen, setNotifOpen] = useState(false);
   const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
+  const [sessionsOpen, setSessionsOpen] = useState(false); // resume-session picker
   const renameInputRef = useRef(null);
 
   const panesRef = useRef(panes);
@@ -766,11 +768,13 @@ export default function App() {
   // Spawn an agent; with a direction, insert it so it lands beside/above/
   // below the focused pane in the grid (Ghostty-style directional splits).
   // Row math mirrors the arrow-key nav: index ± grid columns.
-  const spawnAgent = async (dir, harnessId) => {
+  const spawnAgent = async (dir, harnessId, resume = null) => {
     if (!activePath) return;
     const harness = getHarness(
       settingsRef.current,
-      harnessId ?? settingsRef.current.defaultHarness,
+      // resuming only makes sense for Claude sessions; force the Claude
+      // harness so a non-Claude default doesn't get a --resume it can't use
+      resume ? "claude" : harnessId ?? settingsRef.current.defaultHarness,
     );
     // missing binary would exec into "command not found" and the pane dies —
     // route to Settings → Agents instead
@@ -782,7 +786,7 @@ export default function App() {
       cwd: activePath,
       cols: 100,
       rows: 30,
-      resume: null,
+      resume,
       // theme only means something to Claude's settings file
       theme: harness.claude
         ? getTheme(settingsRef.current.theme).claudeTheme ?? null
@@ -1090,6 +1094,12 @@ export default function App() {
         }
       }
       cmds.push({
+        id: "resume-session",
+        label: "Resume previous session…",
+        hint: "reopen a past Claude conversation",
+        action: () => setSessionsOpen(true),
+      });
+      cmds.push({
         id: "toggle-plans",
         label: showPlans ? "Hide plans panel" : "Show plans panel",
         action: () => setShowPlans((s) => !s),
@@ -1358,6 +1368,10 @@ export default function App() {
                   <DropdownMenuItem onSelect={spawnChatAgent}>
                     Claude (Chat)
                     <span className="ml-auto text-xs opacity-50">headless</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setSessionsOpen(true)}>
+                    Resume session…
+                    <span className="ml-auto text-xs opacity-50">--resume</span>
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -1649,6 +1663,17 @@ export default function App() {
           onSave={(commands) => {
             updateProject(runDialog, { commands });
             setRunDialog(null);
+          }}
+        />
+      )}
+
+      {sessionsOpen && activeProject && (
+        <SessionsDialog
+          project={activeProject}
+          onClose={() => setSessionsOpen(false)}
+          onResume={(sid) => {
+            setSessionsOpen(false);
+            spawnAgent(undefined, "claude", sid);
           }}
         />
       )}
