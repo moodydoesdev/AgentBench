@@ -2537,6 +2537,31 @@ button.chat-question-opt.clickable:hover {
   border-left-color: rgb(var(--green));
 }
 
+.chat-img-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 8px;
+}
+
+.chat-img-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid rgba(var(--blue), 0.3);
+  border-radius: 999px;
+  background: rgba(var(--blue), 0.08);
+  color: var(--text);
+  font: 11px var(--font-ui);
+}
+
+.chat-img-hint {
+  color: var(--text-dim);
+  font: italic 10.5px var(--font-ui);
+}
+
 .chat-debug-btn {
   flex: none;
   display: grid;

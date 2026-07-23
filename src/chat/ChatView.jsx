@@ -1,7 +1,7 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUp, CaretUp, Info, Robot, Stop } from "@phosphor-icons/react";
+import { ArrowUp, CaretUp, ImageSquare, Info, Robot, Stop } from "@phosphor-icons/react";
 import { createChatStore, applyLines, applyLine, addLocalUser } from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
@@ -155,6 +155,7 @@ export default memo(function ChatView({
   onSend,
   onStop,
   onNeedsTerm,
+  onImagePaste,
   status,
   register,
 }) {
@@ -175,6 +176,7 @@ export default memo(function ChatView({
   // "/" autocomplete: query is the token after a leading slash, null = closed
   const [cmdQuery, setCmdQuery] = useState(null);
   const [cmdIndex, setCmdIndex] = useState(0);
+  const [imgCount, setImgCount] = useState(0); // images handed to Claude's buffer
   const commandsRef = useRef(null); // merged builtin + custom, fetched once
 
   const loadCommands = () => {
@@ -342,8 +344,25 @@ export default memo(function ChatView({
     if (!opensDialog) addLocalUser(storeRef.current, text);
     onSend(text);
     if (opensDialog && mode === "transcript") onNeedsTerm?.();
+    setImgCount(0); // images were already forwarded into Claude's buffer
     atBottomRef.current = true;
     bump();
+  };
+
+  // Image paste mirrors the terminal: forward Ctrl+V (\x16) so Claude reads
+  // the host clipboard into its own input buffer, then our text is pasted
+  // after it on send — exactly the sequence a user does in Term view.
+  // Transcript panes only; the headless -p process has no host clipboard.
+  const onPaste = (ev) => {
+    if (mode !== "transcript" || !onImagePaste) return;
+    const items = ev.clipboardData?.items ?? [];
+    const hasImage = Array.from(items).some((it) => it.type.startsWith("image/"));
+    const hasText = Array.from(items).some((it) => it.type === "text/plain");
+    if (hasImage && !hasText) {
+      ev.preventDefault();
+      onImagePaste();
+      setImgCount((n) => n + 1);
+    }
   };
 
   const store = storeRef.current;
@@ -470,10 +489,21 @@ export default memo(function ChatView({
               ))}
             </div>
           )}
+          {imgCount > 0 && (
+            <div className="chat-img-chips">
+              {Array.from({ length: imgCount }).map((_, i) => (
+                <span key={i} className="chat-img-chip">
+                  <ImageSquare size={12} /> image {i + 1}
+                </span>
+              ))}
+              <span className="chat-img-hint">sent on your next message</span>
+            </div>
+          )}
           <textarea
             ref={inputRef}
             rows={1}
             placeholder="Message Claude…  ( / for commands )"
+            onPaste={onPaste}
             onKeyDown={(ev) => {
               ev.stopPropagation();
               if (cmdQuery != null && cmdMatches.length > 0) {
