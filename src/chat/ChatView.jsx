@@ -1,8 +1,8 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUp, Bell, CaretUp, ImageSquare, Info, Robot, Stop, Terminal } from "@phosphor-icons/react";
-import { createChatStore, applyLines, applyLine, addLocalUser } from "./records";
+import { ArrowUp, Bell, CaretUp, ImageSquare, Info, Robot, Stop, Terminal, X } from "@phosphor-icons/react";
+import { createChatStore, applyLines, applyLine, applyAsk, addLocalUser } from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
 
@@ -80,6 +80,13 @@ const Row = memo(
     if (msg.role === "user")
       return (
         <div className={`chat-user${msg.local ? " pending" : ""}`}>
+          {msg.images?.length > 0 && (
+            <div className="chat-user-images">
+              {msg.images.map((im, i) => (
+                <img key={i} className="chat-user-img" src={im.url} alt="" />
+              ))}
+            </div>
+          )}
           {msg.text}
           {msg.local && <span className="chat-user-spin" aria-label="sending" />}
         </div>
@@ -178,7 +185,6 @@ export default memo(function ChatView({
   onSend,
   onStop,
   onNeedsTerm,
-  onImagePaste,
   status,
   register,
 }) {
@@ -199,7 +205,13 @@ export default memo(function ChatView({
   // "/" autocomplete: query is the token after a leading slash, null = closed
   const [cmdQuery, setCmdQuery] = useState(null);
   const [cmdIndex, setCmdIndex] = useState(0);
-  const [imgCount, setImgCount] = useState(0); // images handed to Claude's buffer
+  // Pasted/dropped images staged in the composer: { key, url (data URL), name }.
+  // They render inline (WYSIWYG), can be removed, and are written to temp files
+  // on send so Claude gets them by path.
+  const [images, setImages] = useState([]);
+  const [dragOver, setDragOver] = useState(false);
+  const imgKeyRef = useRef(0);
+  const fileInputRef = useRef(null);
   const commandsRef = useRef(null); // merged builtin + custom, fetched once
 
   const loadCommands = () => {
@@ -323,6 +335,15 @@ export default memo(function ChatView({
           storeRef.current = createChatStore();
           bump();
         }),
+        // PreToolUse(AskUserQuestion) fires the moment a question is posed —
+        // the transcript won't carry it until the turn resumes past the
+        // (answered) prompt, so render the pending card from this ping instead.
+        listen("ask", (e) => {
+          if (e.payload.id !== id) return;
+          setWaiting(false);
+          if (applyAsk(storeRef.current, e.payload.tool_id, e.payload.questions))
+            bump();
+        }),
       );
       return () => {
         dead = true;
@@ -353,39 +374,91 @@ export default memo(function ChatView({
     return () => register?.(null);
   }, [id]);
 
-  const submit = () => {
+  const submit = async () => {
     const el = inputRef.current;
-    const text = el?.value.trim();
-    if (!text) return;
+    const text = el?.value.trim() ?? "";
+    const imgs = images;
+    if (!text && imgs.length === 0) return;
+
+    // Persist staged images to temp files up front — Claude ingests them by
+    // path (deterministic), instead of us racing the OS clipboard. If a write
+    // fails, fall through and at least send the text.
+    let paths = [];
+    if (imgs.length && mode === "transcript") {
+      try {
+        paths = await Promise.all(
+          imgs.map((im) => invoke("save_pasted_image", { dataUrl: im.url })),
+        );
+      } catch {
+        paths = [];
+      }
+    }
+
     el.value = "";
     el.style.height = "";
     setCmdQuery(null);
+    setImages([]);
     // dialog commands (/resume, /usage, /model…) render in the terminal —
     // flip to Term view so the dialog is actually visible
     const tok = text.startsWith("/") ? text.slice(1).split(/\s+/)[0] : null;
     const opensDialog = tok != null && TUI_COMMANDS.has(tok);
-    if (!opensDialog) addLocalUser(storeRef.current, text);
-    onSend(text);
+    // Wire text: image paths first (temp names never contain spaces, so no
+    // quoting needed), then the user's message. Claude Code loads images
+    // referenced by path.
+    const wire = paths.length
+      ? [...paths, text].filter(Boolean).join(" ")
+      : text;
+    if (!opensDialog) {
+      addLocalUser(storeRef.current, text, imgs.map((im) => ({ url: im.url })));
+    }
+    onSend(wire);
     if (opensDialog && mode === "transcript") onNeedsTerm?.();
-    setImgCount(0); // images were already forwarded into Claude's buffer
     atBottomRef.current = true;
     bump();
   };
 
-  // Image paste mirrors the terminal: forward Ctrl+V (\x16) so Claude reads
-  // the host clipboard into its own input buffer, then our text is pasted
-  // after it on send — exactly the sequence a user does in Term view.
-  // Transcript panes only; the headless -p process has no host clipboard.
+  // Stage an image File (from paste, drop, or the picker) as a data URL so it
+  // renders immediately and can be written to a temp file on send.
+  const addImageFile = (file) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = () =>
+      setImages((imgs) => [
+        ...imgs,
+        {
+          key: `img${imgKeyRef.current++}`,
+          url: String(reader.result),
+          name: file.name || "pasted image",
+        },
+      ]);
+    reader.readAsDataURL(file);
+  };
+
+  const removeImage = (key) =>
+    setImages((imgs) => imgs.filter((i) => i.key !== key));
+
+  // Capture pasted images into the composer instead of the OS clipboard round
+  // trip. If the clipboard also has text, let that paste normally; only
+  // swallow the paste when it's image-only (nothing to type).
   const onPaste = (ev) => {
-    if (mode !== "transcript" || !onImagePaste) return;
-    const items = ev.clipboardData?.items ?? [];
-    const hasImage = Array.from(items).some((it) => it.type.startsWith("image/"));
-    const hasText = Array.from(items).some((it) => it.type === "text/plain");
-    if (hasImage && !hasText) {
-      ev.preventDefault();
-      onImagePaste();
-      setImgCount((n) => n + 1);
-    }
+    if (mode !== "transcript") return;
+    const items = Array.from(ev.clipboardData?.items ?? []);
+    const imageItems = items.filter((it) => it.type.startsWith("image/"));
+    if (!imageItems.length) return;
+    const hasText = items.some((it) => it.type === "text/plain");
+    if (!hasText) ev.preventDefault();
+    for (const it of imageItems) addImageFile(it.getAsFile());
+  };
+
+  const onDrop = (ev) => {
+    if (mode !== "transcript") return;
+    const files = Array.from(ev.dataTransfer?.files ?? []).filter((f) =>
+      f.type.startsWith("image/"),
+    );
+    setDragOver(false);
+    if (!files.length) return;
+    ev.preventDefault();
+    files.forEach(addImageFile);
   };
 
   const store = storeRef.current;
@@ -489,7 +562,20 @@ export default memo(function ChatView({
               .join("\n")}
           </pre>
         )}
-        <div className="chat-composer-card">
+        <div
+          className={`chat-composer-card${dragOver ? " drag-over" : ""}`}
+          onDrop={onDrop}
+          onDragOver={(ev) => {
+            if (mode !== "transcript") return;
+            if (Array.from(ev.dataTransfer?.items ?? []).some((i) => i.kind === "file")) {
+              ev.preventDefault();
+              setDragOver(true);
+            }
+          }}
+          onDragLeave={(ev) => {
+            if (!ev.currentTarget.contains(ev.relatedTarget)) setDragOver(false);
+          }}
+        >
           {cmdQuery != null && cmdMatches.length > 0 && (
             <div className="chat-cmd-menu">
               {cmdMatches.map((c, i) => (
@@ -512,20 +598,35 @@ export default memo(function ChatView({
               ))}
             </div>
           )}
-          {imgCount > 0 && (
-            <div className="chat-img-chips">
-              {Array.from({ length: imgCount }).map((_, i) => (
-                <span key={i} className="chat-img-chip">
-                  <ImageSquare size={12} /> image {i + 1}
-                </span>
+          {images.length > 0 && (
+            <div className="chat-img-tray">
+              {images.map((im) => (
+                <div key={im.key} className="chat-img-thumb" title={im.name}>
+                  <img src={im.url} alt={im.name} />
+                  <button
+                    className="chat-img-remove"
+                    title="Remove image"
+                    aria-label="Remove image"
+                    // mousedown so the textarea keeps focus
+                    onMouseDown={(ev) => {
+                      ev.preventDefault();
+                      removeImage(im.key);
+                    }}
+                  >
+                    <X size={10} weight="bold" />
+                  </button>
+                </div>
               ))}
-              <span className="chat-img-hint">sent on your next message</span>
             </div>
           )}
           <textarea
             ref={inputRef}
             rows={1}
-            placeholder="Message Claude…  ( / for commands )"
+            placeholder={
+              mode === "transcript"
+                ? "Message Claude…  ( / for commands · paste or drop an image )"
+                : "Message Claude…  ( / for commands )"
+            }
             onPaste={onPaste}
             onKeyDown={(ev) => {
               ev.stopPropagation();
@@ -567,6 +668,28 @@ export default memo(function ChatView({
             <span className="chat-composer-hint">
               {working ? "working — esc to stop" : "enter to send"}
             </span>
+            {mode === "transcript" && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  hidden
+                  onChange={(ev) => {
+                    Array.from(ev.target.files ?? []).forEach(addImageFile);
+                    ev.target.value = "";
+                  }}
+                />
+                <button
+                  className="chat-attach-btn"
+                  title="Attach an image"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <ImageSquare size={14} />
+                </button>
+              </>
+            )}
             <button
               className={`chat-debug-btn${showDebug ? " on" : ""}`}
               title="Chat pipeline debug info"
