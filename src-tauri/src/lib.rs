@@ -456,6 +456,75 @@ fn read_file_base64(path: String) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Persist a pasted/dropped image (a `data:` URL) to a temp file and return
+/// its absolute path, so the chat composer can hand Claude an image *by path*
+/// — reliable, unlike racing the OS clipboard with a synthetic Ctrl+V. Files
+/// land in a dedicated temp subdir that's pruned of day-old images each call.
+#[tauri::command]
+fn save_pasted_image(data_url: String) -> Result<String, String> {
+    use base64::Engine;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // data:[<mime>][;base64],<payload>
+    let comma = data_url.find(',').ok_or("not a data URL")?;
+    let header = &data_url[..comma];
+    let payload = data_url[comma + 1..].trim();
+    if !header.contains(";base64") {
+        return Err("expected a base64 data URL".into());
+    }
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|h| h.split(';').next())
+        .unwrap_or("image/png");
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "png",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| format!("bad base64: {e}"))?;
+
+    let dir = std::env::temp_dir().join("agentbench-images");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    prune_old_images(&dir);
+
+    // unique name without a uuid dep: monotonic clock + a process-wide counter
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("paste-{stamp}-{seq}.{ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Drop images older than a day so the temp dir doesn't grow without bound.
+fn prune_old_images(dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|age| age.as_secs() > 24 * 3600)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Which of `bins` exist on the user's PATH. Probed through a login shell so
 /// the answer matches what a spawned pane would actually find. Returns the
 /// subset that was found.
@@ -656,6 +725,7 @@ pub fn run() {
             list_slash_commands,
             list_sessions,
             read_file_base64,
+            save_pasted_image,
             sync_plan_skill,
             check_binaries,
             install_harness,

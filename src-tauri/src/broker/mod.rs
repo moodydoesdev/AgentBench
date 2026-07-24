@@ -259,7 +259,14 @@ fn write_hook_settings(
         "hooks": {
             "SessionStart": [{ "hooks": [{ "type": "command", "command": curl("session"), "timeout": 10 }] }],
             "Stop": [{ "hooks": [{ "type": "command", "command": curl("done"), "timeout": 10 }] }],
-            "Notification": [{ "hooks": [{ "type": "command", "command": curl("needs_input"), "timeout": 10 }] }]
+            "Notification": [{ "hooks": [{ "type": "command", "command": curl("needs_input"), "timeout": 10 }] }],
+            // Claude buffers transcript writes, so a *pending* AskUserQuestion
+            // never reaches the JSONL until it's already answered — the chat
+            // view (which reads the transcript) can't render the live prompt.
+            // PreToolUse fires with tool_input the instant the question is
+            // posed, so the broker can push the questions to the chat view for
+            // an immediate, answerable card. Scoped to AskUserQuestion only.
+            "PreToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": curl("ask"), "timeout": 10 }] }]
         }
     });
     // accept only Claude's known theme names
@@ -1078,6 +1085,23 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                             hist.truncate(8);
                         }
                         persist_panes(&core);
+                    }
+                    // PreToolUse(AskUserQuestion): forward the questions to the
+                    // chat view so it can render the pending prompt live — the
+                    // transcript won't carry it until the turn resumes past the
+                    // (already-answered) question.
+                    if kind == "ask" {
+                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                            let questions = &v["tool_input"]["questions"];
+                            if questions.is_array() {
+                                core.broadcast(&json!({
+                                    "ev": "ask",
+                                    "id": id,
+                                    "tool_id": v["tool_use_id"].as_str(),
+                                    "questions": questions.clone(),
+                                }));
+                            }
+                        }
                     }
                     // The Notification hook also fires an idle ping ("Claude is
                     // waiting for your input") after ~60s at the prompt; only

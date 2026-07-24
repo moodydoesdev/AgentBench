@@ -923,9 +923,6 @@ export default memo(function AgentPane({
                 onSend={sendChatToPty}
                 onStop={() => invoke("interrupt_pane", { id }).catch(() => {})}
                 onNeedsTerm={() => onViewChange?.(id, "term")}
-                onImagePaste={() =>
-                  invoke("write_pane", { id, data: "\x16" }).catch(() => {})
-                }
                 status={status}
                 register={registerChat}
               />

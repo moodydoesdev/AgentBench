@@ -25,9 +25,16 @@ export function createChatStore() {
 }
 
 /** Optimistic echo: show the user's message the instant they hit send —
- *  the real transcript record arrives a poll later and is deduped. */
-export function addLocalUser(store, text) {
-  const msg = push(store, { role: "user", kind: "text", text, local: true });
+ *  the real transcript record arrives a poll later and is deduped. `images`
+ *  is an optional array of { url } shown inline in the bubble. */
+export function addLocalUser(store, text, images) {
+  const msg = push(store, {
+    role: "user",
+    kind: "text",
+    text,
+    images: images?.length ? images : undefined,
+    local: true,
+  });
   store.pending.push(msg);
   return msg;
 }
@@ -47,6 +54,28 @@ function push(store, msg) {
   msg.rev = ++store.rev;
   store.messages.push(msg);
   return msg;
+}
+
+// A message content-block image → a renderable URL. The transcript inlines
+// the bytes as base64; the API-shape allows a plain url source too.
+function imageUrlFromSource(s) {
+  if (!s) return null;
+  if (s.type === "base64" && s.data) {
+    return `data:${s.media_type || "image/png"};base64,${s.data}`;
+  }
+  if (s.type === "url" && s.url) return s.url;
+  return null;
+}
+
+// Strip the machinery from a pasted-image turn's text: Claude's [Image #N]
+// markers and the temp paths we prepend to deliver the image, so the bubble
+// shows what the user actually typed.
+function cleanImageText(text) {
+  return text
+    .replace(/\[Image #\d+\]/g, "")
+    .replace(/\S*agentbench-images[\\/]paste-\S+/g, "")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
 }
 
 function textOf(content) {
@@ -184,10 +213,16 @@ function applyAssistant(store, rec) {
       });
       changed = true;
     } else if (b.type === "tool_use") {
-      const tool = { id: b.id, name: b.name, input: b.input, done: false };
-      store.tools.set(b.id, tool);
-      const msg = push(store, { role: "assistant", kind: "tool", tool, sidechain });
-      store.toolMsg.set(b.id, msg);
+      // A PreToolUse-hook question card may already be on screen (inserted by
+      // applyAsk before the transcript caught up) — adopt it in place instead
+      // of stacking a duplicate, rebinding to the real tool_use id so its
+      // tool_result lands on the same card.
+      if (!(b.name === "AskUserQuestion" && adoptSyntheticAsk(store, b))) {
+        const tool = { id: b.id, name: b.name, input: b.input, done: false };
+        store.tools.set(b.id, tool);
+        const msg = push(store, { role: "assistant", kind: "tool", tool, sidechain });
+        store.toolMsg.set(b.id, msg);
+      }
       changed = true;
     }
   }
@@ -198,6 +233,37 @@ function applyUser(store, rec) {
   if (rec.isMeta) return false;
   const content = rec.message?.content;
   const sidechain = !!rec.isSidechain;
+
+  // A user record with top-level image block(s) is a pasted/attached-image
+  // turn — tool-result images are nested inside a tool_result block, not
+  // top-level, so this cleanly targets only what the user sent. Render the
+  // image(s) for real and fold them into the optimistic echo (upgrading its
+  // local preview to the transcript bytes) so we don't double up.
+  if (Array.isArray(content) && content.some((b) => b.type === "image")) {
+    const images = content
+      .filter((b) => b.type === "image")
+      .map((b) => imageUrlFromSource(b.source))
+      .filter(Boolean)
+      .map((url) => ({ url }));
+    const text = cleanImageText(
+      content
+        .filter((b) => b.type === "text" && typeof b.text === "string")
+        .map((b) => b.text)
+        .join("\n"),
+    );
+    const i = store.pending.findIndex((p) => p.images?.length);
+    if (i !== -1) {
+      const [msg] = store.pending.splice(i, 1);
+      if (images.length) msg.images = images;
+      if (text) msg.text = text;
+      msg.local = false;
+      msg.rev = ++store.rev;
+    } else {
+      push(store, { role: "user", kind: "text", text, images, sidechain });
+    }
+    return true;
+  }
+
   let changed = false;
   if (Array.isArray(content)) {
     for (const b of content) {
@@ -226,9 +292,6 @@ function applyUser(store, rec) {
           }
           changed = true;
         }
-      } else if (b.type === "image") {
-        push(store, { role: "user", kind: "text", text: "[image]", sidechain });
-        changed = true;
       }
     }
   } else if (typeof content === "string" && content.trim()) {
@@ -264,6 +327,52 @@ function applyStreamEvent(store, rec) {
   if (ev.type === "message_stop" && store.draft) {
     // keep the text visible; the full assistant record will replace it
     return false;
+  }
+  return false;
+}
+
+// Signature that ties a live PreToolUse ping to its later transcript record:
+// the questions array is identical in both, so it dedupes even when the hook
+// carried no tool_use id.
+const askSig = (questions) => JSON.stringify(questions ?? null);
+
+/** A pending AskUserQuestion pushed by the PreToolUse hook, before the
+ *  transcript catches up. Renders an answerable card immediately; deduped so
+ *  repeated pings (or an already-present transcript record) don't stack. */
+export function applyAsk(store, toolId, questions) {
+  if (!Array.isArray(questions)) return false;
+  const sig = askSig(questions);
+  for (const t of store.tools.values()) {
+    if (t.name === "AskUserQuestion" && askSig(t.input?.questions) === sig) {
+      return false; // already showing this question (synthetic or real)
+    }
+  }
+  const id = toolId || `ask-${store.nextKey}`;
+  const tool = { id, name: "AskUserQuestion", input: { questions }, done: false, synthetic: true };
+  store.tools.set(id, tool);
+  const msg = push(store, { role: "assistant", kind: "tool", tool });
+  store.toolMsg.set(id, msg);
+  return true;
+}
+
+// When the transcript finally delivers the real AskUserQuestion tool_use,
+// rebind the synthetic card (matched by identical questions) to the real
+// tool_use id so its tool_result lands here — instead of pushing a duplicate.
+function adoptSyntheticAsk(store, b) {
+  const sig = askSig(b.input?.questions);
+  for (const [key, msg] of store.toolMsg) {
+    const t = msg.tool;
+    if (t?.synthetic && t.name === "AskUserQuestion" && askSig(t.input?.questions) === sig) {
+      store.tools.delete(key);
+      store.toolMsg.delete(key);
+      t.id = b.id;
+      t.input = b.input;
+      t.synthetic = false;
+      store.tools.set(b.id, t);
+      store.toolMsg.set(b.id, msg);
+      msg.rev = ++store.rev;
+      return true;
+    }
   }
   return false;
 }
