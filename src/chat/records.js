@@ -20,7 +20,6 @@ export function createChatStore() {
     pending: [], // optimistic local user echoes awaiting their real record
     nextKey: 0,
     rev: 0, // bumped on every visible change — cheap render/scroll guard
-    typeCounts: {}, // raw record types seen — for the debug panel
   };
 }
 
@@ -129,12 +128,21 @@ function commandChip(text) {
   const name = /<command-name>\s*([^<]*?)\s*<\/command-name>/.exec(text)?.[1];
   if (!name) return null;
   const args = /<command-args>\s*([^<]*?)\s*<\/command-args>/.exec(text)?.[1];
-  return args ? `${name} ${args}` : name;
+  // The tag carries its own leading slash; normalize here so no renderer has
+  // to guess. The event row used to re-prepend one and print "//clear".
+  const slashed = name.startsWith("/") ? name : `/${name}`;
+  return args ? `${slashed} ${args}` : slashed;
 }
 
 // A command typed in the composer left a pending echo; its transcript record
-// comes back as a chip, so confirm-and-morph the echo instead of stacking a
-// second, forever-spinning copy.
+// comes back as a chip, so confirm the echo instead of stacking a second,
+// forever-spinning copy.
+//
+// The echo is already a normal user bubble and stays one — it's something you
+// typed, so it reads as chat. It used to morph into kind "command", which
+// yanked your own message into a centered pill mid-thread and, since the pill
+// doesn't wrap, mangled anything long. Only commands with no echo (auto-
+// compact and friends, which the harness runs on its own) stay event rows.
 function pushCommandChip(store, chip, sidechain) {
   const first = chip.trim().split(/\s+/)[0];
   const i = store.pending.findIndex(
@@ -142,8 +150,7 @@ function pushCommandChip(store, chip, sidechain) {
   );
   if (i !== -1) {
     const [msg] = store.pending.splice(i, 1);
-    msg.kind = "command";
-    msg.text = chip;
+    msg.text = chip; // canonical "/name args", not the raw keystrokes
     msg.local = false;
     msg.rev = ++store.rev;
     return;
@@ -154,9 +161,6 @@ function pushCommandChip(store, chip, sidechain) {
 /** Apply one parsed record. Returns true when the visible list changed. */
 export function applyRecord(store, rec) {
   if (!rec || typeof rec !== "object") return false;
-  if (rec.type) {
-    store.typeCounts[rec.type] = (store.typeCounts[rec.type] ?? 0) + 1;
-  }
 
   // transcript backfill overlaps the live tail; uuids dedupe the seam
   if (rec.uuid) {
@@ -334,7 +338,23 @@ function applyStreamEvent(store, rec) {
 // Signature that ties a live PreToolUse ping to its later transcript record:
 // the questions array is identical in both, so it dedupes even when the hook
 // carried no tool_use id.
-const askSig = (questions) => JSON.stringify(questions ?? null);
+//
+// Key ORDER differs between the two paths, so the stringify must be canonical:
+// the hook's copy round-trips through serde_json (a BTreeMap without the
+// preserve_order feature — keys come back sorted), while the transcript's is
+// JSON.parsed straight from the JSONL in Claude Code's original order. Plain
+// JSON.stringify never matched, so every question rendered twice.
+const canon = (v) =>
+  Array.isArray(v)
+    ? v.map(canon)
+    : v && typeof v === "object"
+      ? Object.fromEntries(
+          Object.keys(v)
+            .sort()
+            .map((k) => [k, canon(v[k])]),
+        )
+      : v;
+const askSig = (questions) => JSON.stringify(canon(questions ?? null));
 
 /** A pending AskUserQuestion pushed by the PreToolUse hook, before the
  *  transcript catches up. Renders an answerable card immediately; deduped so
@@ -362,7 +382,13 @@ function adoptSyntheticAsk(store, b) {
   const sig = askSig(b.input?.questions);
   for (const [key, msg] of store.toolMsg) {
     const t = msg.tool;
-    if (t?.synthetic && t.name === "AskUserQuestion" && askSig(t.input?.questions) === sig) {
+    if (!t?.synthetic || t.name !== "AskUserQuestion") continue;
+    // The hook usually carries the real tool_use_id, so prefer that exact
+    // match; the signature is the fallback for hooks that didn't. Without the
+    // id check a same-id synthetic card would be silently orphaned below —
+    // store.tools.set(b.id, …) would overwrite it and its tool_result would
+    // land on the new card, leaving the old one spinning forever.
+    if (key === b.id || askSig(t.input?.questions) === sig) {
       store.tools.delete(key);
       store.toolMsg.delete(key);
       t.id = b.id;

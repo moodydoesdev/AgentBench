@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod dictation;
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -205,8 +206,14 @@ fn unwatch_transcript(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<(
 
 /// Stop the current turn (chat view's Stop button).
 #[tauri::command]
-fn interrupt_pane(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<(), String> {
-    client.send(json!({ "op": "interrupt", "id": id }))
+fn interrupt_pane(
+    client: State<'_, Arc<BrokerClient>>,
+    id: u32,
+    resubmit: Option<bool>,
+) -> Result<(), String> {
+    client.send(json!({
+        "op": "interrupt", "id": id, "resubmit": resubmit.unwrap_or(false)
+    }))
 }
 
 #[tauri::command]
@@ -729,7 +736,11 @@ pub fn run() {
             sync_plan_skill,
             check_binaries,
             install_harness,
-            shutdown_broker
+            shutdown_broker,
+            dictation::dictation_available,
+            dictation::dictation_start,
+            dictation::dictation_stop,
+            dictation::dictation_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

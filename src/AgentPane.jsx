@@ -891,7 +891,11 @@ export default memo(function AgentPane({
           mode="stream"
           initialLines={initialLines}
           onSend={sendChatToStream}
-          onStop={() => invoke("interrupt_pane", { id }).catch(() => {})}
+          onStop={(resubmit) =>
+            invoke("interrupt_pane", { id, resubmit: !!resubmit }).catch((err) =>
+              console.error("interrupt failed", err),
+            )
+          }
           status={status}
           register={registerChat}
         />
@@ -921,7 +925,11 @@ export default memo(function AgentPane({
                 cwd={cwd}
                 mode="transcript"
                 onSend={sendChatToPty}
-                onStop={() => invoke("interrupt_pane", { id }).catch(() => {})}
+                onStop={(resubmit) =>
+            invoke("interrupt_pane", { id, resubmit: !!resubmit }).catch((err) =>
+              console.error("interrupt failed", err),
+            )
+          }
                 onNeedsTerm={() => onViewChange?.(id, "term")}
                 status={status}
                 register={registerChat}

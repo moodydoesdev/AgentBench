@@ -533,7 +533,7 @@ export default function SettingsWindow() {
                 sub="View Claude panes open in — each pane's Term/Chat toggle still overrides"
               >
                 <Segmented
-                  value={settings.defaultPaneView ?? "term"}
+                  value={settings.defaultPaneView ?? "chat"}
                   options={[
                     ["term", "Terminal"],
                     ["chat", "Chat"],

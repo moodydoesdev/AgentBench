@@ -1,7 +1,9 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUp, Bell, CaretUp, ImageSquare, Info, Robot, Stop, Terminal, X } from "@phosphor-icons/react";
+import { ArrowUp, Bell, CaretUp, ImageSquare, Microphone, Robot, Stop, Terminal, X } from "@phosphor-icons/react";
+import { LogoMark } from "../components/Logo";
+import useDictation from "./useDictation";
 import { createChatStore, applyLines, applyLine, applyAsk, addLocalUser } from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
@@ -67,14 +69,14 @@ const Row = memo(
           )}
         </div>
       );
-    // a slash command in the transcript is an event, not something the user
-    // "said" — some (auto-compact) the harness runs on its own, so it's shown
-    // as a centered command pill, never a right-aligned user bubble
+    // Only commands the harness ran itself land here (anything sent from the
+    // composer keeps its user bubble) — those aren't something the user
+    // "said", so they stay a centered event row rather than a chat message.
     if (msg.kind === "command")
       return (
         <div className="chat-cmd-event">
           <Terminal size={11} weight="bold" />
-          <code>/{msg.text}</code>
+          <code>{msg.text}</code>
         </div>
       );
     if (msg.role === "user")
@@ -193,14 +195,23 @@ export default memo(function ChatView({
   const [, forceRender] = useReducer((n) => n + 1, 0);
   const [waiting, setWaiting] = useState(mode === "transcript");
   const [watchError, setWatchError] = useState(null);
-  const [diag, setDiag] = useState(null); // broker's view of sid/path/exists
-  const [showDebug, setShowDebug] = useState(false);
   const [tailCap, setTailCap] = useState(TAIL);
   const listRef = useRef(null);
   const atBottomRef = useRef(true);
   const inputRef = useRef(null);
   const rafRef = useRef(0);
   const lastRevRef = useRef(0);
+  // Authoritative turn state from the UserPromptSubmit/Stop hooks; null until
+  // the first one lands (old broker, or settings written before those hooks
+  // existed), which is when the record heuristic below stands in.
+  const [turnActive, setTurnActive] = useState(null);
+  const workingRef = useRef(false);
+  // Set when the composer sends into an already-running turn: the TUI queues
+  // that message, and interrupting restores it to the input buffer, so stop
+  // has to follow through with an Enter to avoid swallowing it. Any other
+  // stop must NOT send that Enter or it just resubmits and the agent
+  // restarts — which is what made stop look like it did nothing.
+  const queuedRef = useRef(false);
 
   // "/" autocomplete: query is the token after a leading slash, null = closed
   const [cmdQuery, setCmdQuery] = useState(null);
@@ -213,6 +224,55 @@ export default memo(function ChatView({
   const imgKeyRef = useRef(0);
   const fileInputRef = useRef(null);
   const commandsRef = useRef(null); // merged builtin + custom, fetched once
+
+  // Dictation writes into the textarea, which is uncontrolled — the composer
+  // reads el.value directly. Partials are revisions of the whole phrase, so
+  // each one replaces the transcript rather than appending: keep whatever was
+  // typed before the mic opened and rewrite only the tail after it.
+  const dictBaseRef = useRef("");
+  const [dictError, setDictError] = useState(null);
+  const writeTranscript = (text) => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.value = dictBaseRef.current + text;
+    // match the autosize + "/" menu the onInput handler would have done
+    el.style.height = "";
+    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+    syncCmdMenu(el.value);
+  };
+  const dictation = useDictation({
+    onPartial: writeTranscript,
+    onFinal: (text) => {
+      writeTranscript(text);
+      const el = inputRef.current;
+      if (!el) return;
+      // No trailing space: it would leave the box non-empty-looking, which
+      // disarms the bare-Space shortcut below and turns every later Space
+      // press into another stray space. The separator before the next phrase
+      // is added when that phrase starts instead.
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    },
+    onError: setDictError,
+  });
+  // Whether the current phrase is push-to-talk (⌥Space) rather than a button
+  // toggle. Only a held phrase is tied to keys that must be released, so only
+  // it should be abandoned when the composer loses focus.
+  const dictHoldRef = useRef(false);
+  const startDictation = (held) => {
+    const el = inputRef.current;
+    // Anything already typed is kept and the phrase lands after it, separated
+    // by exactly one space however much trailing whitespace is sitting there.
+    // A box holding only whitespace counts as empty, so a few stray Space
+    // presses can't prefix the message with them.
+    const typed = el?.value ?? "";
+    dictBaseRef.current = typed.trim() ? typed.replace(/\s+$/, "") + " " : "";
+    dictHoldRef.current = held;
+    setDictError(null);
+    dictation.start();
+  };
+  const toggleDictation = () =>
+    dictation.listening ? dictation.stop() : startDictation(false);
 
   const loadCommands = () => {
     if (commandsRef.current) return;
@@ -302,12 +362,22 @@ export default memo(function ChatView({
     let dead = false;
     const unlistens = [];
 
+    // Turn boundaries, straight from the hooks — the transcript lands records
+    // after the fact, so it can't tell "mid-turn" from "at rest".
+    const onTurn = listen("turn", (e) => {
+      if (e.payload.id !== id) return;
+      setTurnActive(!!e.payload.active);
+      // Turn over: whatever was queued has been consumed (or discarded), so
+      // a later stop must not fire a stray Enter.
+      if (!e.payload.active) queuedRef.current = false;
+    });
+    unlistens.push(onTurn);
+
     if (mode === "transcript") {
       invoke("watch_transcript", { id })
         .then((res) => {
           if (dead) return;
           setWaiting(!res?.sid);
-          setDiag(res);
           if (res?.text) {
             try {
               applyLines(storeRef.current, res.text.split("\n"));
@@ -376,6 +446,12 @@ export default memo(function ChatView({
 
   const submit = async () => {
     const el = inputRef.current;
+    // Sending ends any phrase in flight. Without this the recognizer's last
+    // result lands after the box is cleared and types the sent message
+    // straight back into it — and the image write below can await, widening
+    // the window it lands in.
+    dictation.cancel();
+    dictBaseRef.current = "";
     const text = el?.value.trim() ?? "";
     const imgs = images;
     if (!text && imgs.length === 0) return;
@@ -411,10 +487,22 @@ export default memo(function ChatView({
     if (!opensDialog) {
       addLocalUser(storeRef.current, text, imgs.map((im) => ({ url: im.url })));
     }
+    // Sending into a live turn means the TUI queues this message — remember
+    // that, so a later stop knows to push it through rather than drop it.
+    if (workingRef.current) queuedRef.current = true;
+    setTurnActive(true); // don't wait on the hook to offer a stop button
     onSend(wire);
     if (opensDialog && mode === "transcript") onNeedsTerm?.();
     atBottomRef.current = true;
     bump();
+  };
+
+  // One funnel for every stop affordance, so the queued-message flag is
+  // consumed exactly once and a second stop can't fire a stray Enter.
+  const stop = () => {
+    const resubmit = queuedRef.current;
+    queuedRef.current = false;
+    onStop?.(resubmit);
   };
 
   // Stage an image File (from paste, drop, or the picker) as a data URL so it
@@ -470,42 +558,64 @@ export default memo(function ChatView({
   // button. Active: streaming draft, an unfinished tool, or the user just
   // sent and nothing has come back yet.
   const last = store.messages[store.messages.length - 1];
-  const working =
+  // Fallback only. In transcript mode there is no draft (drafts come from
+  // stream-json events), so this reads false for long stretches of a live
+  // turn — every gap between a finished record and the next one. That hid
+  // the stop button and made Esc a no-op exactly when they were wanted.
+  const looksWorking =
     !!store.draft ||
     (last &&
       (last.kind === "draft" ||
         (last.kind === "tool" && !last.tool.done) ||
         last.role === "user"));
+  // The hooks bracket the turn exactly; trust them once they've reported.
+  const working = turnActive ?? looksWorking;
+  workingRef.current = working;
+
+  // nothing to show yet: the list becomes a centered welcome panel instead
+  const empty = groups.length === 0;
+  const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : "";
 
   return (
-    <div className="chat-view">
+    // Esc also stops when focus has left the composer — clicking a question
+    // card or "Show earlier" moves it, and the textarea's handler (which
+    // stopPropagation()s, so this never double-fires) was the only binding.
+    <div
+      className="chat-view"
+      onKeyDown={(ev) => {
+        if (ev.key === "Escape" && working) stop();
+      }}
+    >
       <div className="chat-list" ref={listRef} onScroll={onScroll}>
-        <div className="chat-col">
+        <div className={`chat-col${empty ? " empty" : ""}`}>
           <ChatErrorBoundary>
           {watchError && (
             <pre className="chat-error">
               {`chat view couldn't reach the transcript watcher (${watchError}).\nThe broker probably predates this build — use Settings → Workspace →\nRestart broker (or the command menu's "Restart broker").`}
             </pre>
           )}
-          {waiting && !watchError && groups.length === 0 && (
-            <div className="chat-waiting">
-              waiting for session… (starts with the first message)
+          {empty && !watchError && (
+            <div className="chat-empty">
+              <LogoMark className="chat-empty-mark" aria-hidden="true" />
+              <h2>{waiting ? "Ready when you are" : "New conversation"}</h2>
+              <p>
+                Send a message to start a session
+                {folder ? ` in ${folder}` : ""}. Replies stream in here — the
+                terminal keeps running behind the Term toggle.
+              </p>
+              <div className="chat-empty-tips">
+                <span>
+                  <kbd>/</kbd> commands
+                </span>
+                <span>
+                  <kbd>Enter</kbd> send
+                </span>
+                <span>
+                  <kbd>Esc</kbd> stop
+                </span>
+                <span>paste or drop images</span>
+              </div>
             </div>
-          )}
-          {/* empty list + a watch response = something's off; show the
-              broker's view so a screenshot is enough to debug */}
-          {groups.length === 0 && !watchError && diag && (
-            <pre className="chat-diag">
-              {[
-                `sid: ${diag.sid ?? "none yet"}`,
-                `sessions seen: ${diag.hist ?? 0}`,
-                diag.path ? `transcript: ${diag.path}` : "transcript: (no session id from hooks yet)",
-                diag.path ? `exists: ${diag.exists ? "yes" : "NO — path mismatch?"}` : null,
-                `cwd: ${diag.cwd ?? ""}`,
-              ]
-                .filter(Boolean)
-                .join("\n")}
-            </pre>
           )}
           {hiddenCount > 0 && (
             <button
@@ -547,21 +657,6 @@ export default memo(function ChatView({
         </div>
       </div>
       <div className="chat-composer">
-        {showDebug && (
-          <pre className="chat-diag chat-diag-panel">
-            {[
-              `mode: ${mode} · messages: ${store.messages.length} · groups: ${groups.length} · rev: ${store.rev}`,
-              `record types: ${JSON.stringify(store.typeCounts)}`,
-              `pending echoes: ${store.pending.length} · working: ${working ? "yes" : "no"}`,
-              diag
-                ? `sid: ${diag.sid ?? "none"} · hist: ${diag.hist} · exists: ${diag.exists}\npath: ${diag.path}\ncwd: ${diag.cwd}`
-                : "no watch response yet",
-              watchError ? `error: ${watchError}` : null,
-            ]
-              .filter(Boolean)
-              .join("\n")}
-          </pre>
-        )}
         <div
           className={`chat-composer-card${dragOver ? " drag-over" : ""}`}
           onDrop={onDrop}
@@ -630,6 +725,34 @@ export default memo(function ChatView({
             onPaste={onPaste}
             onKeyDown={(ev) => {
               ev.stopPropagation();
+              // Push-to-talk, matching Claude Code's own /voice binding: hold
+              // Space on an empty box, since there is nothing to append a
+              // space to yet. Once there's text, Space has to stay a space, so
+              // ⌥Space is the escape hatch for dictating mid-sentence.
+              //
+              // Checked before everything else so a held key can't also open
+              // the "/" menu or submit, and preventDefault'd because Space
+              // would otherwise type (and ⌥Space a non-breaking space).
+              // `repeat` fires while held — ignore it and let keyup be the
+              // only thing that ends the phrase.
+              if (dictation.available && ev.code === "Space") {
+                const bare =
+                  !ev.altKey && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey;
+                // trim(), not === "": a box holding only whitespace still has
+                // nothing to append a space to, and treating it as non-empty
+                // is what makes repeated Space presses pile up instead of
+                // starting a phrase.
+                if (ev.altKey || (bare && ev.currentTarget.value.trim() === "")) {
+                  ev.preventDefault();
+                  if (!ev.repeat) startDictation(true);
+                  return;
+                }
+              }
+              if (dictation.listening && ev.key === "Escape") {
+                ev.preventDefault();
+                dictation.cancel();
+                return;
+              }
               if (cmdQuery != null && cmdMatches.length > 0) {
                 if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
                   ev.preventDefault();
@@ -655,7 +778,25 @@ export default memo(function ChatView({
                 submit();
               }
               // Esc interrupts, mirroring the terminal
-              if (ev.key === "Escape" && working) onStop?.();
+              if (ev.key === "Escape" && working) stop();
+            }}
+            onKeyUp={(ev) => {
+              // Releasing either half of the chord ends a held phrase —
+              // letting go of ⌥ first is common and shouldn't strand the mic.
+              if (
+                dictHoldRef.current &&
+                dictation.listening &&
+                (ev.code === "Space" || ev.key === "Alt")
+              ) {
+                ev.preventDefault();
+                dictation.stop();
+              }
+            }}
+            onBlur={() => {
+              // A held chord can't deliver its keyup once focus is gone, so
+              // the mic would stay open forever; drop the phrase. A tapped
+              // session is deliberate and survives clicking away.
+              if (dictHoldRef.current && dictation.listening) dictation.cancel();
             }}
             onInput={(ev) => {
               const el = ev.currentTarget;
@@ -665,8 +806,16 @@ export default memo(function ChatView({
             }}
           />
           <div className="chat-composer-bar">
-            <span className="chat-composer-hint">
-              {working ? "working — esc to stop" : "enter to send"}
+            <span
+              className={`chat-composer-hint${dictError ? " chat-composer-hint-error" : ""}`}
+            >
+              {dictError
+                ? dictError
+                : dictation.listening
+                  ? "listening — esc to discard"
+                  : working
+                    ? "working — esc to stop"
+                    : "enter to send"}
             </span>
             {mode === "transcript" && (
               <>
@@ -690,18 +839,30 @@ export default memo(function ChatView({
                 </button>
               </>
             )}
-            <button
-              className={`chat-debug-btn${showDebug ? " on" : ""}`}
-              title="Chat pipeline debug info"
-              onClick={() => setShowDebug((s) => !s)}
-            >
-              <Info size={13} />
-            </button>
+            {dictation.available && (
+              <button
+                className={`chat-mic-btn${dictation.listening ? " chat-mic-live" : ""}`}
+                title={
+                  dictation.listening
+                    ? "Stop dictating and insert (Esc discards)"
+                    : "Dictate — click to toggle, or hold ⌥Space"
+                }
+                aria-pressed={dictation.listening}
+                // mousedown so the textarea keeps focus, matching the attach
+                // button — and so ⌥Space stays usable straight afterwards
+                onMouseDown={(ev) => {
+                  ev.preventDefault();
+                  toggleDictation();
+                }}
+              >
+                <Microphone size={14} weight={dictation.listening ? "fill" : "regular"} />
+              </button>
+            )}
             {working && (
               <button
                 className="chat-stop"
                 title="Stop the current turn (Esc)"
-                onClick={() => onStop?.()}
+                onClick={() => stop()}
               >
                 <Stop size={12} weight="fill" />
               </button>

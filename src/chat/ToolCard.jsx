@@ -55,6 +55,7 @@ function QuestionCard({ tool, paneId, canAnswer }) {
     questions.map(() => ({ pick: null, set: [], other: "" })),
   );
   const [sent, setSent] = useState(false);
+  const [sendError, setSendError] = useState(null);
 
   const answerable =
     canAnswer &&
@@ -109,14 +110,27 @@ function QuestionCard({ tool, paneId, canAnswer }) {
 
   const submit = async () => {
     if (!answerable || !allAnswered) return;
+    if (paneId == null) {
+      setSendError("no terminal attached to this card — answer in Term view");
+      return;
+    }
     setSent(true);
+    setSendError(null);
     // paced so the TUI consumes each Enter (and any list→text mode switch)
-    // before the next burst arrives
-    for (let i = 0; i < questions.length; i++) {
-      for (const keys of stepsFor(questions[i], at(i))) {
-        invoke("write_pane", { id: paneId, data: keys }).catch(() => {});
-        await sleep(160);
+    // before the next burst arrives. Each write is awaited: a rejected
+    // write_pane used to be swallowed, so a dead pane or a restarted broker
+    // still flipped the card to "answer sent…" with nothing on the wire and
+    // no way to retry.
+    try {
+      for (let i = 0; i < questions.length; i++) {
+        for (const keys of stepsFor(questions[i], at(i))) {
+          await invoke("write_pane", { id: paneId, data: keys });
+          await sleep(160);
+        }
       }
+    } catch (err) {
+      setSent(false); // let them retry — nothing (or only part) got through
+      setSendError(String(err));
     }
   };
 
@@ -172,7 +186,9 @@ function QuestionCard({ tool, paneId, canAnswer }) {
       ) : answerable ? (
         <div className="chat-question-foot">
           <span className="chat-question-hint">
-            assumes the Term picker is untouched
+            {sendError
+              ? `send failed: ${sendError}`
+              : "assumes the Term picker is untouched"}
           </span>
           <button
             className="chat-question-submit"

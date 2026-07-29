@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Merged into the bundle's Info.plist by tauri-bundler.
+
+	  macOS refuses to hand a process the microphone unless the bundle it is
+	  identified by declares a purpose string — and it does not merely deny the
+	  request, it SIGABRTs the process. The chat tab's dictation runs in this
+	  process (not the broker, which is a bare executable with no bundle and so
+	  can never be granted), so the keys have to live here.
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>AgentBench uses the microphone to dictate messages into the chat composer.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>AgentBench transcribes your dictation on-device to type it into the chat composer.</string>
+</dict>
+</plist>

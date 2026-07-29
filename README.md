@@ -28,8 +28,9 @@
 
 AgentBench is a desktop app for people who run more than one coding agent at a
 time. Instead of juggling terminal tabs, you get a grid of agent panes per
-project — each one a full terminal running the agent of your choice — with the
-app keeping watch so you don't have to.
+project — each one a full terminal running the agent of your choice, or a
+rendered chat transcript of the same session — with the app keeping watch so
+you don't have to.
 
 ## Why
 
@@ -41,28 +42,53 @@ miss, and makes everything in between effortless.
 
 - **Agent grid** — spawn as many agents as you need per project, arranged in a
   resizable, drag-to-reorder grid. One click to add another.
-- **Any agent, one bench** — Claude Code, opencode, Codex, Gemini CLI, and pi
-  ship as built-in harnesses, plus plain terminal panes and custom harnesses
-  for anything else on your PATH. Missing binary? AgentBench installs it right
-  in the pane, in front of you. Mix harnesses freely in the same grid.
+- **Any agent, one bench** — Claude Code, opencode, Codex, Gemini CLI, pi and
+  Oh My Pi (`omp`) ship as built-in harnesses, plus plain terminal panes and
+  custom harnesses for anything else on your PATH. Missing binary? AgentBench
+  installs it right in the pane, in front of you. Mix harnesses freely in the
+  same grid.
+- **Chat or terminal, per pane** — Claude panes open as a clean chat transcript
+  by default: rendered markdown, collapsible tool cards, permission prompts you
+  can answer inline, `/` command autocomplete, image paste, and real
+  select-and-copy. Flip to **Term** any time for the raw TUI — it's the same
+  live session, not a copy. Prefer the terminal? Settings → Terminal → Claude
+  pane view.
+- **Headless chat agents** — spawn *Claude (Chat)* for a pane with no terminal
+  at all: pure chat UI over a streaming session, ideal when you just want to
+  delegate and read.
+- **Resume past sessions** — browse a project's previous Claude conversations,
+  newest first, and reopen any of them into a fresh pane with `--resume`.
 - **Knows when a turn ends** — panes glow green when an agent finishes and
   pulse amber when one is waiting on your input. No output-scraping guesswork;
   it's wired into Claude Code itself.
 - **Pings you anywhere** — a soft chime plus a native OS notification when the
-  app is in the background. Walk away, come back only when needed.
-- **Projects sidebar** — group agents by repository and flip between projects
-  instantly; every pane keeps running in the background.
+  app is in the background, and a notification bell with recent agent activity.
+  Walk away, come back only when needed.
+- **Projects sidebar** — group agents by repository, give each project its own
+  accent color, and flip between projects instantly; every pane keeps running
+  in the background.
+- **Run commands** — save per-project dev/test/build commands and launch them
+  into their own panes from the command menu. Hide a pane and the process keeps
+  running; bring it back whenever you want to look.
+- **Command menu** — `⌘⇧P` (rebindable) to spawn an agent in any direction, run
+  a saved command, jump to a project, pane, plan, or theme, and more.
+- **Drop files in** — drag files onto a pane and their paths land in the
+  prompt, properly quoted. File paths in output are clickable.
 - **Agents survive restarts** — close the app, reopen it, and your agents are
   still there with full scrollback. Even a reboot restores them via
   `claude --resume`.
 - **Visual plans** — agents can publish rich, interactive plan documents
   (diagrams, file maps, annotated code) that open right next to their
   terminal. Review, comment, and send feedback without leaving the app.
-- **Themes** — nine color schemes from Midnight to Solarized Light, applied
-  across the whole app *and* inside every terminal.
+- **Make it yours** — nine themes from Midnight to Solarized Light applied
+  across the app *and* every terminal, plus a custom background image with
+  frosted-glass surfaces and opacity controls.
+- **Terminal that behaves** — copy-on-select, clickable links, configurable
+  word-jump and pane-navigation modifiers, and a shell setting (macOS, Linux,
+  and Windows with PowerShell defaults).
 - **Auto-updates** — signed updates delivered straight from GitHub Releases.
-  The app checks on launch, installs in place, and restarting brings every
-  agent back exactly where it was.
+  The app checks on launch (or on demand from Settings), installs in place, and
+  restarting brings every agent back exactly where it was.
 
 <p align="center">
   <img src="docs/plan.png" alt="A visual plan with wireframes, architecture diagram, and file map published by an agent" width="900">
@@ -71,7 +97,7 @@ miss, and makes everything in between effortless.
 </p>
 
 <p align="center">
-  <img src="docs/harness-menu.png" alt="Harness picker: Claude, opencode, Codex, Gemini, pi, Terminal" width="300">
+  <img src="docs/harness-menu.png" alt="Harness picker: Claude, opencode, Codex, Gemini, pi, Oh My Pi, Terminal" width="300">
   <br>
   <sub>Pick a harness per pane — mix agents freely in one grid.</sub>
 </p>
@@ -91,8 +117,8 @@ Click into a pane and the glow clears — you're caught up.
 
 Prereqs: Node 20+, Rust toolchain, and at least one agent CLI —
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets the deepest
-integration (status glow, session resume, visual plans); Codex, Gemini,
-opencode, and pi run as full terminal harnesses.
+integration (status glow, chat view, session resume, visual plans); Codex,
+Gemini, opencode, pi, and Oh My Pi run as full terminal harnesses.
 
 ```bash
 npm install
@@ -100,5 +126,6 @@ npm run tauri dev      # run the app
 npm run tauri build    # package it (.app / .msi)
 ```
 
-Add a project, hit **New Claude** — or pick any other harness from the
-dropdown — and start delegating.
+Add a project, hit **New Agent** — or pick any other harness from the
+dropdown — and start delegating. `⌘⇧P` opens the command menu if you'd rather
+keep your hands on the keyboard.

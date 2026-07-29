@@ -30,3 +30,13 @@ portable-pty = "0.8"
 tiny_http = "0.12"
 base64 = "0.22"
 dirs = "6"
+
+# Chat-tab dictation: capture on AVAudioEngine, transcribe with the same
+# on-device recognizer macOS dictation uses. No API key, no audio leaves the
+# machine. macOS-only — the mic button hides itself elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSValue", "NSLocale", "NSObjCRuntime"] }
+objc2-speech = { version = "0.3", features = ["block2", "SFSpeechRecognizer", "SFSpeechRecognitionRequest", "SFSpeechRecognitionResult", "SFSpeechRecognitionTask", "SFTranscription"] }
+objc2-avf-audio = { version = "0.3", features = ["block2", "AVAudioEngine", "AVAudioNode", "AVAudioIONode", "AVAudioFormat", "AVAudioBuffer", "AVAudioTypes"] }
+block2 = "0.6"

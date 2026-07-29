@@ -259,6 +259,13 @@ fn write_hook_settings(
         "hooks": {
             "SessionStart": [{ "hooks": [{ "type": "command", "command": curl("session"), "timeout": 10 }] }],
             "Stop": [{ "hooks": [{ "type": "command", "command": curl("done"), "timeout": 10 }] }],
+            // Turn boundaries for the chat view's stop affordance. The
+            // transcript alone can't say whether a turn is live — it lands
+            // records after the fact, so "last record is finished assistant
+            // text" looks identical mid-turn and at rest. These two hooks
+            // bracket the turn exactly, whether the prompt came from the
+            // composer or from someone typing in Term view.
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": curl("prompt"), "timeout": 10 }] }],
             "Notification": [{ "hooks": [{ "type": "command", "command": curl("needs_input"), "timeout": 10 }] }],
             // Claude buffers transcript writes, so a *pending* AskUserQuestion
             // never reaches the JSONL until it's already answered — the chat
@@ -325,6 +332,93 @@ pub fn shell_command_args(shell: &str) -> &'static [&'static str] {
     }
 }
 
+/// Rewrite a leading bare `claude` to the app-bundled copy Claude Code ships,
+/// so `/voice` can actually reach the microphone.
+///
+/// macOS resolves microphone access against the *responsible process*, and in
+/// a pty every process here turns out to be responsible for itself — the pane's
+/// `claude` is not attributed to AgentBench.app the way a child of Terminal.app
+/// is attributed to Terminal. Claude Code's native installer is a bare
+/// executable with no bundle, so there is no Info.plist for TCC to read a
+/// purpose string from; asking for the mic doesn't get denied, it SIGABRTs the
+/// process. That's why voice mode silently fails in a pane while it works in a
+/// normal terminal.
+///
+/// Claude Code already ships the escape hatch: `ClaudeCode.app`, whose
+/// `Contents/MacOS/claude` is a hard link to the very same binary sitting in a
+/// bundle that declares `NSMicrophoneUsageDescription`. Launch that path and
+/// the process is identified as `com.anthropic.claude-code`, which macOS can
+/// prompt for and the user can toggle under Privacy & Security → Microphone.
+///
+/// Returns the line unchanged whenever anything doesn't line up — a non-native
+/// install (npm's `claude` is a node shim, and has no bundle), a custom
+/// harness, a missing binary. Voice stays broken in those cases, but nothing
+/// else changes.
+#[cfg(target_os = "macos")]
+fn bundle_claude_for_voice(line: &str) -> String {
+    // only a bare `claude` — an explicit path is the user's choice to respect
+    let Some(rest) = line.strip_prefix("claude") else {
+        return line.to_string();
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return line.to_string();
+    }
+    match claude_bundle_exe() {
+        Some(exe) => format!("'{}'{}", exe.display(), rest),
+        None => line.to_string(),
+    }
+}
+
+/// Path to `ClaudeCode.app/Contents/MacOS/claude`, created/refreshed to point
+/// at the installed binary. `None` unless this is a native install.
+#[cfg(target_os = "macos")]
+fn claude_bundle_exe() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
+    let root = data.join("claude");
+    let versions = root.join("versions");
+
+    // The launcher is a symlink into versions/<v>; follow it to the real file.
+    // Only the native installer has this layout, and only it is a lone Mach-O
+    // that a bundle can wrap — an npm install would be `node .../cli.js`.
+    let real = [
+        dirs::home_dir().unwrap_or_default().join(".local/bin/claude"),
+        PathBuf::from("/usr/local/bin/claude"),
+    ]
+    .into_iter()
+    .filter_map(|p| std::fs::canonicalize(p).ok())
+    .find(|p| p.starts_with(&versions))?;
+
+    let macos_dir = root.join("ClaudeCode.app/Contents/MacOS");
+    let exe = macos_dir.join("claude");
+    std::fs::create_dir_all(&macos_dir).ok()?;
+    // Claude Code writes this itself when it re-execs for the background pty
+    // host; keep it byte-identical so we're refreshing its bundle, not forking
+    // a second one that could drift.
+    std::fs::write(
+        macos_dir.parent()?.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claude-code</string><key>CFBundleName</key><string>Claude Code</string><key>CFBundleDisplayName</key><string>Claude Code</string><key>CFBundleExecutable</key><string>claude</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/><key>NSMicrophoneUsageDescription</key><string>Claude Code uses the microphone for voice dictation.</string><key>NSAppleEventsUsageDescription</key><string>Claude Code needs to send Apple Events to open URLs and control applications you authorize.</string><key>NSLocalNetworkUsageDescription</key><string>Claude Code connects to servers and devices on your local network when commands you run need to reach them.</string></dict></plist>
+"#,
+    )
+    .ok()?;
+
+    // A hard link keeps Anthropic's signature intact (same inode, same file),
+    // but it also pins the version it was made from: after an update the link
+    // still resolves to the old binary. Compare inodes and re-link when they
+    // diverge, or panes would quietly run a stale Claude forever.
+    let want = std::fs::metadata(&real).ok()?.ino();
+    if std::fs::metadata(&exe).ok().map(|m| m.ino()) != Some(want) {
+        let _ = std::fs::remove_file(&exe);
+        std::fs::hard_link(&real, &exe).ok()?;
+    }
+    Some(exe)
+}
+
 /// Launch the harness through a login shell so it gets the user's real PATH
 /// even when launched from Finder/Explorer. `settings_path` is Some only for
 /// Claude — it carries the hook wiring via `--settings`.
@@ -337,6 +431,9 @@ fn harness_command(
     hook_port: u16,
     shell_pref: Option<&str>,
 ) -> CommandBuilder {
+    #[cfg(target_os = "macos")]
+    let mut line = bundle_claude_for_voice(spec.command.trim());
+    #[cfg(not(target_os = "macos"))]
     let mut line = spec.command.clone();
     if let Some(path) = settings_path {
         #[cfg(unix)]
@@ -992,20 +1089,30 @@ pub fn create_chat_pane(
 
 /// Stop the current turn. Pty panes get a bare ESC (Claude Code's interrupt
 /// key); headless panes get a stream-json control_request.
-pub fn interrupt_pane(core: &Arc<Core>, id: u32) {
+///
+/// `resubmit` is for the one case the caller knows about: messages chat-sent
+/// while a turn was already running get queued by the TUI, and interrupting
+/// restores them into the input buffer unsubmitted, so an Enter pushes them
+/// through. It must stay opt-in — this used to fire on every interrupt, and
+/// since interrupting is itself what puts text in the buffer, the Enter kept
+/// resubmitting it and the agent started straight back up. Stop looked like
+/// it hadn't interrupted at all.
+pub fn interrupt_pane(core: &Arc<Core>, id: u32, resubmit: bool) {
     static REQ: AtomicU32 = AtomicU32::new(1);
     {
         let mut panes = core.panes.lock().unwrap();
         if let Some(pane) = panes.get_mut(&id) {
-            let _ = pane.writer.write_all(b"\x1b");
-            // Interrupting restores any queued (chat-sent) messages into the
-            // TUI's input buffer unsubmitted; a follow-up Enter pushes them
-            // through. Harmless no-op when the buffer is empty.
-            let enter_core = core.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                let _ = write_pane(&enter_core, id, "\r");
-            });
+            let _ = pane
+                .writer
+                .write_all(b"\x1b")
+                .and_then(|_| pane.writer.flush());
+            if resubmit {
+                let enter_core = core.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = write_pane(&enter_core, id, "\r");
+                });
+            }
             return;
         }
     }
@@ -1118,6 +1225,17 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                     if kind == "done" {
                         core.last_done.lock().unwrap().insert(id, Instant::now());
                     }
+                    // Turn boundaries for the chat view. Deliberately its own
+                    // event rather than an agent-event kind: that one drives
+                    // pane status and the notification list, and a ping per
+                    // prompt would spam both.
+                    if kind == "prompt" || kind == "done" {
+                        core.broadcast(&json!({
+                            "ev": "turn",
+                            "id": id,
+                            "active": kind == "prompt",
+                        }));
+                    }
                     // Belt and braces for the idle ping: if the user hasn't
                     // typed since the turn ended, nothing new can be waiting
                     // on them — squelch regardless of the message text.
@@ -1205,7 +1323,11 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
             None
         }
         Some("interrupt") => {
-            interrupt_pane(core, req["id"].as_u64().unwrap_or(0) as u32);
+            interrupt_pane(
+                core,
+                req["id"].as_u64().unwrap_or(0) as u32,
+                req["resubmit"].as_bool().unwrap_or(false),
+            );
             None
         }
         Some("list") => Some(json!({ "result": list_panes(core) })),

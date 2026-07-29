@@ -40,6 +40,20 @@ export const BUILTIN_HARNESSES = [
     install: "npm install -g @mariozechner/pi-coding-agent",
   },
   {
+    id: "omp",
+    name: "Oh My Pi",
+    // fork of pi; approval mode is already yolo by default but pass it
+    // explicitly so a user config with `tools.approvalMode: write` can't
+    // leave a pane sitting on an approval prompt nobody is watching
+    command: "omp --yolo",
+    // ships as a bun binary, so npm -g leaves a shim that needs bun on PATH —
+    // upstream's installer picks bun when it's there and drops a prebuilt
+    // binary in ~/.local/bin otherwise
+    install: navigator.userAgent.includes("Windows")
+      ? "irm https://omp.sh/install.ps1 | iex"
+      : "curl -fsSL https://omp.sh/install | sh",
+  },
+  {
     id: "terminal",
     name: "Terminal",
     // plain shell pane, no agent — on unix $SHELL expands inside the login
@@ -83,7 +97,7 @@ export const DEFAULT_SETTINGS = {
   navMod: "off", // modifier for arrow-key pane navigation: off | ctrl | alt | meta
   wordMod: "ctrl", // modifier+←/→ sends ESC b / ESC f (word jump): off | ctrl | meta
   copyOnSelect: true, // highlighting text in a terminal copies it (xterm engine)
-  defaultPaneView: "term", // Claude panes open in "term" or "chat" view
+  defaultPaneView: "chat", // Claude panes open in "term" or "chat" view
   shell: "", // shell panes/installs run through ("" = auto: $SHELL, pwsh on Windows)
   theme: "midnight",
   bgImage: "", // absolute path to a custom background image ("" = off)

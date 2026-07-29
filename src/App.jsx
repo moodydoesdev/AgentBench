@@ -1546,7 +1546,7 @@ export default function App() {
                     kind={p.kind}
                     sigintGuard={!!p.harness?.claude || !!p.claude}
                     claude={!!p.claude}
-                    view={paneViews[p.id] ?? settings.defaultPaneView ?? "term"}
+                    view={paneViews[p.id] ?? settings.defaultPaneView ?? "chat"}
                     onViewChange={setPaneView}
                     initialLines={chatLines[p.id]}
                     hidden={p.hidden}
