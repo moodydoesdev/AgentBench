@@ -102,23 +102,37 @@ async fn main() {
     }
 }
 
-/// Where the built PWA lives. Dev runs from the repo; a release build ships it
-/// beside the executable.
+/// Where the built PWA lives.
+///
+/// The desktop webview gets its copy embedded in the app binary, but this
+/// process serves the files over HTTP, so it needs them on disk — they ship as
+/// a bundled resource. Where that lands differs per platform (beside the exe on
+/// Windows and Linux, `Contents/Resources` inside a macOS app bundle), and in
+/// dev it is just the repo's `dist/`, so all the candidates are tried in order.
 fn pwa_dir() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("AGENTBENCH_PWA_DIR") {
         return std::path::PathBuf::from(dir);
     }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("dist"));
+            // macOS: gateway runs from Contents/MacOS, resources sit alongside
+            candidates.push(dir.join("../Resources/dist"));
+            // Linux AppImage/deb layout
+            candidates.push(dir.join("../lib/AgentBench/dist"));
+        }
+    }
     #[cfg(debug_assertions)]
-    {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist")
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("dist")))
-            .unwrap_or_else(|| std::path::PathBuf::from("dist"))
-    }
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist"));
+
+    candidates
+        .iter()
+        .find(|p| p.join("mobile.html").is_file())
+        .cloned()
+        // Nothing found: fall back to the first guess so the error surfaces as
+        // 404s from a running gateway rather than a silent misconfiguration.
+        .unwrap_or_else(|| candidates.into_iter().next().unwrap_or_else(|| "dist".into()))
 }
 
 /// Serve the PWA shell.
