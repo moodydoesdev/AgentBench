@@ -100,6 +100,10 @@ async fn main() {
         .route("/api/pair", post(pair))
         .route("/api/ws", any(ws_bridge))
         .route("/api/health", get(health))
+        .route("/api/push/key", get(push_key))
+        .route("/api/push/subscribe", post(push_subscribe))
+        .route("/api/push/unsubscribe", post(push_unsubscribe))
+        .route("/api/push/test", post(push_test))
         .fallback_service(pwa_service())
         .layer(
             // Multi-bench: the shell is served by whichever machine you
@@ -266,6 +270,72 @@ async fn pair(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Respon
     }
 }
 
+/// Subscribing binds a phone's push subscription to this machine's VAPID key,
+/// so these routes need the device token like any other data route.
+fn require_device(gw: &Gateway, headers: &header::HeaderMap) -> Option<String> {
+    let token = header_token(headers)?;
+    gw.tokens.verify(&token).then(|| token)
+}
+
+async fn push_key(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    Json(json!({ "publicKey": gw.push.public_key() })).into_response()
+}
+
+async fn push_subscribe(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(token) = require_device(&gw, &headers) else {
+        return unauthorized();
+    };
+    let device = agentbench_lib::gateway::tokens::token_id(&token);
+    match gw.push.subscribe(body["subscription"].clone(), &device) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn push_unsubscribe(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    gw.push
+        .unsubscribe(body["endpoint"].as_str().unwrap_or_default());
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// Sends a notification immediately, so a phone can prove the whole path works
+/// rather than waiting for an agent to happen to finish.
+async fn push_test(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    let results = gw
+        .push
+        .notify(&json!({
+            "title": format!("AgentBench · {}", gw.machine),
+            "body": "Notifications are working.",
+            "tag": "test",
+            "machine": gw.machine,
+            "kind": "test",
+        }))
+        .await;
+    Json(json!({
+        "ok": true,
+        "subscriptions": gw.push.count(),
+        "results": results,
+    }))
+    .into_response()
+}
+
 /// Browsers cannot set headers on a WebSocket handshake, so the token rides
 /// the query string here (and only here). It is still the same device token,
 /// checked the same way, over the same TLS.
@@ -398,6 +468,8 @@ async fn local_status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "urls": candidate_urls(),
         "pairing": code.map(|(code, expires)| json!({ "code": code, "expiresAt": expires })),
         "devices": gw.tokens.list(),
+        "pushSubscriptions": gw.push.count(),
+        "pushDevices": gw.push.list(),
     }))
 }
 

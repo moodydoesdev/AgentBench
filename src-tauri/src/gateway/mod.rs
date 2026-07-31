@@ -7,6 +7,7 @@
 //! authentication, a phone-shaped event fan-out, and filesystem reads that
 //! never touch the broker at all.
 
+pub mod push;
 pub mod tokens;
 
 use serde_json::{json, Value};
@@ -338,6 +339,7 @@ pub struct Gateway {
     pub broker: Arc<BrokerLink>,
     pub tokens: TokenStore,
     pub snapshot: Snapshot,
+    pub push: push::Push,
     pub machine: String,
     pub started_at: u64,
     pub conn_seq: AtomicU64,
@@ -349,6 +351,7 @@ impl Gateway {
             broker,
             tokens: TokenStore::load(),
             snapshot: Snapshot::new(),
+            push: push::Push::load(),
             machine: machine_name(),
             started_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -357,19 +360,91 @@ impl Gateway {
             conn_seq: AtomicU64::new(1),
         });
         // keep the durable view current even with no phone connected, so the
-        // first `hello` after a pairing is already accurate
+        // first `hello` after a pairing is already accurate — and push the
+        // events worth interrupting someone for, which is the whole reason to
+        // carry the app on a phone rather than watch it
         let tracker = gw.clone();
         let mut rx = tracker.broker.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(ev) => tracker.snapshot.apply(&ev),
+                    Ok(ev) => {
+                        tracker.snapshot.apply(&ev);
+                        tracker.maybe_push(&ev).await;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
         gw
+    }
+
+    /// Turn a broker event into a notification, when it is one a person would
+    /// want to be told about away from the machine: an agent finished, or it
+    /// is blocked waiting on them.
+    async fn maybe_push(&self, ev: &Value) {
+        if self.push.count() == 0 {
+            return;
+        }
+        let kind = ev["ev"].as_str().unwrap_or_default();
+        let id = ev["id"].as_u64().unwrap_or(0) as u32;
+        let (title, body, tag) = match kind {
+            "agent-event" => match ev["kind"].as_str() {
+                Some("done") => ("Agent finished", "finished its turn", "done"),
+                Some("needs_input") => ("Agent needs you", "is waiting for input", "input"),
+                _ => return,
+            },
+            // a pending question is the most interruption-worthy thing there is
+            "ask" => ("Question waiting", "asked you something", "ask"),
+            _ => return,
+        };
+
+        // Name the pane by what it is working on; a bare number in a
+        // notification is useless.
+        let (project, session) = self.pane_context(id).await;
+        let heading = match &session {
+            Some(title) => title.clone(),
+            None => project.clone().unwrap_or_else(|| format!("Agent {id}")),
+        };
+        let payload = json!({
+            "title": format!("{title} · {}", self.machine),
+            "body": match &project {
+                Some(p) => format!("{heading} — {body} in {p}"),
+                None => format!("{heading} {body}"),
+            },
+            // one notification per pane per kind, so a chatty agent replaces
+            // its own notification instead of stacking a wall of them
+            "tag": format!("{}-{}-{}", self.machine, id, tag),
+            "machine": self.machine,
+            "paneId": id,
+            "kind": tag,
+        });
+        let _ = self.push.notify(&payload).await;
+    }
+
+    /// (project name, session title) for a pane, best effort.
+    async fn pane_context(&self, id: u32) -> (Option<String>, Option<String>) {
+        let Ok(list) = self.broker.request(json!({ "op": "list" })).await else {
+            return (None, None);
+        };
+        let panes = list.as_array().cloned().unwrap_or_default();
+        let solo = solo_projects(&panes);
+        let Some(pane) = panes.iter().find(|p| p["id"].as_u64() == Some(id as u64)) else {
+            return (None, None);
+        };
+        let cwd = pane["cwd"].as_str().unwrap_or_default().to_string();
+        let projects = fsdata::read_projects();
+        let name = projects
+            .iter()
+            .find(|p| p["path"].as_str() == Some(cwd.as_str()))
+            .and_then(|p| p["name"].as_str().map(String::from))
+            .or_else(|| {
+                std::path::Path::new(&cwd)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            });
+        (name, pane_title(pane, &solo))
     }
 
     /// The reconnect contract: everything a phone needs to render a correct

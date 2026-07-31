@@ -30,6 +30,49 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+// A push arrives whether or not the app is open — that is the entire point of
+// carrying it on a phone rather than watching a screen.
+self.addEventListener("push", (event) => {
+  let data = {};
+  try {
+    data = event.data?.json() ?? {};
+  } catch {
+    data = { title: "AgentBench", body: event.data?.text() ?? "" };
+  }
+  event.waitUntil(
+    self.registration.showNotification(data.title || "AgentBench", {
+      body: data.body || "",
+      // Replacing by tag keeps a busy agent from stacking a wall of
+      // notifications; each pane and kind owns one.
+      tag: data.tag || "agentbench",
+      renotify: true,
+      icon: "/icon-192.png",
+      badge: "/icon-192.png",
+      timestamp: Date.now(),
+      data,
+    }),
+  );
+});
+
+// Tapping a notification should land on the agent it is about, reusing an
+// open window rather than piling up new ones.
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const { machine, paneId } = event.notification.data ?? {};
+  const target = paneId ? `/?pane=${paneId}&machine=${encodeURIComponent(machine ?? "")}` : "/";
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if (client.url.startsWith(self.location.origin)) {
+          client.postMessage({ type: "open-pane", machine, paneId });
+          return client.focus();
+        }
+      }
+      return self.clients.openWindow(target);
+    }),
+  );
+});
+
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   const url = new URL(request.url);

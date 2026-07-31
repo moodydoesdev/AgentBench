@@ -16,6 +16,7 @@ import LogView from "./LogView";
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
 import { BUILTIN_HARNESSES } from "../settings";
+import { disablePush, enablePush, isSubscribed, pushSupported, testPush } from "./push";
 import {
   CLIENT_PROTOCOL,
   baseName,
@@ -74,6 +75,32 @@ export default function MobileApp() {
   }, []);
 
   useEffect(() => saveGateways(gateways), [gateways]);
+
+  // Tapping a notification focuses the app; the service worker tells us which
+  // agent it was about so the tap lands somewhere useful.
+  useEffect(() => {
+    const onMessage = (ev) => {
+      if (ev.data?.type !== "open-pane") return;
+      const { machine, paneId } = ev.data;
+      const target = machines.find(
+        (m) => m.machine === machine || m.name === machine,
+      );
+      const pane = target?.panes?.find((p) => p.id === paneId);
+      if (!target || !pane) return;
+      setOpen({
+        url: target.url,
+        paneId: pane.id,
+        cwd: pane.cwd,
+        label: pane.title || `${pane.harness ?? "agent"} ${pane.id}`,
+        subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
+        kind: pane.kind,
+        chat: isChatPane(pane),
+        machine: target.machine ?? target.name,
+      });
+    };
+    navigator.serviceWorker?.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker?.removeEventListener("message", onMessage);
+  }, [machines]);
 
   // Scanning the desktop's QR lands here with the handshake in the fragment.
   // Also handled on hashchange, not just mount: once the app is installed, a
@@ -562,6 +589,85 @@ function ActivityScreen({ items, machines, onOpen }) {
   );
 }
 
+/** Notification opt-in for one machine. */
+function PushRow({ gateway, machines }) {
+  const live = machines.find((m) => m.url === gateway.url);
+  const [state, setState] = useState("off");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState(null);
+
+  // Holding the permission is not the same as being subscribed to this
+  // machine, so ask rather than assume.
+  useEffect(() => {
+    let dead = false;
+    isSubscribed(gateway).then((on) => {
+      if (!dead) setState(on ? "on" : "off");
+    });
+    return () => {
+      dead = true;
+    };
+  }, [gateway.url, gateway.token]);
+
+  const run = async (fn, done) => {
+    setBusy(true);
+    setNote(null);
+    try {
+      await fn();
+      setNote(done);
+    } catch (err) {
+      setNote(String(err.message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mob-card">
+      <div className="mob-card-head">
+        <span className={`mob-dot ${live?.connected ? "ok" : "off"}`} />
+        <strong>{live?.machine ?? gateway.name}</strong>
+        <span className="mob-spacer" />
+        <span className="mob-pill">{state === "on" ? "on" : "off"}</span>
+      </div>
+      <p className="mob-note" style={{ padding: "4px 0 8px" }}>
+        Get told when an agent finishes, needs input, or asks a question — even
+        with the app closed.
+      </p>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button
+          className="mob-sheet-item"
+          style={{ flex: 1, justifyContent: "center", marginBottom: 0 }}
+          disabled={busy}
+          onClick={() =>
+            state === "on"
+              ? run(
+                  () => disablePush(gateway).then(() => setState("off")),
+                  "Notifications off.",
+                )
+              : run(
+                  () => enablePush(gateway).then(() => setState("on")),
+                  "Notifications on.",
+                )
+          }
+        >
+          {busy ? "…" : state === "on" ? "Turn off" : "Turn on"}
+        </button>
+        {state === "on" && (
+          <button
+            className="mob-sheet-item"
+            style={{ flex: 1, justifyContent: "center", marginBottom: 0 }}
+            disabled={busy}
+            onClick={() => run(() => testPush(gateway), "Sent — check your notifications.")}
+          >
+            Send a test
+          </button>
+        )}
+      </div>
+      {note && <div className="mob-note">{note}</div>}
+    </div>
+  );
+}
+
 function SettingsScreen({ gateways, machines, onChange }) {
   const [url, setUrl] = useState("");
   const [code, setCode] = useState("");
@@ -611,6 +717,18 @@ function SettingsScreen({ gateways, machines, onChange }) {
           </div>
         );
       })}
+
+      <h2>Notifications</h2>
+      {!pushSupported() ? (
+        <div className="mob-note">
+          This browser can't receive notifications. On iPhone, add the app to
+          your Home Screen first — Safari only allows them for installed apps.
+        </div>
+      ) : (
+        gateways.map((g) => (
+          <PushRow key={g.url} gateway={g} machines={machines} />
+        ))
+      )}
 
       <h2>This app</h2>
       <div className="mob-card">
