@@ -28,12 +28,23 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Default listening port. `tailscale serve` fronts this with trusted HTTPS.
 pub const DEFAULT_PORT: u16 = 8473;
 
-/// Ops a paired phone may issue in phase 1: read and drive panes that already
-/// exist. Spawning (`create`, `create-chat`) and `kill` are deliberately absent
-/// until the PWA has a spawn UI — a device token must never reach more of the
-/// broker than the app has screens for. `shutdown` is desktop-only, forever.
+/// Ops a paired phone may issue. The rule is that a device token never reaches
+/// more of the broker than the app has screens for: spawning and killing are
+/// here because the fleet can now start and close agents. `shutdown` stays out
+/// — taking the broker down would kill every agent on the machine, and that
+/// belongs to whoever is sitting at it.
 const ALLOWED_OPS: &[&str] = &[
-    "write", "watch", "unwatch", "interrupt", "resize", "list", "saved", "ping",
+    "write",
+    "watch",
+    "unwatch",
+    "interrupt",
+    "resize",
+    "list",
+    "saved",
+    "ping",
+    "create",
+    "create-chat",
+    "kill",
 ];
 
 /// Broker ops that produce a response line. The rest are fire-and-forget —
@@ -551,15 +562,18 @@ mod tests {
     }
 
     #[test]
-    fn spawn_and_shutdown_are_not_reachable_from_a_phone() {
-        for op in ["create", "create-chat", "kill", "shutdown"] {
-            assert!(
-                !ALLOWED_OPS.contains(&op),
-                "{op} must stay off the phase-1 allowlist"
-            );
+    fn shutdown_is_never_reachable_from_a_phone() {
+        // Shutting the broker down kills every agent on the machine.
+        assert!(!ALLOWED_OPS.contains(&"shutdown"));
+        for op in ["write", "watch", "interrupt", "create", "create-chat", "kill"] {
+            assert!(ALLOWED_OPS.contains(&op), "{op} should be reachable");
         }
-        for op in ["write", "watch", "interrupt"] {
-            assert!(ALLOWED_OPS.contains(&op), "{op} should be drivable");
+    }
+
+    #[test]
+    fn unknown_ops_are_refused() {
+        for op in ["", "eval", "exec", "read-file"] {
+            assert!(!ALLOWED_OPS.contains(&op));
         }
     }
 

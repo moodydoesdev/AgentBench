@@ -14,6 +14,17 @@ import { listen as tauriListen } from "@tauri-apps/api/event";
 // not our command names, so the mapping that lib.rs performs in Rust happens
 // here for the WebSocket path.
 const OP_FOR = {
+  create_pane: (a) => ({
+    op: "create",
+    cwd: a.cwd,
+    cols: a.cols ?? 100,
+    rows: a.rows ?? 30,
+    resume: a.resume ?? null,
+    harness: a.harness ?? null,
+    shell: a.shell ?? null,
+  }),
+  create_chat_pane: (a) => ({ op: "create-chat", cwd: a.cwd, resume: a.resume ?? null }),
+  kill_pane: (a) => ({ op: "kill", id: a.id }),
   write_pane: (a) => ({ op: "write", id: a.id, data: a.data, answers: a.answers }),
   watch_transcript: (a) => ({ op: "watch", id: a.id }),
   unwatch_transcript: (a) => ({ op: "unwatch", id: a.id }),

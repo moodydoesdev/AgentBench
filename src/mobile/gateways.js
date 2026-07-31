@@ -169,7 +169,13 @@ export function rollupStatus(statuses) {
   return statuses[0] ?? "exited";
 }
 
-/** Group a machine's panes by project directory, newest project first. */
+/**
+ * Group a machine's panes by project, newest project first.
+ *
+ * Registered projects with nothing running are included: they are exactly the
+ * ones you want to start an agent in, and leaving them out meant a project
+ * became invisible from the phone the moment its last agent exited.
+ */
 export function groupPanes(machine) {
   const byCwd = new Map();
   for (const pane of machine.panes ?? []) {
@@ -180,17 +186,20 @@ export function groupPanes(machine) {
   const named = new Map(
     (machine.projects ?? []).map((p) => [p.path, p.name || baseName(p.path)]),
   );
+  for (const project of machine.projects ?? []) {
+    if (!byCwd.has(project.path)) byCwd.set(project.path, []);
+  }
   return [...byCwd.entries()]
     .map(([cwd, panes]) => ({
       cwd,
       name: named.get(cwd) ?? baseName(cwd),
       panes,
-      status: rollupStatus(panes.map((p) => p.status)),
+      status: panes.length ? rollupStatus(panes.map((p) => p.status)) : "idle",
     }))
-    .sort((a, b) => rank(a.status) - rank(b.status));
+    .sort((a, b) => rank(a.status) - rank(b.status) || a.name.localeCompare(b.name));
 }
 
-const rank = (s) => ({ input: 0, working: 1, done: 2, exited: 3 })[s] ?? 4;
+const rank = (s) => ({ input: 0, working: 1, done: 2, exited: 3, idle: 4 })[s] ?? 5;
 
 export function baseName(p) {
   return String(p).split(/[\\/]/).filter(Boolean).pop() ?? p;

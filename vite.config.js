@@ -37,6 +37,12 @@ function stampServiceWorker() {
 
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss(), stampServiceWorker()],
+  define: {
+    // Shown in the mobile app's Settings. An installed PWA can silently be
+    // running an old bundle; without this, "is the phone up to date?" can only
+    // be guessed at from symptoms.
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString().slice(0, 16).replace("T", " ")),
+  },
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),

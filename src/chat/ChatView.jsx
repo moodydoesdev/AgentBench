@@ -195,6 +195,10 @@ export default memo(function ChatView({
   // somewhere Claude can read by path. Without it the picker would take a
   // photo and then quietly drop it, so the phone hides the affordance.
   allowImages = mode === "transcript",
+  // A phone has no Esc key, so hints that name one are worse than useless and
+  // anything only reachable by keyboard needs a button of its own.
+  touch = typeof window !== "undefined" &&
+    window.matchMedia?.("(pointer: coarse)")?.matches === true,
 }) {
   // Desktop: Tauri IPC. Phone: the WebSocket to the machine owning this pane.
   const { invoke, listen } = useTransport();
@@ -823,10 +827,16 @@ export default memo(function ChatView({
               {dictError
                 ? dictError
                 : dictation.listening
-                  ? "listening — esc to discard"
+                  ? touch
+                    ? "listening — mic to insert, ✕ to discard"
+                    : "listening — esc to discard"
                   : working
-                    ? "working — esc to stop"
-                    : "enter to send"}
+                    ? touch
+                      ? "working — stop to interrupt"
+                      : "working — esc to stop"
+                    : touch
+                      ? "tap send"
+                      : "enter to send"}
             </span>
             {allowImages && (
               <>
@@ -849,6 +859,20 @@ export default memo(function ChatView({
                   <ImageSquare size={14} />
                 </button>
               </>
+            )}
+            {dictation.listening && (
+              // Discarding a phrase was Esc-only, which no phone can do.
+              <button
+                className="chat-mic-discard"
+                title="Discard this phrase"
+                aria-label="Discard dictation"
+                onMouseDown={(ev) => {
+                  ev.preventDefault();
+                  dictation.cancel();
+                }}
+              >
+                <X size={13} weight="bold" />
+              </button>
             )}
             {dictation.available && (
               <button

@@ -3054,3 +3054,23 @@ button.chat-question-opt.choice.on {
   color: var(--text-dim);
   font-family: var(--font-ui);
 }
+
+/* Discard a dictated phrase. Esc does this on a keyboard; a phone needs a
+   control it can actually reach. */
+.chat-mic-discard {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: rgb(var(--red));
+  opacity: 0.75;
+  cursor: pointer;
+}
+
+.chat-mic-discard:hover {
+  opacity: 1;
+}
