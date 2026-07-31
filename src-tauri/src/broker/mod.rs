@@ -655,6 +655,7 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
     let panes = core.panes.lock().unwrap();
     let chat_panes = core.chat_panes.lock().unwrap();
     let colors = core.colors.lock().unwrap();
+    let sessions = core.sessions.lock().unwrap();
     let mut out: Vec<_> = panes
         .iter()
         .map(|(id, p)| {
@@ -664,6 +665,10 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
                 "cwd": p.cwd,
                 "harness": p.harness,
                 "color": colors.get(id),
+                // Newest known session id. Clients that cannot see a terminal
+                // (the mobile app) use it to name a pane from its transcript
+                // instead of showing "claude 17".
+                "session": sessions.get(id).and_then(|h| h.first()),
                 "buffer": base64::engine::general_purpose::STANDARD.encode(&buf[..]),
             })
         })

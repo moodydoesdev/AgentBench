@@ -635,3 +635,16 @@
   color: var(--text-dim);
   font-size: 15px;
 }
+
+/* A titled agent row stacks: what the session is about, then which agent. */
+.mob-agent-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mob-agent-name .mob-agent-id {
+  display: block;
+  font-size: 11px;
+}

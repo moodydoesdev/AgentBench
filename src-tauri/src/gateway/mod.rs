@@ -71,6 +71,7 @@ const FS_READS: &[&str] = &[
     "list_projects",
     "pane_buffer",
     "save_image",
+    "pane_titles",
 ];
 
 pub fn gateway_file() -> std::path::PathBuf {
@@ -237,8 +238,9 @@ pub struct Snapshot {
     statuses: std::sync::Mutex<HashMap<u32, String>>,
     /// pane id -> the live AskUserQuestion payload, until it is resolved
     asks: std::sync::Mutex<HashMap<u32, Value>>,
-    /// Asks already being answered, so two phones cannot both drive one picker
-    claimed: std::sync::Mutex<HashMap<u32, String>>,
+    /// Asks already being answered, so two clients cannot both drive one
+    /// picker. Held with a timestamp: see `claim_ask`.
+    claimed: std::sync::Mutex<HashMap<u32, (String, std::time::Instant)>>,
 }
 
 impl Snapshot {
@@ -312,13 +314,22 @@ impl Snapshot {
         json!(asks.values().cloned().collect::<Vec<_>>())
     }
 
-    /// First answer wins. Returns false when someone else already claimed it.
+    /// First answer wins — but only for as long as answering plausibly takes.
+    ///
+    /// A claim that outlived its attempt used to block the pane forever: if a
+    /// submission failed halfway (a dropped connection, a rejected write), the
+    /// retry was refused as "already being handled" and the question could
+    /// never be answered from the phone again. The claim now expires, so a
+    /// failed attempt costs one short wait rather than the whole question.
     fn claim_ask(&self, pane: u32, who: &str) -> bool {
+        const CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(20);
         let mut claimed = self.claimed.lock().unwrap();
-        if claimed.contains_key(&pane) {
-            return false;
+        if let Some((holder, at)) = claimed.get(&pane) {
+            if holder != who && at.elapsed() < CLAIM_TTL {
+                return false;
+            }
         }
-        claimed.insert(pane, who.to_string());
+        claimed.insert(pane, (who.to_string(), std::time::Instant::now()));
         true
     }
 }
@@ -374,17 +385,22 @@ impl Gateway {
         let panes = self.broker.request(json!({ "op": "list" })).await;
         let panes = match panes {
             Ok(Value::Array(list)) => {
+                let solo = solo_projects(&list);
                 let mut out = Vec::with_capacity(list.len());
                 for p in list {
                     if let Some(id) = p["id"].as_u64() {
                         self.snapshot.seed_pane(id as u32);
                     }
+                    let title = pane_title(&p, &solo);
                     out.push(json!({
                         "id": p["id"],
                         "cwd": p["cwd"],
                         "harness": p["harness"],
                         "kind": p["kind"],
                         "color": p["color"],
+                        // what the session is about, so the fleet can say more
+                        // than "claude 17"
+                        "title": title,
                     }));
                 }
                 Value::Array(out)
@@ -450,6 +466,21 @@ impl Gateway {
                 self.pane_buffer(id, limit.min(512 * 1024)).await
             }
             "save_image" => save_image(args["dataUrl"].as_str().unwrap_or_default()),
+            // Titles are refined while a session runs, so they are refreshable
+            // rather than fixed at connect time.
+            "pane_titles" => {
+                let list = self.broker.request(json!({ "op": "list" })).await?;
+                let panes = list.as_array().cloned().unwrap_or_default();
+                let solo = solo_projects(&panes);
+                let mut titles = serde_json::Map::new();
+                for pane in &panes {
+                    let Some(id) = pane["id"].as_u64() else { continue };
+                    if let Some(title) = pane_title(pane, &solo) {
+                        titles.insert(id.to_string(), json!(title));
+                    }
+                }
+                Ok(Value::Object(titles))
+            }
             _ => Err(format!("unknown fs read: {name}")),
         }
     }
@@ -481,6 +512,39 @@ impl Gateway {
             Ok(None)
         }
     }
+}
+
+/// Directories running exactly one pane. Only those can be named from the
+/// newest transcript without risking attributing one agent's work to another.
+fn solo_projects(panes: &[Value]) -> std::collections::HashSet<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for p in panes {
+        if let Some(cwd) = p["cwd"].as_str() {
+            *counts.entry(cwd.to_string()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n == 1)
+        .map(|(cwd, _)| cwd)
+        .collect()
+}
+
+/// What a session is about, for clients with no terminal title to read.
+///
+/// Prefers the session id the broker reports. An older broker does not send
+/// one — it outlives app updates by design — so a lone pane in a directory
+/// falls back to that directory's newest transcript.
+fn pane_title(pane: &Value, solo: &std::collections::HashSet<String>) -> Option<String> {
+    let cwd = pane["cwd"].as_str()?;
+    if pane["kind"].as_str() == Some("run") {
+        return None; // a run command is named by its command, not a session
+    }
+    let sid = pane["session"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| solo.contains(cwd).then(|| fsdata::newest_session_id(cwd))?)?;
+    fsdata::session_title(cwd, &sid)
 }
 
 /// Write an image sent from a phone to a temp file and return its path, so the

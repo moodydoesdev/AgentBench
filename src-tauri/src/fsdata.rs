@@ -178,6 +178,117 @@ fn preview_of(path: &Path) -> (Option<String>, u64) {
     (preview, msgs)
 }
 
+/// Claude Code's project-dir slug: cwd with every non-alphanumeric char
+/// replaced by '-'.
+fn cwd_slug(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// A human name for a session, for clients that cannot see the terminal title.
+///
+/// Claude Code writes `ai-title` records into the transcript — the same short
+/// summary the desktop shows — and refines them as the session goes on, so the
+/// last one wins. Falling back to the first thing the user actually typed
+/// still beats a pane number.
+///
+/// Transcripts run to megabytes, and this is called for every pane, so it
+/// reads a bounded window from each end rather than the whole file.
+pub fn session_title(cwd: &str, sid: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+    const HEAD: usize = 64 * 1024;
+
+    let path = dirs::home_dir()?
+        .join(".claude")
+        .join("projects")
+        .join(cwd_slug(cwd))
+        .join(format!("{sid}.jsonl"));
+    let mut f = std::fs::File::open(&path).ok()?;
+    let len = f.metadata().ok()?.len();
+
+    // newest title first: scan the tail
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut title = None;
+    for line in text.lines() {
+        if !line.contains("\"ai-title\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if let Some(t) = v["aiTitle"].as_str().filter(|t| !t.trim().is_empty()) {
+                title = Some(t.trim().to_string());
+            }
+        }
+    }
+    if title.is_some() {
+        return title;
+    }
+
+    // no title yet — use the opening message, minus harness plumbing
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut head = vec![0u8; HEAD];
+    let read = f.read(&mut head).ok()?;
+    for line in String::from_utf8_lossy(&head[..read]).lines() {
+        let Ok(rec) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if rec["type"].as_str() != Some("user") || rec["isMeta"].as_bool() == Some(true) {
+            continue;
+        }
+        let text = match &rec["message"]["content"] {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .find_map(|b| {
+                    (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("").to_string())
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let t = text.trim();
+        if t.is_empty() || t.starts_with('<') || t.starts_with("Caveat:") || t.starts_with('/') {
+            continue;
+        }
+        return Some(t.chars().take(60).collect());
+    }
+    None
+}
+
+/// The newest transcript in a project, for naming a pane when the broker has
+/// not reported a session id.
+///
+/// Only safe when the project has a single pane: with several agents in one
+/// directory there is no way to tell whose transcript this is, and a confident
+/// wrong label is worse than none. A broker that reports session ids (see
+/// `list_panes`) makes this unnecessary.
+pub fn newest_session_id(cwd: &str) -> Option<String> {
+    let dir = dirs::home_dir()?
+        .join(".claude")
+        .join("projects")
+        .join(cwd_slug(cwd));
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(sid) = path.file_stem().and_then(|x| x.to_str()).map(String::from) else {
+            continue;
+        };
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b, _)| mtime > *b) {
+            best = Some((mtime, sid));
+        }
+    }
+    best.map(|(_, sid)| sid)
+}
+
 /// Resumable Claude sessions for a project: scan its transcript dir
 /// (~/.claude/projects/<slug>/*.jsonl) and return { sid, mtime, preview, msgs }
 /// newest-first, so the UI can offer "resume a previous session". The slug is
