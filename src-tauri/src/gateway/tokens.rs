@@ -97,7 +97,14 @@ pub struct Device {
 struct PendingCode {
     code: String,
     expires_at: u64,
+    /// Wrong guesses so far. A single typo must not invalidate a QR the user
+    /// is looking at, but the window still has to close on a brute-force
+    /// attempt — the code is only 8 digits.
+    misses: u8,
 }
+
+/// How many wrong guesses a pairing window survives.
+const MAX_MISSES: u8 = 5;
 
 pub struct TokenStore {
     devices: Mutex<Vec<Device>>,
@@ -147,13 +154,22 @@ impl TokenStore {
         }
     }
 
-    /// Mint a pairing code, replacing any previous one — only the code on
-    /// screen should work.
-    pub fn new_code(&self) -> String {
+    /// The code to display. A live code is returned as-is so that re-opening
+    /// the panel, a re-render, or a second look at the QR cannot invalidate
+    /// the very code the user is about to scan; `force` is the explicit
+    /// "regenerate" action.
+    pub fn new_code(&self, force: bool) -> String {
+        let mut pending = self.pending.lock().unwrap();
+        if !force {
+            if let Some(live) = pending.as_ref().filter(|p| p.expires_at > now_ms()) {
+                return live.code.clone();
+            }
+        }
         let code = random_code();
-        *self.pending.lock().unwrap() = Some(PendingCode {
+        *pending = Some(PendingCode {
             code: code.clone(),
             expires_at: now_ms() + CODE_TTL.as_millis() as u64,
+            misses: 0,
         });
         code
     }
@@ -168,13 +184,25 @@ impl TokenStore {
         (p.expires_at > now_ms()).then(|| (p.code.clone(), p.expires_at))
     }
 
-    /// Exchange a pairing code for a device token. The code is consumed
-    /// whether or not it matched, so a wrong guess cannot be retried against
-    /// the same code.
+    /// Exchange a pairing code for a device token. Success consumes the code,
+    /// so it is strictly single-use; a wrong guess only counts against the
+    /// window, which closes after `MAX_MISSES`.
     pub fn redeem(&self, code: &str, device_name: &str) -> Option<String> {
-        let taken = self.pending.lock().unwrap().take()?;
-        if taken.expires_at <= now_ms() || taken.code != code.trim() {
-            return None;
+        {
+            let mut pending = self.pending.lock().unwrap();
+            let live = pending.as_mut()?;
+            if live.expires_at <= now_ms() {
+                *pending = None;
+                return None;
+            }
+            if live.code != code.trim() {
+                live.misses += 1;
+                if live.misses >= MAX_MISSES {
+                    *pending = None;
+                }
+                return None;
+            }
+            *pending = None; // matched — burn it
         }
         let token = random_token();
         let name = device_name.trim();
@@ -253,7 +281,7 @@ mod tests {
     #[test]
     fn code_is_single_use() {
         let store = TokenStore::ephemeral();
-        let code = store.new_code();
+        let code = store.new_code(false);
         assert!(store.redeem(&code, "Phone").is_some());
         // a second redemption of the same code must fail — the pairing window
         // closes the instant it is used
@@ -261,11 +289,30 @@ mod tests {
     }
 
     #[test]
-    fn wrong_code_burns_the_pairing_window() {
+    fn a_typo_does_not_invalidate_the_displayed_code() {
         let store = TokenStore::ephemeral();
-        let code = store.new_code();
+        let code = store.new_code(false);
         assert!(store.redeem("0000-0000", "Phone").is_none());
+        // the QR on screen must still work after a wrong guess
+        assert!(store.redeem(&code, "Phone").is_some());
+    }
+
+    #[test]
+    fn repeated_wrong_guesses_close_the_window() {
+        let store = TokenStore::ephemeral();
+        let code = store.new_code(false);
+        for _ in 0..MAX_MISSES {
+            assert!(store.redeem("0000-0000", "Phone").is_none());
+        }
         assert!(store.redeem(&code, "Phone").is_none());
+    }
+
+    #[test]
+    fn showing_the_qr_again_keeps_the_same_code() {
+        let store = TokenStore::ephemeral();
+        let first = store.new_code(false);
+        assert_eq!(first, store.new_code(false));
+        assert_ne!(first, store.new_code(true));
     }
 
     #[test]
