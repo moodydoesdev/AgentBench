@@ -17,6 +17,29 @@ const SpeechRecognition =
     ? window.SpeechRecognition || window.webkitSpeechRecognition
     : undefined;
 
+/**
+ * The whole phrase, rebuilt from scratch on every event.
+ *
+ * `results` is cumulative — it holds every result for the session, and an
+ * event's `resultIndex` only says where the *changes* begin. Accumulating from
+ * that index appends text that is already present, which is what turns
+ * "testing testing 1 2 3" into "testingtesting testing 1testing testing 1 2".
+ * Reading the full list instead makes this idempotent: however many times an
+ * event revises a result, the transcript is whatever the recognizer currently
+ * believes was said.
+ */
+export function transcriptFromResults(results) {
+  let final = "";
+  let interim = "";
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const text = result[0]?.transcript ?? "";
+    if (result.isFinal) final += text;
+    else interim += text;
+  }
+  return { final, text: (final + interim).replace(/\s+/g, " ").trim() };
+}
+
 export default function useWebDictation({ onPartial, onFinal, onError } = {}) {
   const [listening, setListening] = useState(false);
   const recRef = useRef(null);
@@ -52,15 +75,9 @@ export default function useWebDictation({ onPartial, onFinal, onError } = {}) {
     abandonedRef.current = false;
 
     rec.onresult = (ev) => {
-      let interim = "";
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const result = ev.results[i];
-        if (result.isFinal) finalRef.current += result[0].transcript;
-        else interim += result[0].transcript;
-      }
-      if (!abandonedRef.current) {
-        handlers.current.onPartial?.((finalRef.current + interim).trimStart());
-      }
+      const { final, text } = transcriptFromResults(ev.results);
+      finalRef.current = final;
+      if (!abandonedRef.current) handlers.current.onPartial?.(text);
     };
 
     rec.onerror = (ev) => {
@@ -77,7 +94,7 @@ export default function useWebDictation({ onPartial, onFinal, onError } = {}) {
     rec.onend = () => {
       recRef.current = null;
       setListening(false);
-      const text = finalRef.current.trim();
+      const text = finalRef.current.replace(/\s+/g, " ").trim();
       if (!abandonedRef.current && text) handlers.current.onFinal?.(text);
     };
 

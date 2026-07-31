@@ -525,17 +525,40 @@ fn gateway_status() -> Value {
         Ok(v) => {
             let mut v = v;
             v["running"] = json!(true);
+            v["autoStart"] = json!(gateway_prefs()["autoStart"].as_bool().unwrap_or(false));
             v
         }
-        Err(e) => json!({ "running": false, "error": e }),
+        Err(e) => json!({
+            "running": false,
+            "error": e,
+            "autoStart": gateway_prefs()["autoStart"].as_bool().unwrap_or(false),
+        }),
     }
 }
 
-#[tauri::command]
-fn gateway_start(port: Option<u16>, url: Option<String>) -> Result<Value, String> {
-    if gateway_status()["running"] == json!(true) {
-        return Ok(gateway_status());
+/// Remembered mobile-access settings: whether the gateway should come back on
+/// its own, and the address/port it was last started with.
+fn gateway_prefs_file() -> std::path::PathBuf {
+    broker::config_dir().join("gateway-prefs.json")
+}
+
+fn gateway_prefs() -> Value {
+    std::fs::read_to_string(gateway_prefs_file())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_gateway_prefs(prefs: &Value) {
+    let _ = std::fs::create_dir_all(broker::config_dir());
+    if let Ok(text) = serde_json::to_string_pretty(prefs) {
+        let _ = std::fs::write(gateway_prefs_file(), text);
     }
+}
+
+/// Launch the gateway detached, like the broker. Returns immediately; callers
+/// decide whether to wait for it to answer.
+fn spawn_gateway(port: Option<u16>, url: Option<String>) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut cmd;
     #[cfg(debug_assertions)]
@@ -575,12 +598,29 @@ fn gateway_start(port: Option<u16>, url: Option<String>) -> Result<Value, String
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
     cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn gateway_start(port: Option<u16>, url: Option<String>) -> Result<Value, String> {
+    if gateway_status()["running"] == json!(true) {
+        return Ok(gateway_status());
+    }
+    spawn_gateway(port, url.clone())?;
     // dev builds compile first; poll rather than guess a fixed delay
     for _ in 0..240 {
         std::thread::sleep(Duration::from_millis(500));
         let status = gateway_status();
         if status["running"] == json!(true) {
-            return Ok(status);
+            // Starting it is the opt-in: mobile access comes back with the app
+            // from now on, so a phone can reach this machine without someone
+            // opening Settings on the desktop first.
+            write_gateway_prefs(&json!({
+                "autoStart": true,
+                "url": url,
+                "port": port,
+            }));
+            return Ok(gateway_status());
         }
     }
     Err("gateway did not come up".into())
@@ -588,7 +628,31 @@ fn gateway_start(port: Option<u16>, url: Option<String>) -> Result<Value, String
 
 #[tauri::command]
 fn gateway_stop() -> Result<(), String> {
+    // An explicit stop means stop — including across restarts.
+    let mut prefs = gateway_prefs();
+    prefs["autoStart"] = json!(false);
+    write_gateway_prefs(&prefs);
     gateway_control("POST", "/local/quit", None).map(|_| ())
+}
+
+/// Bring the gateway back at launch if mobile access was left on. Runs off the
+/// main thread: the desktop must not wait on it, and a gateway that fails to
+/// start is a Settings problem, not a reason to block the app.
+fn restore_gateway() {
+    std::thread::spawn(|| {
+        let prefs = gateway_prefs();
+        if prefs["autoStart"].as_bool() != Some(true) {
+            return;
+        }
+        if gateway_status()["running"] == json!(true) {
+            return; // survived the app restart, as it is designed to
+        }
+        let port = prefs["port"].as_u64().map(|p| p as u16);
+        let url = prefs["url"].as_str().map(String::from);
+        if let Err(e) = spawn_gateway(port, url) {
+            eprintln!("mobile gateway did not restart: {e}");
+        }
+    });
 }
 
 /// Mint a pairing code + QR for a phone. `url` is the address the phone should
@@ -684,6 +748,8 @@ pub fn run() {
                     .build()?;
                 app.set_menu(menu)?;
             }
+
+            restore_gateway();
 
             let client = BrokerClient::connect(app.handle().clone())
                 .map_err(|e| format!("broker: {e}"))?;

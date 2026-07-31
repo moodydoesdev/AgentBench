@@ -258,8 +258,10 @@ function MobileAccess() {
             running
               ? status?.brokerConnected === false
                 ? "Reachable, but not connected to the broker — start an agent or restart the broker."
-                : `Serving the mobile app as ${status?.machine ?? "this machine"}.`
-              : "Start it to control this machine's agents from your phone."
+                : `Serving the mobile app as ${status?.machine ?? "this machine"}. It starts with AgentBench and keeps running after you close the app, so your phone can still reach this machine.`
+              : status?.autoStart
+                ? "Stopped for now; it will start again with AgentBench."
+                : "Start it to control this machine's agents from your phone. Once started, it comes back automatically on future launches."
           }
         >
           <button
