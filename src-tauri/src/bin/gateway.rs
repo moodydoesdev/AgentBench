@@ -322,12 +322,30 @@ async fn local_status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
 }
 
 async fn local_code(State(gw): State<Arc<Gateway>>, body: Option<Json<Value>>) -> Json<Value> {
-    let code = gw.tokens.new_code();
+    // Re-opening the panel returns the live code rather than minting a new
+    // one, so a QR cannot be invalidated while the user is scanning it.
+    // "Regenerate" passes force.
+    let force = body
+        .as_ref()
+        .map(|b| b["force"].as_bool() == Some(true))
+        .unwrap_or(false);
+    let code = gw.tokens.new_code(force);
+    // An empty or absent address falls back to the best detected one. Note the
+    // candidates are objects, not strings — reading them as strings yielded a
+    // QR pointing at nothing at all.
     let url = body
         .as_ref()
-        .and_then(|b| b["url"].as_str().map(String::from))
-        .or_else(|| candidate_urls().first().and_then(|u| u.as_str().map(String::from)))
+        .and_then(|b| b["url"].as_str())
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            candidate_urls()
+                .first()
+                .and_then(|u| u["url"].as_str().map(String::from))
+        })
         .unwrap_or_default();
+    let url = url.trim_end_matches('/').to_string();
     // The QR is a link into the PWA itself, so the phone's own camera opens the
     // app and pairs — no in-app scanner, no typing. The fragment carries the
     // handshake and never leaves the browser: fragments are not sent to
@@ -368,8 +386,16 @@ async fn local_quit() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-/// Reachable addresses for this machine, best first. Tailscale is the intended
-/// transport, so its name leads when the CLI can tell us one.
+/// Reachable addresses for this machine, best first — the first entry is what
+/// the pairing QR encodes, so the ordering is the whole user experience.
+///
+/// Tailscale wins when present: it is the only option that works away from
+/// home. Its plain IP leads over the MagicDNS name because that one works the
+/// moment Tailscale is installed, whereas the HTTPS name needs `tailscale
+/// serve` set up first; the name still appears so the trusted-certificate
+/// upgrade (which is what unlocks installing the PWA) is one tap away.
+/// Virtual adapters sort last: a VirtualBox or Docker address is reachable
+/// from nothing at all, and left unranked it can easily come out on top.
 fn candidate_urls() -> Vec<Value> {
     let port = std::env::var("AGENTBENCH_GATEWAY_PORT")
         .ok()
@@ -382,25 +408,99 @@ fn candidate_urls() -> Vec<Value> {
             out.push(json!({ "url": url.trim(), "kind": "configured" }));
         }
     }
-    if let Some(name) = tailscale_dns_name() {
-        // `tailscale serve` publishes on 443 under the machine's MagicDNS name
-        out.push(json!({
-            "url": format!("https://{name}"),
-            "kind": "tailscale",
-            "needsServe": true,
-            "serveCommand": format!("tailscale serve --bg {port}"),
-        }));
-        out.push(json!({ "url": format!("http://{name}:{port}"), "kind": "tailscale-direct" }));
+
+    let ts = tailscale_self();
+    let ts_ips: Vec<String> = ts.as_ref().map(|t| t.ips.clone()).unwrap_or_default();
+    let serving = ts.as_ref().map(|t| t.serving).unwrap_or(false);
+
+    if let Some(ts) = &ts {
+        let https = ts.name.as_ref().map(|name| {
+            json!({
+                "url": format!("https://{name}"),
+                "kind": "tailscale",
+                "needsServe": !serving,
+                "serveCommand": format!("tailscale serve --bg {port}"),
+            })
+        });
+        // Already served over HTTPS? Then that is simply the best address.
+        if serving {
+            out.extend(https.clone());
+        }
+        for ip in &ts.ips {
+            if ip.contains(':') {
+                continue; // IPv6 needs bracket syntax; the v4 address is enough
+            }
+            out.push(json!({ "url": format!("http://{ip}:{port}"), "kind": "tailscale" }));
+        }
+        if !serving {
+            out.extend(https);
+        }
     }
+
+    let mut lan: Vec<(u8, String)> = Vec::new();
     for ip in local_ips() {
-        out.push(json!({ "url": format!("http://{ip}:{port}"), "kind": "lan" }));
+        if ts_ips.iter().any(|t| t == &ip) {
+            continue; // already listed as a tailscale address
+        }
+        lan.push((address_rank(&ip), ip));
+    }
+    lan.sort_by_key(|(rank, _)| *rank);
+    for (rank, ip) in lan {
+        out.push(json!({
+            "url": format!("http://{ip}:{port}"),
+            "kind": if rank == 0 { "lan" } else { "virtual" },
+        }));
     }
     out
 }
 
-fn tailscale_dns_name() -> Option<String> {
-    let mut cmd = std::process::Command::new("tailscale");
-    cmd.args(["status", "--json"]);
+/// 0 = a real LAN address, 1 = an adapter that only talks to this machine's
+/// own virtual machines or containers.
+fn address_rank(ip: &str) -> u8 {
+    // VirtualBox host-only, and the Docker/Hyper-V 172.16/12 block
+    if ip.starts_with("192.168.56.") {
+        return 1;
+    }
+    if let Some(second) = ip.strip_prefix("172.").and_then(|r| r.split('.').next()) {
+        if let Ok(n) = second.parse::<u8>() {
+            if (16..=31).contains(&n) {
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+struct TailscaleSelf {
+    name: Option<String>,
+    ips: Vec<String>,
+    serving: bool,
+}
+
+/// The Tailscale CLI is usually NOT on PATH on Windows, and a gateway started
+/// before Tailscale was installed would not see an updated PATH anyway, so the
+/// standard install locations are probed directly.
+fn tailscale_bins() -> Vec<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = vec!["tailscale".into()];
+    #[cfg(windows)]
+    {
+        candidates.push(r"C:\Program Files\Tailscale\tailscale.exe".into());
+        candidates.push(r"C:\Program Files (x86)\Tailscale\tailscale.exe".into());
+    }
+    #[cfg(unix)]
+    {
+        candidates.push("/usr/bin/tailscale".into());
+        candidates.push("/usr/local/bin/tailscale".into());
+        candidates.push("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into());
+    }
+    // The bare name stays first for PATH installs, but it cannot be *assumed*
+    // to work: probing it is the only way to tell, so callers try each in turn.
+    candidates
+}
+
+fn tailscale_cmd(bin: &std::path::Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -408,12 +508,37 @@ fn tailscale_dns_name() -> Option<String> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let out = cmd.output().ok()?;
-    if !out.status.success() {
+    out.status.success().then_some(out.stdout)
+}
+
+fn tailscale_self() -> Option<TailscaleSelf> {
+    let (bin, status) = tailscale_bins().into_iter().find_map(|bin| {
+        let raw = tailscale_cmd(&bin, &["status", "--json"])?;
+        let status: Value = serde_json::from_slice(&raw).ok()?;
+        Some((bin, status))
+    })?;
+    if status["BackendState"].as_str() != Some("Running") {
         return None;
     }
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let name = v["Self"]["DNSName"].as_str()?.trim_end_matches('.');
-    (!name.is_empty()).then(|| name.to_string())
+    let name = status["Self"]["DNSName"]
+        .as_str()
+        .map(|n| n.trim_end_matches('.').to_string())
+        .filter(|n| !n.is_empty());
+    let ips = status["Self"]["TailscaleIPs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    // `serve status` is non-empty only once something is actually published,
+    // which is what decides whether the HTTPS name is usable today.
+    let serving = tailscale_cmd(&bin, &["serve", "status", "--json"])
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .map(|v| v.get("Web").is_some_and(|w| w.as_object().is_some_and(|o| !o.is_empty())))
+        .unwrap_or(false);
+    Some(TailscaleSelf { name, ips, serving })
 }
 
 /// Non-loopback IPv4 addresses, so the Settings window can offer a LAN URL

@@ -235,11 +235,11 @@ function MobileAccess() {
     }
   };
 
-  const pair = async () => {
+  const pair = async (force = false) => {
     setBusy("pair");
     setError(null);
     try {
-      setPairing(await invoke("gateway_pair", { url: chosenUrl || null }));
+      setPairing(await invoke("gateway_pair", { url: chosenUrl || null, force }));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -277,10 +277,10 @@ function MobileAccess() {
           </button>
         </Row>
 
-        {running && urls.length > 0 && (
+        {running && (
           <Row
             title="Address"
-            sub="The address your phone uses. Tailscale is recommended: it gives trusted HTTPS with no open ports and works away from home."
+            sub="What the pairing QR points your phone at. Tailscale addresses work anywhere; a LAN address only works on this network, and a virtual adapter reaches nothing but this machine's own VMs."
             stack
           >
             <div className="mobile-urls">
@@ -291,9 +291,21 @@ function MobileAccess() {
                   onClick={() => setChosenUrl(u.url)}
                 >
                   <span className="mobile-url-text">{u.url}</span>
-                  <span className="mobile-url-kind">{u.kind}</span>
+                  <span className="mobile-url-kind">
+                    {u.needsServe ? "needs setup" : u.kind}
+                  </span>
                 </button>
               ))}
+              {/* Detection can miss an address — a VPN, a reverse proxy, a
+                  hostname only your DNS knows — so it is always typeable. */}
+              <input
+                className="mobile-url-input"
+                placeholder="Or type an address — https://machine.tailnet.ts.net"
+                value={urls.some((u) => u.url === chosenUrl) ? "" : chosenUrl}
+                onChange={(ev) => setChosenUrl(ev.target.value.trim())}
+                spellCheck={false}
+                autoCapitalize="off"
+              />
             </div>
           </Row>
         )}
@@ -335,6 +347,13 @@ function MobileAccess() {
                 />
               </Row>
               <Row title="Or type it in" sub={`Code ${pairing.code} · ${pairing.url}`}>
+                <button
+                  className="btn-sm"
+                  disabled={busy != null}
+                  onClick={() => pair(true)}
+                >
+                  New code
+                </button>
                 <button
                   className="btn-sm"
                   onClick={() => {

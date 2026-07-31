@@ -594,8 +594,12 @@ fn gateway_stop() -> Result<(), String> {
 /// Mint a pairing code + QR for a phone. `url` is the address the phone should
 /// use; the QR carries it alongside the one-time code.
 #[tauri::command]
-fn gateway_pair(url: Option<String>) -> Result<Value, String> {
-    gateway_control("POST", "/local/code", Some(json!({ "url": url })))
+fn gateway_pair(url: Option<String>, force: Option<bool>) -> Result<Value, String> {
+    gateway_control(
+        "POST",
+        "/local/code",
+        Some(json!({ "url": url, "force": force.unwrap_or(false) })),
+    )
 }
 
 #[tauri::command]
