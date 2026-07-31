@@ -60,7 +60,16 @@ export default function MobileApp() {
   const [open, setOpen] = useState(null); // { url, paneId, cwd, label }
   const [activity, setActivity] = useState([]);
   const [pairing, setPairing] = useState(null); // { state, message }
+  const [updateReady, setUpdateReady] = useState(false);
   const { machines, refresh } = useFleet(gateways);
+
+  // A new build is on the workstation; reloading is the user's call so it
+  // cannot interrupt a message being typed.
+  useEffect(() => {
+    const onUpdate = () => setUpdateReady(true);
+    window.addEventListener("agentbench:update-ready", onUpdate);
+    return () => window.removeEventListener("agentbench:update-ready", onUpdate);
+  }, []);
 
   useEffect(() => saveGateways(gateways), [gateways]);
 
@@ -134,11 +143,10 @@ export default function MobileApp() {
   if (open) {
     const machine = machines.find((m) => m.url === open.url);
     return (
-      <ChatScreen
-        machine={machine}
-        pane={open}
-        onBack={() => setOpen(null)}
-      />
+      <>
+        {updateReady && <UpdateBanner />}
+        <ChatScreen machine={machine} pane={open} onBack={() => setOpen(null)} />
+      </>
     );
   }
 
@@ -151,6 +159,8 @@ export default function MobileApp() {
           <ArrowClockwise size={18} />
         </button>
       </header>
+
+      {updateReady && <UpdateBanner />}
 
       {pairing && (
         <div className={`mob-banner ${pairing.state}`} onClick={() => setPairing(null)}>
@@ -178,6 +188,21 @@ export default function MobileApp() {
         <TabButton icon={Gear} label="Settings" on={tab === "settings"} onClick={() => setTab("settings")} />
       </nav>
     </div>
+  );
+}
+
+function UpdateBanner() {
+  return (
+    <button
+      className="mob-update"
+      onClick={() => {
+        // A hard reload so the new shell and its assets are fetched rather
+        // than restored from the back/forward cache.
+        location.reload();
+      }}
+    >
+      AgentBench was updated on your computer — tap to reload
+    </button>
   );
 }
 

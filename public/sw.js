@@ -6,7 +6,11 @@
  * device still loads the shell offline, then every data call returns 401 and
  * the app drops back to the pairing screen.
  */
-const CACHE = "agentbench-shell-v1";
+// Stamped at build time. A service worker is only considered "new" when its
+// own bytes change, so without this the browser would never look for updated
+// assets and a phone would run the build it first loaded forever.
+const BUILD = "__BUILD_ID__";
+const CACHE = `agentbench-shell-${BUILD}`;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
