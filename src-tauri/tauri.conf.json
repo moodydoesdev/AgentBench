@@ -33,6 +33,9 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
+    "resources": {
+      "../dist/": "dist/"
+    },
     "macOS": {
       "entitlements": "Entitlements.plist"
     },
