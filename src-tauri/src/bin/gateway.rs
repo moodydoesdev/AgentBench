@@ -51,17 +51,45 @@ async fn main() {
         .expect("bind loopback control listener");
     let local_port = local_listener.local_addr().unwrap().port();
 
-    let _ = std::fs::create_dir_all(agentbench_lib::broker::config_dir());
-    let _ = std::fs::write(
-        gateway::gateway_file(),
-        serde_json::to_string_pretty(&json!({
-            "port": port,
-            "controlPort": local_port,
-            "pid": std::process::id(),
-            "machine": gw.machine,
-        }))
-        .unwrap(),
-    );
+    // One gateway owns `gateway.json`, which is how the desktop finds the
+    // control channel. A second instance on another port would bind happily
+    // and then overwrite that file, leaving Settings talking to a process that
+    // may not even exist — which looks exactly like "mobile access won't
+    // start", because the app then tries to launch another one onto a port
+    // that is already held.
+    if let Some(existing) = live_gateway() {
+        if std::env::var("AGENTBENCH_GATEWAY_ALLOW_SECOND").is_err() {
+            eprintln!(
+                "agentbench-gateway: another gateway is already running (pid {existing}); exiting"
+            );
+            std::process::exit(0);
+        }
+        eprintln!("agentbench-gateway: another gateway is live (pid {existing}); leaving gateway.json alone");
+    } else {
+        claim_advertisement(port, local_port, &gw.machine);
+    }
+
+    // Keep the claim honest. A crash, a kill, or a stray instance can leave
+    // the file pointing somewhere dead; re-claiming it means the desktop can
+    // always find the gateway that is actually serving.
+    {
+        let machine = gw.machine.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let ours = std::fs::read_to_string(gateway::gateway_file())
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .and_then(|v| v["pid"].as_u64())
+                    .map(|pid| pid as u32 == std::process::id())
+                    .unwrap_or(false);
+                if !ours && live_gateway().is_none() {
+                    eprintln!("agentbench-gateway: re-claiming a stale gateway.json");
+                    claim_advertisement(port, local_port, &machine);
+                }
+            }
+        });
+    }
 
     eprintln!("agentbench-gateway: public :{port}, control 127.0.0.1:{local_port}");
 
@@ -86,6 +114,7 @@ async fn main() {
         .with_state(gw.clone());
 
     let local = Router::new()
+        .route("/local/ping", get(local_ping))
         .route("/local/status", get(local_status))
         .route("/local/code", post(local_code))
         .route("/local/code", axum::routing::delete(local_clear_code))
@@ -100,6 +129,51 @@ async fn main() {
         _ = public_srv => {}
         _ = local_srv => {}
     }
+}
+
+fn claim_advertisement(port: u16, control_port: u16, machine: &str) {
+    let _ = std::fs::create_dir_all(agentbench_lib::broker::config_dir());
+    let _ = std::fs::write(
+        gateway::gateway_file(),
+        serde_json::to_string_pretty(&json!({
+            "port": port,
+            "controlPort": control_port,
+            "pid": std::process::id(),
+            "machine": machine,
+        }))
+        .unwrap(),
+    );
+}
+
+/// The pid of a gateway that is already advertised and still answering, if any.
+/// A stale `gateway.json` (killed process, or one left behind by a crash) is
+/// treated as absent, so this never blocks a legitimate start.
+///
+/// Probes `/local/ping` rather than `/local/status`: status shells out to
+/// `tailscale` and the network stack, which is far too slow to sit behind a
+/// liveness check.
+fn live_gateway() -> Option<u32> {
+    use std::io::{Read, Write};
+    let text = std::fs::read_to_string(gateway::gateway_file()).ok()?;
+    let info: Value = serde_json::from_str(&text).ok()?;
+    let pid = info["pid"].as_u64()? as u32;
+    if pid == std::process::id() {
+        return None;
+    }
+    let control = info["controlPort"].as_u64()? as u16;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], control));
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+        .ok()?;
+    stream
+        .write_all(b"GET /local/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut raw = String::new();
+    // a timeout leaves whatever arrived in `raw`, which is enough to judge
+    let _ = stream.read_to_string(&mut raw);
+    raw.contains("200 OK").then_some(pid)
 }
 
 /// Where the built PWA lives.
@@ -309,6 +383,12 @@ async fn serve_socket(socket: WebSocket, gw: Arc<Gateway>, who: String) {
 // Loopback control surface — the desktop Settings window only.
 // ---------------------------------------------------------------------------
 
+/// Liveness only — no subprocesses, no network probing. Exists so "is a
+/// gateway already running?" is answerable in a millisecond.
+async fn local_ping(State(gw): State<Arc<Gateway>>) -> Json<Value> {
+    Json(json!({ "ok": true, "pid": std::process::id(), "machine": gw.machine }))
+}
+
 async fn local_status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
     let code = gw.tokens.current_code();
     Json(json!({
@@ -397,6 +477,25 @@ async fn local_quit() -> Json<Value> {
 /// Virtual adapters sort last: a VirtualBox or Docker address is reachable
 /// from nothing at all, and left unranked it can easily come out on top.
 fn candidate_urls() -> Vec<Value> {
+    // Discovery runs `tailscale` twice and asks the OS for its addresses —
+    // together a couple of seconds. The Settings panel polls status every few
+    // seconds while it is open, so the answer is cached; addresses change on
+    // the timescale of joining a network, not of a UI refresh.
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Value>)>> =
+        std::sync::Mutex::new(None);
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    if let Some((at, cached)) = CACHE.lock().unwrap().as_ref() {
+        if at.elapsed() < TTL {
+            return cached.clone();
+        }
+    }
+    let fresh = discover_urls();
+    *CACHE.lock().unwrap() = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
+}
+
+fn discover_urls() -> Vec<Value> {
     let port = std::env::var("AGENTBENCH_GATEWAY_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
