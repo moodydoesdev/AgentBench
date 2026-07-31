@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import useWebDictation from "./useWebDictation";
 
 // On-device dictation, driven by the Rust side (see src-tauri/src/dictation.rs).
 // One microphone means one session process-wide, so the backend emits to every
@@ -12,12 +13,18 @@ import { invoke } from "@tauri-apps/api/core";
 // still differ from the last partial, because ending the audio lets the
 // recognizer re-score the tail.
 // Dictation is driven by the desktop's Rust side, so it only exists inside the
-// Tauri webview. In the mobile PWA these APIs are absent — calling them throws
-// on every mount — so the hook reports itself unavailable and the mic button
-// simply never appears.
+// Tauri webview. Outside it — the mobile PWA — these APIs are absent, and the
+// browser's own recognizer stands in, so the composer gets a working mic in
+// both places from one hook.
 const HAS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export default function useDictation({ onPartial, onFinal, onError } = {}) {
+export default function useDictation(options = {}) {
+  const native = useNativeDictation(options);
+  const web = useWebDictation(options);
+  return HAS_TAURI ? native : web;
+}
+
+function useNativeDictation({ onPartial, onFinal, onError } = {}) {
   const [available, setAvailable] = useState(false);
   const [listening, setListening] = useState(false);
   // True between our own start() and the session ending. Gates the shared

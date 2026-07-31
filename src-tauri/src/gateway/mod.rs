@@ -50,13 +50,16 @@ const REQUEST_OPS: &[&str] = &[
     "shutdown",
 ];
 
-/// Filesystem reads the phone can make. These bypass the broker entirely.
+/// Reads the phone can make that bypass the broker's op vocabulary: plain
+/// filesystem lookups, plus a couple of helpers the broker has no op for.
 const FS_READS: &[&str] = &[
     "list_sessions",
     "list_plans",
     "read_plan",
     "list_slash_commands",
     "list_projects",
+    "pane_buffer",
+    "save_image",
 ];
 
 pub fn gateway_file() -> std::path::PathBuf {
@@ -349,30 +352,77 @@ impl Gateway {
 
     /// The reconnect contract: everything a phone needs to render a correct
     /// fleet without having witnessed the events that produced it.
+    ///
+    /// Scrollback is deliberately excluded. The broker's `list` carries every
+    /// pane's buffer — up to 512KB each — which is the right trade for a
+    /// desktop reattaching over a loopback socket and completely wrong for a
+    /// phone on cellular reconnecting every time the screen locks. The fleet
+    /// only needs identity and status; a pane's backlog is fetched when one is
+    /// actually opened (`pane_buffer`).
     pub async fn hello(&self) -> Value {
         let panes = self.broker.request(json!({ "op": "list" })).await;
-        if let Ok(Value::Array(list)) = &panes {
-            for p in list {
-                if let Some(id) = p["id"].as_u64() {
-                    self.snapshot.seed_pane(id as u32);
+        let panes = match panes {
+            Ok(Value::Array(list)) => {
+                let mut out = Vec::with_capacity(list.len());
+                for p in list {
+                    if let Some(id) = p["id"].as_u64() {
+                        self.snapshot.seed_pane(id as u32);
+                    }
+                    out.push(json!({
+                        "id": p["id"],
+                        "cwd": p["cwd"],
+                        "harness": p["harness"],
+                        "kind": p["kind"],
+                        "color": p["color"],
+                    }));
                 }
+                Value::Array(out)
             }
-        }
+            _ => Value::Array(vec![]),
+        };
         json!({
             "ev": "hello",
             "machine": self.machine,
             "protocolVersion": PROTOCOL_VERSION,
             "brokerConnected": self.broker.is_connected(),
             "startedAt": self.started_at,
-            "panes": panes.unwrap_or(Value::Array(vec![])),
+            "panes": panes,
             "statuses": self.snapshot.statuses_json(),
             "asks": self.snapshot.asks_json(),
             "projects": fsdata::read_projects(),
         })
     }
 
-    /// Run one filesystem read on behalf of a phone.
-    pub fn fs_read(&self, name: &str, args: &Value) -> Result<Value, String> {
+    /// One pane's scrollback, for a log view that has just been opened. Pty
+    /// panes carry raw base64 bytes; headless chat panes carry stream-json
+    /// lines. Tailed to the most recent slice so a long-running dev server
+    /// does not push a phone into a multi-megabyte download.
+    pub async fn pane_buffer(&self, id: u32, limit: usize) -> Result<Value, String> {
+        let list = self.broker.request(json!({ "op": "list" })).await?;
+        let pane = list
+            .as_array()
+            .and_then(|panes| panes.iter().find(|p| p["id"].as_u64() == Some(id as u64)))
+            .ok_or("no such pane")?;
+        let buffer = pane["buffer"].as_str().map(|b| {
+            // base64 chars, not bytes — trimming to a char boundary keeps the
+            // decode valid, and the tail is what a log wants anyway.
+            let start = b.len().saturating_sub(limit / 3 * 4);
+            let start = start - (start % 4);
+            b[start..].to_string()
+        });
+        Ok(json!({
+            "id": id,
+            "cwd": pane["cwd"],
+            "harness": pane["harness"],
+            "kind": pane["kind"],
+            "buffer": buffer,
+            "lines": pane["lines"],
+            "truncated": pane["buffer"].as_str().map(|b| b.len() > limit / 3 * 4),
+        }))
+    }
+
+    /// Run one non-broker request on behalf of a phone.
+    pub async fn fs_read(&self, name: &str, args: &Value) -> Result<Value, String> {
         if !FS_READS.contains(&name) {
             return Err(format!("fs read not allowed: {name}"));
         }
@@ -383,6 +433,12 @@ impl Gateway {
             "list_slash_commands" => Ok(json!(fsdata::list_slash_commands(project))),
             "read_plan" => fsdata::read_plan(args["path"].as_str().unwrap_or_default()),
             "list_projects" => Ok(json!(fsdata::read_projects())),
+            "pane_buffer" => {
+                let id = args["id"].as_u64().unwrap_or(0) as u32;
+                let limit = args["limit"].as_u64().unwrap_or(96 * 1024) as usize;
+                self.pane_buffer(id, limit.min(512 * 1024)).await
+            }
+            "save_image" => save_image(args["dataUrl"].as_str().unwrap_or_default()),
             _ => Err(format!("unknown fs read: {name}")),
         }
     }
@@ -416,9 +472,83 @@ impl Gateway {
     }
 }
 
+/// Write an image sent from a phone to a temp file and return its path, so the
+/// composer can hand Claude the image the same way the desktop does — by path,
+/// rather than trying to push bytes through a terminal.
+///
+/// Mirrors `save_pasted_image` in lib.rs, including the day-old prune, and
+/// shares its directory so there is one place these land.
+fn save_image(data_url: &str) -> Result<Value, String> {
+    use base64::Engine;
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    const MAX_BYTES: usize = 12 * 1024 * 1024;
+
+    let comma = data_url.find(',').ok_or("not a data URL")?;
+    let header = &data_url[..comma];
+    let payload = data_url[comma + 1..].trim();
+    if !header.contains(";base64") {
+        return Err("expected a base64 data URL".into());
+    }
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|h| h.split(';').next())
+        .unwrap_or("image/png");
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" | "image/heif" => "heic",
+        _ => return Err(format!("unsupported image type: {mime}")),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| format!("bad base64: {e}"))?;
+    // A phone camera photo is large; cap it rather than let one request fill
+    // the disk.
+    if bytes.len() > MAX_BYTES {
+        return Err("image too large (max 12 MB)".into());
+    }
+
+    let dir = std::env::temp_dir().join("agentbench-images");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let now = std::time::SystemTime::now();
+        for entry in rd.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map(|age| age.as_secs() > 24 * 3600)
+                .unwrap_or(false);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("phone-{stamp}-{seq}.{ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(json!(path.to_string_lossy()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_must_be_real_base64_data_urls() {
+        assert!(save_image("https://example.com/cat.png").is_err());
+        assert!(save_image("data:image/png,notbase64").is_err());
+        assert!(save_image("data:application/zip;base64,AAAA").is_err());
+    }
 
     #[test]
     fn spawn_and_shutdown_are_not_reachable_from_a_phone() {
