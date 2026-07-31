@@ -35,6 +35,7 @@ export function saveGateways(list) {
 export function useFleet(gateways) {
   const [conns, setConns] = useState({}); // url -> connection state
   const transports = useRef(new Map());
+  const timers = useRef([]).current;
 
   useEffect(() => {
     const live = transports.current;
@@ -118,9 +119,18 @@ export function useFleet(gateways) {
             : {},
         ),
       );
-      // A pane that appears while we are connected (spawned on the desktop)
-      // should show up without waiting for a reconnect.
-      t.listen("hello", () => {});
+      // Session titles are written into the transcript while a session runs,
+      // so they are refreshed rather than fixed at connect time.
+      const refreshTitles = () =>
+        t
+          .invoke("pane_titles", {})
+          .then((titles) => patch2(setConns, url, () => ({ titles })))
+          .catch(() => {});
+      t.listen("agent-event", refreshTitles);
+      t.listen("hello", refreshTitles);
+      setTimeout(refreshTitles, 1500);
+      const titleTimer = setInterval(refreshTitles, 90000);
+      timers.push(titleTimer);
     }
 
     return () => {};
@@ -132,6 +142,7 @@ export function useFleet(gateways) {
     return () => {
       for (const [, t] of live) t.close();
       live.clear();
+      timers.forEach(clearInterval);
     };
   }, []);
 
@@ -180,7 +191,11 @@ export function groupPanes(machine) {
   const byCwd = new Map();
   for (const pane of machine.panes ?? []) {
     const list = byCwd.get(pane.cwd) ?? [];
-    list.push({ ...pane, status: machine.statuses?.[pane.id] ?? "working" });
+    list.push({
+      ...pane,
+      status: machine.statuses?.[pane.id] ?? "working",
+      title: machine.titles?.[pane.id] ?? pane.title ?? null,
+    });
     byCwd.set(pane.cwd, list);
   }
   const named = new Map(

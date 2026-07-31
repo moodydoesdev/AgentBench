@@ -376,17 +376,31 @@ function MachineSection({ machine, onOpen }) {
                     url: machine.url,
                     paneId: pane.id,
                     cwd: pane.cwd,
-                    label: `${pane.harness ?? "agent"} ${pane.id}`,
+                    label: pane.title || `${pane.harness ?? "agent"} ${pane.id}`,
+                    subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
                     kind: pane.kind,
                     chat: isChatPane(pane),
                     machine: machine.machine ?? machine.name,
                   })
                 }
               >
-                {/* Several agents per project is the norm, and they all run the
-                    same harness — the pane id is what tells them apart. */}
+                {/* What the session is about beats what it is called: several
+                    agents per project is the norm and they all run the same
+                    harness, so "claude 17" says nothing. */}
                 <span className="mob-agent-name">
-                  {pane.harness ?? "agent"} <span className="mob-agent-id">{pane.id}</span>
+                  {pane.title ? (
+                    <>
+                      <span className="mob-agent-title">{pane.title}</span>
+                      <span className="mob-agent-id">
+                        {pane.harness ?? "agent"} {pane.id}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      {pane.harness ?? "agent"}{" "}
+                      <span className="mob-agent-id">{pane.id}</span>
+                    </>
+                  )}
                 </span>
                 {!isChatPane(pane) && <span className="mob-agent-kind">log</span>}
                 {machine.asks?.some((a) => a.id === pane.id) && (
@@ -448,6 +462,7 @@ function ChatScreen({ machine, pane, onBack }) {
         <div className="mob-chat-title">
           <strong>{pane.label}</strong>
           <small>
+            {pane.subtitle ? `${pane.subtitle} · ` : ""}
             {baseName(pane.cwd)} · {pane.machine}
           </small>
         </div>
