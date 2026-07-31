@@ -532,3 +532,22 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+
+/* Update prompt — sits above everything, including the chat screen, so it is
+   visible wherever the user happens to be. */
+.mob-update {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  width: 100%;
+  padding: calc(env(safe-area-inset-top) + 10px) 14px 10px;
+  border: none;
+  border-bottom: 1px solid rgba(var(--green), 0.4);
+  background: rgba(var(--green), 0.16);
+  color: rgb(var(--green));
+  font: inherit;
+  font-size: 13px;
+  text-align: center;
+}

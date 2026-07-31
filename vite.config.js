@@ -6,8 +6,37 @@ import tailwindcss from "@tailwindcss/vite";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
+/**
+ * Stamp the service worker with a build id derived from the emitted asset
+ * names. The browser only treats a service worker as new when its bytes
+ * differ, so this is what lets an installed phone app notice that the
+ * workstation has been updated.
+ */
+function stampServiceWorker() {
+  return {
+    name: "agentbench-stamp-sw",
+    apply: "build",
+    async writeBundle(options, bundle) {
+      const { createHash } = await import("node:crypto");
+      const fs = await import("node:fs/promises");
+      const swPath = path.join(options.dir, "sw.js");
+      let source;
+      try {
+        source = await fs.readFile(swPath, "utf8");
+      } catch {
+        return; // no service worker in this build
+      }
+      const id = createHash("sha256")
+        .update(Object.keys(bundle).sort().join("|"))
+        .digest("hex")
+        .slice(0, 12);
+      await fs.writeFile(swPath, source.replace("__BUILD_ID__", id));
+    },
+  };
+}
+
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), stampServiceWorker()],
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),
