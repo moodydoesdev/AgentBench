@@ -6,6 +6,7 @@ import {
   Desktop,
   Gear,
   Plugs,
+  Plus,
   SquaresFour,
   Trash,
   WarningCircle,
@@ -14,6 +15,7 @@ import ChatView from "../chat/ChatView";
 import LogView from "./LogView";
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
+import { BUILTIN_HARNESSES } from "../settings";
 import {
   CLIENT_PROTOCOL,
   baseName,
@@ -243,8 +245,80 @@ function FleetScreen({ machines, onOpen, onAdd }) {
   );
 }
 
+/**
+ * Start an agent in a project. Mirrors the desktop's New Agent button: the
+ * broker is handed the same harness spec, so a session started from the phone
+ * is indistinguishable from one started at the desk.
+ */
+function NewAgentSheet({ project, machine, onClose, onStarted }) {
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+
+  const start = async (harness) => {
+    setBusy(harness.id);
+    setError(null);
+    try {
+      const id = await machine.transport.invoke("create_pane", {
+        cwd: project.cwd,
+        // a phone-sized terminal; the desktop resizes it when it attaches
+        cols: 100,
+        rows: 30,
+        harness: {
+          id: harness.id,
+          command: harness.command,
+          resume: harness.resume ?? null,
+          claude: !!harness.claude,
+          interactive: !!harness.interactive,
+        },
+      });
+      onStarted({
+        url: machine.url,
+        paneId: id,
+        cwd: project.cwd,
+        label: `${harness.id} ${id}`,
+        chat: !!harness.claude,
+        machine: machine.machine ?? machine.name,
+      });
+    } catch (err) {
+      setError(String(err.message ?? err));
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="mob-sheet-backdrop" onClick={onClose}>
+      <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-head">
+          <strong>New agent</strong>
+          <small className="mob-mono">{project.cwd}</small>
+        </div>
+        {BUILTIN_HARNESSES.map((h) => (
+          <button
+            key={h.id}
+            className="mob-sheet-item"
+            disabled={busy != null}
+            onClick={() => start(h)}
+          >
+            <span>{h.name}</span>
+            {busy === h.id ? (
+              <small>starting…</small>
+            ) : (
+              <small className="mob-mono">{h.command.split(" ")[0]}</small>
+            )}
+          </button>
+        ))}
+        {error && <div className="mob-warn">{error}</div>}
+        <button className="mob-sheet-cancel" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MachineSection({ machine, onOpen }) {
   const projects = groupPanes(machine);
+  const [spawnIn, setSpawnIn] = useState(null);
   const stale =
     machine.protocolVersion != null && machine.protocolVersion !== CLIENT_PROTOCOL;
   return (
@@ -288,7 +362,9 @@ function MachineSection({ machine, onOpen }) {
               <strong>{proj.name}</strong>
               <span className="mob-spacer" />
               <span className="mob-pill">
-                {proj.panes.length} agent{proj.panes.length === 1 ? "" : "s"}
+                {proj.panes.length
+                  ? `${proj.panes.length} agent${proj.panes.length === 1 ? "" : "s"}`
+                  : "idle"}
               </span>
             </div>
             {proj.panes.map((pane) => (
@@ -313,16 +389,31 @@ function MachineSection({ machine, onOpen }) {
                   {pane.harness ?? "agent"} <span className="mob-agent-id">{pane.id}</span>
                 </span>
                 {!isChatPane(pane) && <span className="mob-agent-kind">log</span>}
-                <span className={`mob-agent-status ${pane.status}`}>
-                  {STATUS_LABEL[pane.status] ?? pane.status}
-                </span>
                 {machine.asks?.some((a) => a.id === pane.id) && (
                   <span className="mob-ask">question</span>
                 )}
+                <span className={`mob-agent-status ${pane.status}`}>
+                  {STATUS_LABEL[pane.status] ?? pane.status}
+                </span>
               </button>
             ))}
+            <button className="mob-agent mob-new" onClick={() => setSpawnIn(proj)}>
+              <Plus size={13} weight="bold" />
+              <span className="mob-agent-name">New agent</span>
+            </button>
           </div>
         ))}
+      {spawnIn && (
+        <NewAgentSheet
+          project={spawnIn}
+          machine={machine}
+          onClose={() => setSpawnIn(null)}
+          onStarted={(pane) => {
+            setSpawnIn(null);
+            onOpen(pane);
+          }}
+        />
+      )}
     </section>
   );
 }
@@ -505,6 +596,38 @@ function SettingsScreen({ gateways, machines, onChange }) {
           </div>
         );
       })}
+
+      <h2>This app</h2>
+      <div className="mob-card">
+        <div className="mob-card-head">
+          <strong>Build</strong>
+          <span className="mob-spacer" />
+          <span className="mob-mono">
+            {typeof __BUILD_TIME__ === "string" ? __BUILD_TIME__ : "dev"}
+          </span>
+        </div>
+        <p className="mob-note" style={{ padding: "6px 0 0" }}>
+          An installed app keeps running the version it loaded. If this is older
+          than the workstation's build, reload to pick up changes.
+        </p>
+        <button
+          className="mob-sheet-item"
+          style={{ marginTop: 8 }}
+          onClick={async () => {
+            // Clear the shell cache too: a plain reload can be served from it.
+            if ("caches" in window) {
+              const keys = await caches.keys();
+              await Promise.all(keys.map((k) => caches.delete(k)));
+            }
+            const reg = await navigator.serviceWorker?.getRegistration();
+            await reg?.update().catch(() => {});
+            location.reload();
+          }}
+        >
+          <span>Reload to latest</span>
+          <small>clears the cached shell</small>
+        </button>
+      </div>
 
       <h2>Pair another machine</h2>
       <p className="mob-note">

@@ -551,3 +551,87 @@
   font-size: 13px;
   text-align: center;
 }
+
+/* Composer controls are 24px on the desktop, which is under the comfortable
+   touch target on a phone. */
+.mob-chat-screen .chat-mic-btn,
+.mob-chat-screen .chat-mic-discard,
+.mob-chat-screen .chat-attach-btn,
+.mob-chat-screen .chat-stop {
+  width: 34px;
+  height: 34px;
+}
+
+/* ---- new agent sheet ---- */
+
+.mob-new {
+  color: var(--text-dim);
+}
+
+.mob-new .mob-agent-name {
+  color: var(--text-dim);
+}
+
+.mob-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.mob-sheet {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 14px calc(env(safe-area-inset-bottom) + 14px);
+  border-top-left-radius: 18px;
+  border-top-right-radius: 18px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.mob-sheet-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 4px 10px;
+}
+
+.mob-sheet-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 50px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin-bottom: 6px;
+  background: var(--panel-head);
+  color: var(--text);
+  font-size: 15px;
+  text-align: left;
+}
+
+.mob-sheet-item:disabled {
+  opacity: 0.5;
+}
+
+.mob-sheet-item small {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.mob-sheet-cancel {
+  min-height: 46px;
+  margin-top: 6px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 15px;
+}
