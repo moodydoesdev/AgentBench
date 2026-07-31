@@ -23,13 +23,19 @@ const OP_FOR = {
   saved_panes: () => ({ op: "saved" }),
 };
 
-// Reads that never touch the broker; the gateway serves them from disk.
+// Requests the gateway answers itself, without the broker's op vocabulary.
 const FS_FOR = {
   list_sessions: (a) => ({ fs: "list_sessions", project: a.project }),
   list_plans: (a) => ({ fs: "list_plans", project: a.project }),
   list_slash_commands: (a) => ({ fs: "list_slash_commands", project: a.project }),
   read_plan: (a) => ({ fs: "read_plan", path: a.path }),
   list_projects: () => ({ fs: "list_projects" }),
+  // Scrollback for one pane, fetched when a log is opened rather than shipped
+  // with every reconnect.
+  pane_buffer: (a) => ({ fs: "pane_buffer", id: a.id, limit: a.limit }),
+  // Same contract as the desktop command: an image goes to a temp file and
+  // Claude is handed the path.
+  save_pasted_image: (a) => ({ fs: "save_image", dataUrl: a.dataUrl }),
 };
 
 /** Desktop: straight through to the Tauri backend. */

@@ -11,6 +11,7 @@ import {
   WarningCircle,
 } from "@phosphor-icons/react";
 import ChatView from "../chat/ChatView";
+import LogView from "./LogView";
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
 import {
@@ -28,6 +29,17 @@ const STATUS_LABEL = {
   input: "needs input",
   exited: "exited",
 };
+
+/**
+ * Only Claude panes keep a transcript, which is what the chat view reads.
+ * Everything else — project run commands, and harnesses like codex or gemini —
+ * is a terminal, so it belongs in a log rather than being dressed up as a
+ * conversation it never had.
+ */
+function isChatPane(pane) {
+  if (pane.kind === "run") return false;
+  return pane.harness === "claude" || pane.harness === "claude-chat";
+}
 
 /** A pairing QR opens the app with #pair=<base64 handshake>. */
 function readPairingHash() {
@@ -265,6 +277,7 @@ function MachineSection({ machine, onOpen }) {
                     cwd: pane.cwd,
                     label: `${pane.harness ?? "agent"} ${pane.id}`,
                     kind: pane.kind,
+                    chat: isChatPane(pane),
                     machine: machine.machine ?? machine.name,
                   })
                 }
@@ -274,6 +287,7 @@ function MachineSection({ machine, onOpen }) {
                 <span className="mob-agent-name">
                   {pane.harness ?? "agent"} <span className="mob-agent-id">{pane.id}</span>
                 </span>
+                {!isChatPane(pane) && <span className="mob-agent-kind">log</span>}
                 <span className={`mob-agent-status ${pane.status}`}>
                   {STATUS_LABEL[pane.status] ?? pane.status}
                 </span>
@@ -308,6 +322,7 @@ function ChatScreen({ machine, pane, onBack }) {
     );
   }
   const status = machine.statuses?.[pane.paneId] ?? "working";
+  const chat = pane.chat;
   return (
     <div className="mob mob-chat-screen">
       <header className="mob-top">
@@ -325,22 +340,33 @@ function ChatScreen({ machine, pane, onBack }) {
           {STATUS_LABEL[status] ?? status}
         </span>
       </header>
-      <TransportProvider transport={machine.transport}>
-        <ChatView
-          id={pane.paneId}
-          cwd={pane.cwd}
-          mode={pane.kind === "chat" ? "stream" : "transcript"}
-          placeholder="Message Claude…"
-          allowImages={false}
-          onSend={(text) => sendToPane(machine.transport, pane, text)}
-          onStop={(resubmit) =>
+      {chat ? (
+        <TransportProvider transport={machine.transport}>
+          <ChatView
+            id={pane.paneId}
+            cwd={pane.cwd}
+            mode={pane.kind === "chat" ? "stream" : "transcript"}
+            placeholder="Message Claude…"
+            onSend={(text) => sendToPane(machine.transport, pane, text)}
+            onStop={(resubmit) =>
+              machine.transport
+                .invoke("interrupt_pane", { id: pane.paneId, resubmit })
+                .catch(() => {})
+            }
+            status={status}
+          />
+        </TransportProvider>
+      ) : (
+        <LogView
+          transport={machine.transport}
+          paneId={pane.paneId}
+          onStop={() =>
             machine.transport
-              .invoke("interrupt_pane", { id: pane.paneId, resubmit })
+              .invoke("interrupt_pane", { id: pane.paneId, resubmit: false })
               .catch(() => {})
           }
-          status={status}
         />
-      </TransportProvider>
+      )}
     </div>
   );
 }
@@ -387,8 +413,9 @@ function ActivityScreen({ items, machines, onOpen }) {
                 url: m.url,
                 paneId: pane.id,
                 cwd: pane.cwd,
-                label: pane.harness ?? "agent",
+                label: `${pane.harness ?? "agent"} ${pane.id}`,
                 kind: pane.kind,
+                chat: isChatPane(pane),
                 machine: m.machine ?? m.name,
               });
           }}

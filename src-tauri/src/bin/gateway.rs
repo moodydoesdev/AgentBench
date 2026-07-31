@@ -276,7 +276,7 @@ async fn serve_socket(socket: WebSocket, gw: Arc<Gateway>, who: String) {
         let id = req["id_"].clone();
         let who = format!("{who}:{conn}");
         let reply = if let Some(fs) = req["fs"].as_str() {
-            match gw.fs_read(fs, &req) {
+            match gw.fs_read(fs, &req).await {
                 Ok(v) => json!({ "id_": id, "result": v }),
                 Err(e) => json!({ "id_": id, "error": e }),
             }
