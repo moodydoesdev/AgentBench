@@ -1,5 +1,7 @@
 pub mod broker;
 pub mod dictation;
+pub mod fsdata;
+pub mod gateway;
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -253,54 +255,22 @@ fn shutdown_broker(client: State<'_, Arc<BrokerClient>>) -> Result<(), String> {
 /// the frontend can cheaply poll for changes.
 #[tauri::command]
 fn read_plan(path: String) -> Result<Value, String> {
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mtime = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    Ok(json!({ "content": content, "mtime": mtime }))
+    fsdata::read_plan(&path)
 }
 
 /// List a project's plan documents (.agentbench/plans/*/plan.mdx) for the
 /// plans rail. Title comes from the first `# ` heading; newest first.
 #[tauri::command]
 fn list_plans(project: String) -> Result<Value, String> {
-    let dir = std::path::Path::new(&project)
-        .join(".agentbench")
-        .join("plans");
-    let mut out: Vec<Value> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let plan = entry.path().join("plan.mdx");
-            if !plan.is_file() {
-                continue;
-            }
-            let mtime = std::fs::metadata(&plan)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let title = std::fs::read_to_string(&plan)
-                .ok()
-                .and_then(|c| {
-                    c.lines()
-                        .find(|l| l.starts_with("# "))
-                        .map(|l| l[2..].trim().to_string())
-                })
-                .filter(|t| !t.is_empty());
-            out.push(json!({
-                "path": plan.to_string_lossy(),
-                "slug": entry.file_name().to_string_lossy(),
-                "title": title,
-                "mtime": mtime,
-            }));
-        }
-    }
-    out.sort_by(|a, b| b["mtime"].as_u64().cmp(&a["mtime"].as_u64()));
-    Ok(json!(out))
+    Ok(fsdata::list_plans(&project))
+}
+
+/// Mirror the desktop's project registry to disk so the mobile gateway can
+/// read it. localStorage stays the desktop's source of truth; this file is
+/// desktop-owned and read-only everywhere else.
+#[tauri::command]
+fn save_projects(projects: Value) -> Result<(), String> {
+    fsdata::write_projects(&projects)
 }
 
 /// Slash commands available to a Claude session in `project`, for the chat
@@ -308,61 +278,7 @@ fn list_plans(project: String) -> Result<Value, String> {
 /// /*.md) and skills (.claude/skills/*/SKILL.md). Built-ins live frontend-side.
 #[tauri::command]
 fn list_slash_commands(project: String) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-
-    // description: from SKILL.md / command frontmatter, first match wins
-    fn frontmatter_desc(path: &std::path::Path) -> Option<String> {
-        let text = std::fs::read_to_string(path).ok()?;
-        text.lines()
-            .take(40)
-            .find_map(|l| l.strip_prefix("description:"))
-            .map(|d| {
-                let d = d.trim().trim_matches('"');
-                d.chars().take(120).collect()
-            })
-    }
-
-    let mut push_commands = |dir: std::path::PathBuf, source: &str| {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("md") {
-                    if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
-                        out.push(json!({
-                            "name": stem,
-                            "desc": frontmatter_desc(&p),
-                            "source": source,
-                        }));
-                    }
-                }
-            }
-        }
-    };
-    let home = dirs::home_dir().unwrap_or_default();
-    let proj = std::path::Path::new(&project);
-    push_commands(home.join(".claude").join("commands"), "user");
-    push_commands(proj.join(".claude").join("commands"), "project");
-
-    let mut push_skills = |dir: std::path::PathBuf, source: &str| {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let skill = e.path().join("SKILL.md");
-                if skill.is_file() {
-                    if let Some(name) = e.file_name().to_str() {
-                        out.push(json!({
-                            "name": name,
-                            "desc": frontmatter_desc(&skill),
-                            "source": source,
-                        }));
-                    }
-                }
-            }
-        }
-    };
-    push_skills(home.join(".claude").join("skills"), "skill");
-    push_skills(proj.join(".claude").join("skills"), "skill");
-
-    out
+    fsdata::list_slash_commands(&project)
 }
 
 /// Resumable Claude sessions for a project: scan its transcript dir
@@ -371,86 +287,7 @@ fn list_slash_commands(project: String) -> Vec<Value> {
 /// Claude Code's own: every non-alphanumeric char in cwd replaced by '-'.
 #[tauri::command]
 fn list_sessions(project: String) -> Vec<Value> {
-    let slug: String = project
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claude")
-        .join("projects")
-        .join(slug);
-
-    // first human-authored user line — skips harness plumbing (<tag>…, Caveat:)
-    fn preview_of(path: &std::path::Path) -> (Option<String>, u64) {
-        let Ok(f) = std::fs::File::open(path) else {
-            return (None, 0);
-        };
-        let mut msgs = 0u64;
-        let mut preview = None;
-        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            msgs += 1;
-            if preview.is_some() {
-                continue;
-            }
-            let Ok(rec) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if rec["type"].as_str() != Some("user") || rec["isMeta"].as_bool() == Some(true) {
-                continue;
-            }
-            let text = match &rec["message"]["content"] {
-                Value::String(s) => s.clone(),
-                Value::Array(blocks) => blocks
-                    .iter()
-                    .find_map(|b| {
-                        (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("").to_string())
-                    })
-                    .unwrap_or_default(),
-                _ => String::new(),
-            };
-            let t = text.trim_start();
-            if t.is_empty() || t.starts_with('<') || t.starts_with("Caveat:") {
-                continue;
-            }
-            preview = Some(t.chars().take(140).collect::<String>());
-        }
-        (preview, msgs)
-    }
-
-    let mut out: Vec<(std::time::SystemTime, Value)> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(sid) = p.file_stem().and_then(|x| x.to_str()).map(String::from) else {
-            continue;
-        };
-        let meta = e.metadata().ok();
-        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
-        let mtime_ms = mtime
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let (preview, msgs) = preview_of(&p);
-        // an empty transcript (0 messages) can't be resumed to anything useful
-        if msgs == 0 {
-            continue;
-        }
-        out.push((
-            mtime.unwrap_or(std::time::UNIX_EPOCH),
-            json!({ "sid": sid, "mtime": mtime_ms, "preview": preview, "msgs": msgs }),
-        ));
-    }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    out.into_iter().map(|(_, v)| v).collect()
+    fsdata::list_sessions(&project)
 }
 
 /// Raw file bytes as base64 — used by the auto-theme wallpaper sampler,
@@ -638,6 +475,139 @@ async fn install_harness(command: String, shell: Option<String>) -> Result<(), S
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mobile gateway control. The gateway is a peer daemon, not a child of this
+// app: closing the desktop must not cut a phone off mid-session, so it is
+// spawned detached exactly like the broker and keeps running until it is
+// stopped explicitly.
+// ---------------------------------------------------------------------------
+
+/// Read the running gateway's advertised control port, if any.
+fn gateway_control_port() -> Option<u16> {
+    let text = std::fs::read_to_string(gateway::gateway_file()).ok()?;
+    let info: Value = serde_json::from_str(&text).ok()?;
+    info["controlPort"].as_u64().map(|p| p as u16)
+}
+
+/// One request to the gateway's loopback control surface. Short timeouts: the
+/// Settings window calls this on every render of the Mobile access section.
+fn gateway_control(method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+    let port = gateway_control_port().ok_or("gateway not running")?;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(700))
+        .map_err(|_| "gateway not running".to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut raw = String::new();
+    use std::io::Read;
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|e| e.to_string())?;
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .ok_or("malformed gateway response")?;
+    serde_json::from_str(body).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn gateway_status() -> Value {
+    match gateway_control("GET", "/local/status", None) {
+        Ok(v) => {
+            let mut v = v;
+            v["running"] = json!(true);
+            v
+        }
+        Err(e) => json!({ "running": false, "error": e }),
+    }
+}
+
+#[tauri::command]
+fn gateway_start(port: Option<u16>, url: Option<String>) -> Result<Value, String> {
+    if gateway_status()["running"] == json!(true) {
+        return Ok(gateway_status());
+    }
+    use std::process::{Command, Stdio};
+    let mut cmd;
+    #[cfg(debug_assertions)]
+    {
+        cmd = Command::new("cargo");
+        cmd.args(["run", "--quiet", "--bin", "agentbench-gateway"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"));
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let path = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or("no exe dir")?
+            .join(format!("agentbench-gateway{}", std::env::consts::EXE_SUFFIX));
+        cmd = Command::new(path);
+    }
+    if let Some(port) = port {
+        cmd.env("AGENTBENCH_GATEWAY_PORT", port.to_string());
+    }
+    if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
+        cmd.env("AGENTBENCH_GATEWAY_URL", url.trim());
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    cmd.spawn().map_err(|e| e.to_string())?;
+    // dev builds compile first; poll rather than guess a fixed delay
+    for _ in 0..240 {
+        std::thread::sleep(Duration::from_millis(500));
+        let status = gateway_status();
+        if status["running"] == json!(true) {
+            return Ok(status);
+        }
+    }
+    Err("gateway did not come up".into())
+}
+
+#[tauri::command]
+fn gateway_stop() -> Result<(), String> {
+    gateway_control("POST", "/local/quit", None).map(|_| ())
+}
+
+/// Mint a pairing code + QR for a phone. `url` is the address the phone should
+/// use; the QR carries it alongside the one-time code.
+#[tauri::command]
+fn gateway_pair(url: Option<String>) -> Result<Value, String> {
+    gateway_control("POST", "/local/code", Some(json!({ "url": url })))
+}
+
+#[tauri::command]
+fn gateway_cancel_pair() -> Result<Value, String> {
+    gateway_control("DELETE", "/local/code", None)
+}
+
+#[tauri::command]
+fn gateway_revoke(id: String) -> Result<Value, String> {
+    gateway_control("POST", "/local/revoke", Some(json!({ "id": id })))
+}
+
 /// Install/refresh the bundled plan-authoring skill into ~/.claude/skills so
 /// agents spawned in panes know how to publish visual plans.
 #[tauri::command]
@@ -729,6 +699,13 @@ pub fn run() {
             saved_panes,
             read_plan,
             list_plans,
+            save_projects,
+            gateway_status,
+            gateway_start,
+            gateway_stop,
+            gateway_pair,
+            gateway_cancel_pair,
+            gateway_revoke,
             list_slash_commands,
             list_sessions,
             read_file_base64,

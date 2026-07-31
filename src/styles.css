@@ -2963,3 +2963,77 @@ button.chat-question-opt.choice.on {
   border-top: 1px dashed var(--border);
   padding-top: 6px;
 }
+
+/* Settings → Mobile access */
+.btn-sm.danger {
+  color: rgb(var(--red));
+  border-color: rgba(var(--red), 0.35);
+}
+
+.mobile-urls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.mobile-url {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-head);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mobile-url.on {
+  border-color: rgba(var(--green), 0.5);
+}
+
+.mobile-url-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.mobile-url-kind {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.mobile-cmd {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  user-select: all;
+}
+
+/* The QR must stay high-contrast regardless of theme, so it keeps its own
+   white quiet zone rather than inheriting the panel background. */
+.mobile-qr {
+  width: 190px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.mobile-qr svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}

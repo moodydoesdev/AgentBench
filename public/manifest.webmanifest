@@ -1,0 +1,31 @@
+{
+  "name": "AgentBench",
+  "short_name": "AgentBench",
+  "description": "Monitor and control your AgentBench agents from anywhere.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08080b",
+  "theme_color": "#08080b",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

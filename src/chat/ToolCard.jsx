@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useTransport } from "../lib/TransportContext";
 import {
   ArrowsClockwise,
   Check,
@@ -49,6 +49,7 @@ const SPACE = " ";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function QuestionCard({ tool, paneId, canAnswer }) {
+  const { invoke } = useTransport();
   const questions = Array.isArray(tool.input?.questions) ? tool.input.questions : [];
   // one entry per question: { pick: number|null, set: number[], other: string }
   const [state, setState] = useState(() =>
@@ -124,7 +125,15 @@ function QuestionCard({ tool, paneId, canAnswer }) {
     try {
       for (let i = 0; i < questions.length; i++) {
         for (const keys of stepsFor(questions[i], at(i))) {
-          await invoke("write_pane", { id: paneId, data: keys });
+          // `answers` marks this as the write that resolves a pending
+          // question. The gateway claims the question on the first one, so a
+          // second client answering the same picker is refused rather than
+          // interleaving keystrokes into it.
+          await invoke("write_pane", {
+            id: paneId,
+            data: keys,
+            answers: i === 0,
+          });
           await sleep(160);
         }
       }

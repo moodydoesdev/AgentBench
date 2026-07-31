@@ -1,0 +1,359 @@
+---
+title: "AgentBench Mobile Command Center"
+brief: "Self-hosted mobile PWA to monitor, control, and review AgentBench agents from a phone"
+kind: "plan"
+localOnly: true
+---
+
+# AgentBench Mobile Command Center
+
+A self-hosted PWA that turns a phone into a full remote for **every machine running AgentBench**. One Fleet view spans all your workstations: see each project and agent with live status, read and drive any Claude chat (including answering its questions), get shown the agent's visual work as on-demand screenshots of the real app window, and live-test web projects by loading the actual dev server through a proxy — all without walking back to a computer.
+
+Concretely: Claude finishes a UI change in APP-Current and asks "where should the toggle live?" — the phone shows the question card, you tap an option, the answer replays into the agent's terminal, and a capture of the real app window appears in the Captures tab so you can see the result. The canvas above shows the four phone surfaces and the desktop pairing screen.
+
+<Callout id="status" tone="success">
+
+**Phase 1 is built and verified against a live workstation.** `agentbench-gateway` runs as a peer daemon, pairs a phone by QR, and serves the PWA; the phone renders the fleet grouped by machine and opens any agent's chat with the desktop's own components. Verified end to end against a real broker with 14 live agents: token auth (bad token 401s), the `hello` snapshot, filesystem reads, transcript `watch` returning 2.3 MB of real JSONL, the phase-1 op allowlist refusing `create`/`create-chat`/`kill`/`shutdown`, and the full UI driven in a phone-sized browser — pairing through the QR deep link, fleet, chat, and settings, with no console errors. Captures, spawning, previews, and Web Push remain phases 2 and 3.
+
+</Callout>
+
+### Architecture
+
+The entire design leans on one existing fact: the `agentbench-broker` daemon already speaks newline-delimited JSON over localhost TCP and is **multi-subscriber by design** (`src-tauri/src/broker/mod.rs:160-170` — every connected client receives all broadcast events and can issue every op). A new `agentbench-gateway` binary connects as a second subscriber, exactly like the desktop app does, and exposes an authenticated HTTPS + WebSocket surface to the phone. Every AgentBench machine runs its own gateway; the PWA holds one connection per machine and merges them into a single fleet. The broker, the desktop app, and the agents are untouched.
+
+<Diagram id="arch" caption="One new process per machine. The broker, desktop app, and agents run unchanged; the phone merges one connection per machine into a single fleet.">
+
+```html
+<div class="diagram-panel" data-rough style="display:flex;gap:28px;align-items:stretch;padding:16px">
+  <div class="diagram-box" style="flex:0 0 200px;display:flex;flex-direction:column;gap:10px;padding:12px">
+    <div class="diagram-muted">Your phone</div>
+    <div class="diagram-node">Command-center PWA<br /><small class="diagram-muted">reuses ChatView + plan renderer</small></div>
+    <div class="diagram-pill">installable · offline shell</div>
+  </div>
+  <div style="display:flex;flex-direction:column;justify-content:center;gap:8px">
+    <div class="diagram-pill">HTTPS + WSS</div>
+    <div class="diagram-pill">Bearer token</div>
+    <div class="diagram-muted" style="text-align:center">Tailscale tailnet</div>
+  </div>
+  <div class="diagram-box" style="flex:1;display:flex;flex-direction:column;gap:12px;padding:12px">
+    <div class="diagram-muted">Workstation</div>
+    <div class="diagram-node">agentbench-gateway <strong>(new)</strong><br /><small class="diagram-muted">REST + WebSocket · serves the PWA · xcap capture · preview proxy</small></div>
+    <div class="diagram-muted" style="text-align:center">NDJSON TCP — port from broker.json — same protocol the desktop app uses</div>
+    <div style="display:flex;gap:12px">
+      <div class="diagram-node" style="flex:1">agentbench-broker<br /><small class="diagram-muted">multi-subscriber, unchanged</small></div>
+      <div class="diagram-node" style="flex:1">Desktop app (Tauri)<br /><small class="diagram-muted">existing subscriber</small></div>
+    </div>
+    <div style="display:flex;gap:12px">
+      <div class="diagram-node" style="flex:1">Agent ptys + headless chat<br /><small class="diagram-muted">claude / codex / gemini</small></div>
+      <div class="diagram-node" style="flex:1">Project dev servers<br /><small class="diagram-muted">proxied to the phone</small></div>
+    </div>
+  </div>
+  <div class="diagram-box" style="flex:0 0 150px;display:flex;flex-direction:column;gap:8px;padding:12px;justify-content:center">
+    <div class="diagram-muted">Laptop</div>
+    <div class="diagram-node">Same stack<br /><small class="diagram-muted">own gateway, own tokens</small></div>
+    <div class="diagram-pill">one WS per machine</div>
+  </div>
+</div>
+```
+
+```css
+.diagram-panel { min-height: 300px; }
+```
+
+</Diagram>
+
+### The bets that are hard to reverse
+
+<Callout id="d-passthrough" tone="decision">
+
+**The remote wire protocol is the broker protocol.** WebSocket frames carry broker ops and events verbatim (`create`, `write`, `watch`, `interrupt`, `kill`, ... / `pane-output`, `transcript-lines`, `stream-json`, `ask`, `agent-event`, ...) inside a thin envelope, rather than inventing a second REST-shaped vocabulary that would drift from the broker. The transport shim translates the frontend's Tauri command names into these ops client-side (`write_pane` → `op:"write"`) — the same mapping `lib.rs` performs today. Filesystem reads that never touch the broker (`list_sessions`, `read_plan`, `list_plans`, `list_slash_commands`) travel as a parallel namespace on the same socket (`{ "fs": "list_sessions", ... }`), served by the lifted `fsdata.rs`. The gateway enforces a per-phase **op allowlist**: phase 1 exposes read-and-drive ops for existing panes (`write`, `watch`, `unwatch`, `interrupt`, `resize`, `list`, `saved`); `create`, `create-chat`, and `kill` unlock in phase 2 alongside the spawn UI. A device token never reaches more of the broker than the PWA has screens for.
+
+</Callout>
+
+<Callout id="d-registry" tone="decision">
+
+**The project registry moves to disk, with one writer.** Today projects exist only in the desktop webview's `localStorage["agentbench.projects"]` (`src/App.jsx:96`), which no other process can read. `App.jsx` gains a write-through mirror to `<config_dir>/projects.json` via a new `save_projects` Tauri command. The file schema is the existing shape — `path`, `name`, `color`, `commands` — plus `previewPort` and desktop-approved `captureTargets`, all edited in the desktop UI. **The file is desktop-owned and strictly read-only to the gateway**; anything the phone sets (auto-capture toggle, last-used capture target, device names) lives in a separate gateway-owned `<config_dir>/gateway-prefs.json`, so the two processes never write the same file and the desktop mirror can regenerate `projects.json` without destroying anyone else's state.
+
+</Callout>
+
+<Callout id="d-rust" tone="decision">
+
+**The gateway is a third Rust binary in `src-tauri`** (alongside `agentbench` and `agentbench-broker`), using axum + tokio. It ships beside the app exe like the broker already does, gets built by the existing tauri-action release matrix, and can reuse `broker::broker_file()` discovery and the liftable filesystem helpers in `lib.rs` directly. The broker itself stays std-thread and dependency-light; tokio lives only in the new binary. A Node sidecar was the alternative and loses on packaging, discovery reuse, and a second runtime to ship.
+
+</Callout>
+
+<Callout id="d-multibench" tone="decision">
+
+**Multi-bench from day one.** The PWA is a gateway-list app, not a single-server app: Settings holds one entry per machine (name, tailnet URL, device token), the shell opens one WebSocket per enabled machine, and Fleet groups projects under machine headers. Each machine stays sovereign — its own QR pairing, its own token store, its own revocation — so revoking or compromising the phone on one machine never touches another. Two consequences are load-bearing enough to fix now: gateway `/api/*` routes send CORS headers for the sibling gateway origins the user has added (the shell is served by whichever machine you installed from, and calls the others cross-origin with their own bearer tokens), and the `hello` snapshot leads with `machine` (hostname) and `protocolVersion`, because two machines updating AgentBench independently makes version skew a certainty — a mismatched shell must degrade to a banner, never misrender.
+
+</Callout>
+
+### Reuse before new code
+
+The PWA is a second Vite entry in the same repo, so the hard-won desktop chat machinery runs on the phone as-is:
+
+<Table
+  id="reuse-map"
+  columns={["Existing piece", "Where", "Role on mobile"]}
+  rows={[
+    ["Broker multi-subscriber NDJSON", "src-tauri/src/broker/mod.rs:160", "Gateway connects as a plain second client; zero broker changes"],
+    ["Chat message model + reducer", "src/chat/records.js", "Renders transcripts and stream-json identically on the phone"],
+    ["Question cards + answer keystrokes", "src/chat/ToolCard.jsx:92-121", "Answering from the phone replays the same synthesized picker keys"],
+    ["ChatView (transcript + stream modes)", "src/chat/ChatView.jsx", "The mobile chat screen, behind a transport shim"],
+    ["Plan MDX renderer", "src/plan/ (registry.js, useMdx.js)", "Read plans from the phone in phase 2"],
+    ["Status model + project rollup", "src/AgentPane.jsx:38, src/App.jsx:916", "Fleet screen dots and ordering"],
+    ["broker.json discovery", "src-tauri/src/broker/mod.rs:25", "How the gateway finds the broker port"],
+    ["Filesystem commands (list_sessions, read_plan, ...)", "src-tauri/src/lib.rs", "Lifted into a shared module both lib.rs and the gateway call"],
+  ]}
+/>
+
+The one refactor that unlocks all of this: `ChatView` and friends currently import Tauri's `invoke`/`listen` directly. A ~40-line transport seam (below) makes the backend pluggable — Tauri IPC on desktop, WebSocket on the phone — with no other changes to chat code. It is also what makes multi-bench nearly free: the mobile shell instantiates one transport per configured gateway and hands each component the transport for the machine that owns its pane; chat code stays single-connection and never learns that other machines exist.
+
+<Callout id="ask-arbitration" tone="info">
+
+**One answer per question.** The desktop and the phone can both see a pending ask, and both resolve it by synthesizing picker keystrokes into the same pty. The gateway claims a question on the first answering write and refuses later ones with "already being handled", and the `turn` event that fires when the agent resumes clears the claim and flips every client's card to answered.
+
+The claim covers phone-versus-phone exactly. It cannot cover phone-versus-desktop: desktop keystrokes go straight from the app to the broker, and the broker broadcasts no event for a write, so a second client is invisible to the gateway. Closing that gap needs a broker-side signal (an `input` broadcast, or moving ask resolution behind a dedicated op) — worth doing when questions are answered from two places often enough to matter, and not worth a per-keystroke broadcast before then.
+
+</Callout>
+
+### Gateway API
+
+Small on purpose. Everything stateful flows through the WebSocket as broker passthrough; REST covers auth, files, and captures.
+
+<Endpoint id="ep-pair" method="POST" path="/api/pair" summary="Exchange a pairing code for a device token" auth="none (one-time code)" request={{
+  "contentType": "application/json",
+  "example": "{ \"code\": \"4821-9937\", \"deviceName\": \"Pixel 9\" }"
+}} responses={[
+  { "status": "200", "description": "Paired", "example": "{ \"token\": \"ab_9f2c...\", \"gatewayVersion\": \"0.1.16\" }" },
+  { "status": "403", "description": "Bad or expired code" }
+]}>
+
+The desktop settings window shows a QR containing the gateway URL and a 10-minute code. The returned bearer token is long-lived, per-device, stored hashed in `<config_dir>/gateway-tokens.json`, and revocable from the desktop.
+
+</Endpoint>
+
+<Endpoint id="ep-ws" method="GET" path="/api/ws" summary="WebSocket bridge — broker ops and events, passthrough" auth="Device token, query string (browsers cannot set headers on a WS handshake)" responses={[
+  { "status": "101", "description": "Upgraded", "example": "client -> { \"id\": 7, \"op\": \"write\", \"pane\": 3, \"data\": \"...\" }\nserver -> { \"id\": 7, \"ok\": true }\nserver -> { \"ev\": \"transcript-lines\", \"pane\": 3, \"lines\": [\"...\"] }" },
+  { "status": "401", "description": "Missing or revoked token" }
+]}>
+
+The browser WebSocket API cannot attach an `Authorization` header to a handshake, so the token rides the query string on this route alone — the same device token, verified the same way, inside the same TLS session. Everything else is header-only.
+
+Client frames carry a client-chosen `id`; the gateway **rewrites ids through a per-connection mapping table** before forwarding on its single NDJSON socket — multiple phones plus the gateway's own internal requests share that socket, so client-chosen ids cannot ride it raw. Responses route back under the original id. Every broker broadcast event fans out to all connected phones.
+
+**The reconnect contract is part of the wire format.** Phones drop the socket every time the screen locks, so: on every (re)connect the server sends a `hello` snapshot — `machine` name and `protocolVersion` first, then the pane list with cwd/harness (broker `list`), per-pane status from the gateway's own event tracking, and any unresolved `ask` cards — so the Fleet screen never has to reconstruct state from events it missed, and a version-skewed shell knows to degrade before rendering anything. The client then re-issues `watch` for each open chat; the broker's existing snapshot-plus-offset handshake (`watch_transcript`, `mod.rs:660`) and `transcript-reset` semantics make transcript resume exact, and `pane-output` scrollback replays from the broker's 512KB buffer just as it does when the desktop reattaches. `pane-output` stays base64, so a future terminal view on the phone (xterm.js is already a dependency) needs nothing new.
+
+</Endpoint>
+
+<Endpoint id="ep-capture" method="POST" path="/api/capture" summary="Capture a window, monitor, or region on the workstation" auth="Bearer token" request={{
+  "contentType": "application/json",
+  "example": "{ \"target\": { \"kind\": \"window\", \"titleMatch\": \"APP-Current\" }, \"paneId\": 3 }"
+}} responses={[
+  { "status": "200", "description": "Captured", "example": "{ \"id\": \"cap_012\", \"url\": \"/api/captures/cap_012.png\", \"width\": 1912, \"height\": 1040 }" },
+  { "status": "404", "description": "No window matched titleMatch" }
+]}>
+
+Targets: `window` (title substring match), `monitor` (index), or `region` (x, y, w, h — savable per project as a named preset). PNGs land in `<config_dir>/captures/`, pruned after 48h, served by id.
+
+</Endpoint>
+
+<Endpoint id="ep-show" method="POST" path="/local/show" summary="Agent-triggered capture (localhost only)" auth="none — bound to 127.0.0.1, like the existing hook server" request={{
+  "contentType": "application/json",
+  "example": "{ \"paneId\": 3, \"target\": { \"kind\": \"window\", \"titleMatch\": \"APP-Current\" }, \"note\": \"Dark mode toggle, settings page\" }"
+}} responses={[
+  { "status": "200", "description": "Captured and pushed to paired phones" }
+]}>
+
+Served from a separate listener bound to `127.0.0.1`, discovered via `<config_dir>/gateway.json` (written just like `broker.json`); a small new `agentbench-show` skill (installed the same way `sync_plan_skill` installs the plan skill) teaches agents to curl this after visual changes — that is the "show me its work" loop. This is deliberately **narrower** than the hook server's trust model, because pixels leave the machine: an unauthenticated local caller may only capture targets that were **pre-approved on the desktop for that project** (the `captureTargets` list in `projects.json` — window-title patterns and saved regions). An arbitrary `titleMatch` from an agent is rejected; your password manager is not a valid target just because a local process asked.
+
+</Endpoint>
+
+<Endpoint id="ep-preview" method="POST" path="/api/preview/{project}" summary="Open a dedicated-port preview proxy for a project" auth="Bearer token" responses={[
+  { "status": "200", "description": "Proxy listening", "example": "{ \"url\": \"http://connor-pc.tailnet.ts.net:8451/?pt=eyJ...\" }" },
+  { "status": "502", "description": "Dev server not running on previewPort" }
+]}>
+
+Starts (or returns) a **transparent proxy on its own dedicated port** to `localhost:previewPort`, WebSocket upgrade passed through for HMR. Dedicated ports are the committed mechanism — not path-prefixing — because dev servers emit absolute URLs (`/@vite/client`, `/src/main.jsx`) that 404 under a `/preview/{project}/` prefix, and fixing that means either fragile HTML rewriting in the proxy or a `base` change that disturbs the desktop dev workflow. A transparent proxy on its own origin needs zero dev-server configuration. The `pt` query token is single-use and short-lived; the first request exchanges it for an HttpOnly cookie **scoped to that preview origin only** — preview cookies are never valid on `/api/*` (see Security). The PWA opens previews in a new tab rather than an iframe, which also sidesteps mixed-content rules for plain-HTTP-over-tailnet.
+
+</Endpoint>
+
+### New files and the one seam
+
+<FileTree
+  id="files"
+  title="Files touched"
+  entries={[
+    { path: "src-tauri/src/bin/gateway.rs", change: "added", note: "Phase 1 — entry point: two listeners, routes, PWA serving, QR payload" },
+    { path: "src-tauri/src/gateway/mod.rs", change: "added", note: "Phase 1 — broker link with reconnect, hello snapshot, op allowlist, ask claims" },
+    { path: "src-tauri/src/gateway/tokens.rs", change: "added", note: "Phase 1 — hashed device tokens, one-shot pairing codes, revocation" },
+    { path: "src-tauri/src/fsdata.rs", change: "added", note: "Phase 1 — list_sessions/read_plan/list_plans/list_slash_commands lifted from lib.rs, shared with the gateway" },
+    { path: "src-tauri/src/lib.rs", change: "modified", note: "Phase 1 — save_projects + gateway_{status,start,stop,pair,revoke} commands; delegates to fsdata" },
+    { path: "src-tauri/Cargo.toml", change: "modified", note: "Phase 1 — [[bin]] gateway; axum, tokio, tower-http, sha2, qrcodegen" },
+    { path: "src/lib/transport.js", change: "added", note: "Phase 1 — invoke/listen seam: Tauri impl + reconnecting WebSocket impl" },
+    { path: "src/lib/TransportContext.jsx", change: "added", note: "Phase 1 — provides the transport; defaults to Tauri so desktop is unchanged" },
+    { path: "src/mobile/MobileApp.jsx", change: "added", note: "Phase 1 — shell: Fleet / Activity / Settings, QR deep-link pairing" },
+    { path: "src/mobile/gateways.js", change: "added", note: "Phase 1 — gateway list; one transport per machine; event folding" },
+    { path: "src/mobile/mobile.css", change: "added", note: "Phase 1 — phone shell styles on the app's existing theme tokens" },
+    { path: "mobile.html", change: "added", note: "Phase 1 — second Vite entry, served at / by the gateway" },
+    { path: "public/manifest.webmanifest", change: "added", note: "Phase 1 — PWA manifest + icons" },
+    { path: "public/sw.js", change: "added", note: "Phase 1 — shell-only service worker (never caches /api/)" },
+    { path: "vite.config.js", change: "modified", note: "Phase 1 — multi-entry build" },
+    { path: "src/SettingsWindow.jsx", change: "modified", note: "Phase 1 — Mobile access section: gateway lifecycle, address, QR, devices" },
+    { path: "src/App.jsx", change: "modified", note: "Phase 1 — mirror project registry to projects.json on change" },
+    { path: "src/chat/ChatView.jsx", change: "modified", note: "Phase 1 — transport seam; placeholder + allowImages props for the phone" },
+    { path: "src/chat/ToolCard.jsx", change: "modified", note: "Phase 1 — transport seam; marks the answering write for arbitration" },
+    { path: "src/chat/useDictation.js", change: "modified", note: "Phase 1 — no-ops outside the Tauri webview so the PWA does not throw" },
+    { path: "src-tauri/src/gateway/capture.rs", change: "added", note: "Phase 2 — xcap window/monitor/region capture" },
+    { path: "src-tauri/src/gateway/proxy.rs", change: "added", note: "Phase 3 — dev-server reverse proxy + WS passthrough" },
+    { path: "skills/agentbench-show/SKILL.md", change: "added", note: "Phase 2 — teaches agents to POST /local/show after visual work" },
+  ]}
+/>
+
+<TabsBlock
+  id="key-files"
+  orientation="vertical"
+  tabs={[
+    {
+      id: "tab-gateway",
+      label: "bin/gateway.rs",
+      blocks: [
+        {
+          id: "tab-gateway-code",
+          type: "annotated-code",
+          data: {
+            filename: "src-tauri/src/bin/gateway.rs",
+            language: "rust",
+            code: "#[tokio::main]\nasync fn main() {\n    // Daemon peer of the broker: spawned detached (the connect_or_spawn pattern,\n    // lib.rs:101), survives the desktop app closing, reconnects if the broker restarts.\n    let link = BrokerLink::connect_with_retry(broker::broker_file()).await;\n    let state = Gateway::new(link, TokenStore::load(), CaptureStore::new());\n\n    let local = Router::new() // 127.0.0.1 only, agent-facing\n        .route(\"/local/show\", post(agent_show));\n\n    let public = Router::new() // the COMPLETE unauthenticated surface\n        .route(\"/api/pair\", post(pair))\n        .fallback_service(ServeDir::new(pwa_dist())); // shell, manifest, sw.js — no data\n\n    let secured = Router::new()\n        .route(\"/api/ws\", get(ws_bridge))\n        .route(\"/api/capture\", post(capture))\n        .route(\"/api/preview/{project}\", post(open_preview))\n        .layer(from_fn_with_state(state.clone(), require_token));\n\n    write_gateway_file(&state); // <config_dir>/gateway.json, like broker.json\n    join!(serve(lan_listener(8443), public.merge(secured)), serve(loopback_listener(), local));\n}",
+            annotations: [
+              { lines: "3-5", label: "Lifetime is a decision", note: "The gateway is a peer daemon, not a desktop child — closing the desktop app must not kill phone access, and a broker restart triggers reconnect, not a crash. The desktop Settings toggle starts/stops it; it discovers the broker via broker.json (mod.rs:25) like everyone else." },
+              { lines: "11-13", label: "Bootstrap allowlist, in full", note: "A phone must load the shell and POST /api/pair before it has a token, so exactly these — pairing plus static assets containing no data — skip auth. Auth-exemption lists are where security bugs live; this list is the whole list." },
+              { lines: "15-19", label: "Everything with data 401s", note: "Agents run --dangerously-skip-permissions, so every stateful route requires a valid device token. Preview proxy ports are separate origins with their own scoped cookies." },
+              { lines: "8-9", label: "Loopback, but narrowed", note: "Agent-triggered captures skip auth like the hook server, but only against desktop-approved targets — see /local/show." },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: "tab-transport",
+      label: "lib/transport.js",
+      blocks: [
+        {
+          id: "tab-transport-code",
+          type: "annotated-code",
+          data: {
+            filename: "src/lib/transport.js",
+            language: "js",
+            code: "// One seam so the same chat code runs on desktop and phone.\nexport function tauriTransport() {\n  return {\n    invoke: (cmd, args) => invoke(cmd, args),          // @tauri-apps/api\n    listen: (ev, cb) => listen(ev, cb),\n  };\n}\n\nexport function wsTransport(baseUrl, token) {\n  const ws = reconnectingSocket(`${baseUrl}/api/ws`, token);\n  const subs = new Map(); // ev name -> Set<cb>\n  ws.onframe = (f) => f.ev ? emit(subs, f.ev, f) : settle(f.id, f);\n  return {\n    invoke: (cmd, args) => request(ws, translate(cmd, args)), // write_pane -> {op:\"write\"}, list_sessions -> {fs:\"list_sessions\"}\n    listen: (ev, cb) => subscribe(subs, ev, cb),\n  };\n}",
+            annotations: [
+              { lines: "1", label: "The unlock", note: "ChatView, records.js, and ToolCard currently import invoke/listen directly. Swapping those imports for an injected transport is the only change desktop chat code needs." },
+              { lines: "14", label: "One wire vocabulary", note: "translate() maps Tauri command names to broker ops (the same mapping lib.rs does) or to the fs namespace for filesystem reads. The wire itself carries only broker ops + fs requests — command names never cross it." },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: "tab-vite",
+      label: "vite.config.js",
+      blocks: [
+        {
+          id: "tab-vite-code",
+          type: "annotated-code",
+          data: {
+            filename: "vite.config.js",
+            language: "js",
+            code: "export default defineConfig({\n  build: {\n    rollupOptions: {\n      input: {\n        main: \"index.html\",     // desktop webview (unchanged)\n        mobile: \"mobile.html\",  // phone PWA, served by the gateway\n      },\n    },\n  },\n});",
+            annotations: [
+              { lines: "6", note: "Same repo, same components, second bundle. The gateway serves dist/ so the phone always gets the version matching the workstation." },
+            ],
+          },
+        },
+      ],
+    },
+  ]}
+/>
+
+### Show me its work — captures
+
+Capture runs in the gateway with the `xcap` crate (cross-platform window/monitor capture; region = monitor capture + crop). Three triggers, one pipeline:
+
+1. **Manual** — the Refresh button on the Show-me screen calls `POST /api/capture`.
+2. **Agent-triggered** — the `agentbench-show` skill has the agent curl `POST /local/show` after visual work, with a note; the capture lands in the pane's chat feed and the Captures tab.
+3. **Automatic** — per project, "auto-capture when agent finishes": the gateway listens for the broker's `agent-event done` broadcast and fires the project's saved target.
+
+"Live · 1 fps" reuses the same path as an MJPEG stream (`multipart/x-mixed-replace`) — good enough to watch an agent poke at a desktop app, without going anywhere near real remote desktop.
+
+<Callout id="capture-scope" tone="info">
+
+Two capture paths, two rules. A **phone-initiated** capture (authed device token) may target anything — you are the authenticated owner of the machine. An **agent-initiated** capture via `/local/show` may only hit desktop-approved `captureTargets` from `projects.json`. Approved targets and `previewPort` are edited on the desktop (run-commands dialog); phone-side preferences (auto-capture toggle, last-used target) live in the gateway-owned `gateway-prefs.json`. Window matching is by title substring, which is fragile for renamed windows — the Show-me screen falls back to a window picker listing current titles when a match fails.
+
+</Callout>
+
+### Live testing on the phone
+
+For web projects, the phone loads the real dev server through a gateway proxy, so HMR, real data, and real interactions all work — genuine testing, not a picture of testing. The committed mechanism is a **transparent proxy on a dedicated port per project** (see `POST /api/preview/{project}`): the dev server needs zero configuration beyond `previewPort` in the registry, absolute asset URLs work untouched, and each preview is its own browser origin with its own scoped cookie. Desktop apps are covered by captures and the 1 fps live view instead — streaming interactive desktop control is explicitly out of scope.
+
+### Security
+
+<Callout id="risk" tone="risk">
+
+This gateway is a remote control for agents that run with `--dangerously-skip-permissions` on your workstation. Anyone who reaches it can run arbitrary code as you. There is currently **zero auth anywhere in AgentBench** — both existing servers rely on binding 127.0.0.1 — so the gateway must bring its own: per-device bearer tokens from QR pairing, stored hashed, revocable; all phone-facing routes 401 without one. The transport is **Tailscale**: `tailscale serve` fronts the gateway with trusted HTTPS on the tailnet, opens no ports, works away from home, and provides the trusted-certificate context browsers demand for service workers and install-to-home-screen. The tailnet is a second wall, not a substitute for the token — both are required. A publicly port-forwarded gateway is a non-goal and the settings UI should say so.
+
+</Callout>
+
+<Table
+  id="trust-table"
+  columns={["Surface", "Binding", "Auth"]}
+  rows={[
+    ["Broker NDJSON + hook server (existing)", "127.0.0.1", "None — unchanged"],
+    ["Gateway /local/show", "127.0.0.1", "None, but restricted to desktop-approved capture targets"],
+    ["Gateway /api/pair, /api/health + static PWA shell", "Tailnet (via tailscale serve)", "None by design — the complete bootstrap allowlist; /api/health reports only a machine name and protocol version so a phone can tell 'wrong URL' from 'not paired'"],
+    ["Gateway /api/ws", "Tailnet (via tailscale serve)", "Device token in the handshake query string; cookies are never accepted"],
+    ["Gateway /api/capture, /api/preview", "Tailnet (via tailscale serve)", "Bearer token only — cookies are never accepted on /api/*"],
+    ["Preview proxy ports (one origin per project)", "Tailnet (via tailscale serve)", "Single-use signed query token, exchanged for a cookie scoped to that origin"],
+    ["Capture PNGs + MJPEG live view", "Tailnet (via tailscale serve)", "Short-lived signed query tokens minted over the WS (img tags cannot send Bearer headers)"],
+  ]}
+/>
+
+<Callout id="sw-note" tone="info">
+
+**Why the split matters:** preview pages execute dev-server JavaScript that agents wrote. If a broadly-scoped auth cookie existed, that code could call `/api/ws` cookie-authenticated and drive the broker. Per-origin preview cookies plus header-only auth on `/api/*` closes that hole. Relatedly, the service worker caches only the public shell (which contains no data), so caching is safe and a revoked device simply finds every data call returning 401 and lands on the pairing screen.
+
+</Callout>
+
+### Rollout
+
+<Table
+  id="phases"
+  columns={["Phase", "Ships", "Proves"]}
+  rows={[
+    ["1 — Control", "Gateway binary, pairing + tokens, projects.json mirror, transport seam, PWA with machine-grouped Fleet + Chat (read, send, answer questions on existing panes) + in-app activity. Multi-bench: gateway list in Settings, per-machine pairing, CORS for sibling origins, versioned hello. Op allowlist: write / watch / unwatch / interrupt / resize / list / saved + fs reads", "The passthrough protocol, the reconnect contract, the multi-machine fleet, and the reuse bet, end to end from a real phone"],
+    ["2 — Show me", "xcap capture engine, Captures tab, /local/show + agentbench-show skill, auto-capture on done, plan viewing on the phone, spawning new agents from the phone (create / create-chat / kill join the allowlist, built-in harnesses only)", "The visual review loop, and starting work without the desk"],
+    ["3 — Live", "Dedicated-port preview proxies with HMR, Live 1 fps MJPEG, Web Push (VAPID) for done / needs-input", "Testing from the couch"],
+  ]}
+/>
+
+Notifications are in-app (the Activity tab and badge) until **Web Push** lands in phase 3: VAPID keys generated at first gateway start, push subscriptions stored per paired device, real alerts for done / needs-input while the PWA is closed. The gateway needs outbound internet to reach the browser push services, which a tailnet-connected workstation already has.
+
+Non-goals for all phases: interactive remote desktop (use Parsec/RDP), multi-user accounts, any hosted relay service, native iOS/Android apps, and exposing the gateway to the public internet.
+
+### Verification
+
+<Checklist
+  id="verify"
+  items={[
+    { id: "v-build", label: "cargo build --bins builds agentbench, agentbench-broker, agentbench-gateway; npm run build emits both entries" },
+    { id: "v-pair", label: "Desktop: enable Mobile access, QR renders; phone: scan, pair, token persists across PWA restarts" },
+    { id: "v-chat", label: "Real phone on the tailnet: Fleet shows live projects; send a message to a Claude pane and watch the reply stream; transcript matches the desktop view" },
+    { id: "v-ask", label: "Trigger an AskUserQuestion on desktop, answer it from the phone, confirm the TUI picker resolved correctly (the keystroke-synthesis path)" },
+    { id: "v-capture", label: "POST /api/capture with a window target returns a PNG; an agent curling /local/show surfaces the capture in the Captures tab with its note" },
+    { id: "v-preview", label: "Start the marketing-site dev server, open /preview on the phone, edit a file on desktop, HMR updates the phone" },
+    { id: "v-auth", label: "Request without a token 401s; a revoked device 401s and its cached PWA shell lands on the pairing screen; /local/show refuses non-loopback connections and non-approved targets; a preview-origin cookie replayed against /api/ws is rejected" },
+    { id: "v-reconnect", label: "Lock the phone mid-stream for a minute, unlock: hello snapshot restores fleet status and pending asks, transcript resumes with no gap and no duplicates" },
+    { id: "v-arbitration", label: "With a question pending, type in the pane on desktop, then answer from the phone: the phone answer is rejected with the already-being-handled state" },
+    { id: "v-multibench", label: "Pair two machines: Fleet groups projects under machine headers with independent statuses; drive a pane on each; revoke the phone on machine A and confirm machine B is untouched; force a protocolVersion mismatch and confirm the degraded banner, not a broken UI" },
+  ]}
+/>
+

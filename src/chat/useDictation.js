@@ -11,6 +11,12 @@ import { invoke } from "@tauri-apps/api/core";
 // full text each time and should replace, never append. The final result can
 // still differ from the last partial, because ending the audio lets the
 // recognizer re-score the tail.
+// Dictation is driven by the desktop's Rust side, so it only exists inside the
+// Tauri webview. In the mobile PWA these APIs are absent — calling them throws
+// on every mount — so the hook reports itself unavailable and the mic button
+// simply never appears.
+const HAS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
 export default function useDictation({ onPartial, onFinal, onError } = {}) {
   const [available, setAvailable] = useState(false);
   const [listening, setListening] = useState(false);
@@ -24,10 +30,12 @@ export default function useDictation({ onPartial, onFinal, onError } = {}) {
   handlers.current = { onPartial, onFinal, onError };
 
   useEffect(() => {
+    if (!HAS_TAURI) return;
     invoke("dictation_available").then(setAvailable).catch(() => {});
   }, []);
 
   useEffect(() => {
+    if (!HAS_TAURI) return;
     const subs = [
       listen("dictation://partial", (e) => {
         if (mine.current) handlers.current.onPartial?.(e.payload.text);

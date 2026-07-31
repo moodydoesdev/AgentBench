@@ -14,6 +14,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "agentbench-broker"
 path = "src/bin/broker.rs"
 
+[[bin]]
+name = "agentbench-gateway"
+path = "src/bin/gateway.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -30,6 +34,13 @@ portable-pty = "0.8"
 tiny_http = "0.12"
 base64 = "0.22"
 dirs = "6"
+# mobile gateway (agentbench-gateway binary only)
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+futures-util = "0.3"
+sha2 = "0.10"
+qrcodegen = "1.8"
 
 # Chat-tab dictation: capture on AVAudioEngine, transcribe with the same
 # on-device recognizer macOS dictation uses. No API key, no audio leaves the

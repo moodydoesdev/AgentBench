@@ -13,6 +13,17 @@ export default defineConfig(async () => ({
       "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
+  build: {
+    rollupOptions: {
+      input: {
+        // desktop webview
+        main: path.resolve(import.meta.dirname, "index.html"),
+        // mobile command center, served by agentbench-gateway from the same
+        // dist/ so the phone always gets the build matching its workstation
+        mobile: path.resolve(import.meta.dirname, "mobile.html"),
+      },
+    },
+  },
   optimizeDeps: {
     // lazily imported by the plan pane; pre-bundle to avoid dev-server
     // discovery reloads on first plan open
