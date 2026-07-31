@@ -146,6 +146,10 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem("agentbench.projects", JSON.stringify(projects));
+    // Mirror to disk so the mobile gateway can name projects — localStorage
+    // lives in this webview and no other process can read it. The file is
+    // desktop-owned: the gateway only ever reads it.
+    invoke("save_projects", { projects }).catch(() => {});
   }, [projects]);
 
   useEffect(() => {

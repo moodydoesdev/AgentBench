@@ -1,6 +1,5 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { useTransport } from "../lib/TransportContext";
 import { ArrowUp, Bell, CaretUp, ImageSquare, Microphone, Robot, Stop, Terminal, X } from "@phosphor-icons/react";
 import { LogoMark } from "../components/Logo";
 import useDictation from "./useDictation";
@@ -189,7 +188,16 @@ export default memo(function ChatView({
   onNeedsTerm,
   status,
   register,
+  // The phone has no drag-and-drop and a much narrower composer, so it passes
+  // a shorter prompt instead of the desktop's hint-laden one.
+  placeholder,
+  // Staging an image needs the desktop's save_pasted_image command to write it
+  // somewhere Claude can read by path. Without it the picker would take a
+  // photo and then quietly drop it, so the phone hides the affordance.
+  allowImages = mode === "transcript",
 }) {
+  // Desktop: Tauri IPC. Phone: the WebSocket to the machine owning this pane.
+  const { invoke, listen } = useTransport();
   const storeRef = useRef(null);
   if (!storeRef.current) storeRef.current = createChatStore();
   const [, forceRender] = useReducer((n) => n + 1, 0);
@@ -437,7 +445,9 @@ export default memo(function ChatView({
       dead = true;
       unlistens.forEach((u) => u.then((f) => f()));
     };
-  }, [id, mode]);
+    // the transport is part of the identity of "which stream is this": a
+    // mobile pane re-subscribes when its gateway connection is replaced
+  }, [id, mode, invoke, listen]);
 
   useEffect(() => {
     register?.({ focus: () => inputRef.current?.focus() });
@@ -460,7 +470,7 @@ export default memo(function ChatView({
     // path (deterministic), instead of us racing the OS clipboard. If a write
     // fails, fall through and at least send the text.
     let paths = [];
-    if (imgs.length && mode === "transcript") {
+    if (imgs.length && allowImages) {
       try {
         paths = await Promise.all(
           imgs.map((im) => invoke("save_pasted_image", { dataUrl: im.url })),
@@ -529,7 +539,7 @@ export default memo(function ChatView({
   // trip. If the clipboard also has text, let that paste normally; only
   // swallow the paste when it's image-only (nothing to type).
   const onPaste = (ev) => {
-    if (mode !== "transcript") return;
+    if (!allowImages) return;
     const items = Array.from(ev.clipboardData?.items ?? []);
     const imageItems = items.filter((it) => it.type.startsWith("image/"));
     if (!imageItems.length) return;
@@ -539,7 +549,7 @@ export default memo(function ChatView({
   };
 
   const onDrop = (ev) => {
-    if (mode !== "transcript") return;
+    if (!allowImages) return;
     const files = Array.from(ev.dataTransfer?.files ?? []).filter((f) =>
       f.type.startsWith("image/"),
     );
@@ -661,7 +671,7 @@ export default memo(function ChatView({
           className={`chat-composer-card${dragOver ? " drag-over" : ""}`}
           onDrop={onDrop}
           onDragOver={(ev) => {
-            if (mode !== "transcript") return;
+            if (!allowImages) return;
             if (Array.from(ev.dataTransfer?.items ?? []).some((i) => i.kind === "file")) {
               ev.preventDefault();
               setDragOver(true);
@@ -718,9 +728,10 @@ export default memo(function ChatView({
             ref={inputRef}
             rows={1}
             placeholder={
-              mode === "transcript"
+              placeholder ??
+              (mode === "transcript"
                 ? "Message Claude…  ( / for commands · paste or drop an image )"
-                : "Message Claude…  ( / for commands )"
+                : "Message Claude…  ( / for commands )")
             }
             onPaste={onPaste}
             onKeyDown={(ev) => {
@@ -817,7 +828,7 @@ export default memo(function ChatView({
                     ? "working — esc to stop"
                     : "enter to send"}
             </span>
-            {mode === "transcript" && (
+            {allowImages && (
               <>
                 <input
                   ref={fileInputRef}

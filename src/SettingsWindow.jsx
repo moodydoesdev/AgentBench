@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   BellSimple,
+  DeviceMobile,
   Keyboard,
   PaintBrushBroad,
   Robot,
@@ -171,10 +172,234 @@ function Slider({ value, min = 0, max = 1, step = 0.05, onChange, onCommit }) {
   );
 }
 
+/**
+ * Settings → Mobile access.
+ *
+ * Runs the gateway daemon that a paired phone talks to. The gateway is a peer
+ * of the broker, not a child of this window: it keeps running when the app
+ * closes, which is the whole point of being able to check on agents from
+ * elsewhere. Pairing is per machine, so revoking a phone here never touches
+ * another workstation.
+ */
+function MobileAccess() {
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(null); // "start" | "stop" | "pair"
+  const [pairing, setPairing] = useState(null); // { qr, code, url, expiresAt }
+  const [error, setError] = useState(null);
+  const [chosenUrl, setChosenUrl] = useState("");
+
+  const refresh = () =>
+    invoke("gateway_status")
+      .then((s) => {
+        setStatus(s);
+        if (!chosenUrl && s?.urls?.length) setChosenUrl(s.urls[0].url);
+      })
+      .catch(() => setStatus({ running: false }));
+
+  useEffect(() => {
+    refresh();
+    // the pairing code expires on its own; keep the panel honest while open
+    const t = setInterval(refresh, 4000);
+    return () => clearInterval(t);
+  }, []);
+
+  const running = status?.running === true;
+  const urls = status?.urls ?? [];
+  const devices = status?.devices ?? [];
+  const tailscale = urls.find((u) => u.kind === "tailscale");
+
+  const start = async () => {
+    setBusy("start");
+    setError(null);
+    try {
+      const s = await invoke("gateway_start", { url: chosenUrl || null });
+      setStatus(s);
+      if (!chosenUrl && s?.urls?.length) setChosenUrl(s.urls[0].url);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const stop = async () => {
+    setBusy("stop");
+    try {
+      await invoke("gateway_stop");
+      setPairing(null);
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const pair = async () => {
+    setBusy("pair");
+    setError(null);
+    try {
+      setPairing(await invoke("gateway_pair", { url: chosenUrl || null }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Mobile access</h2>
+
+      <Card title="Gateway">
+        <Row
+          title={running ? "Running" : "Stopped"}
+          sub={
+            running
+              ? status?.brokerConnected === false
+                ? "Reachable, but not connected to the broker — start an agent or restart the broker."
+                : `Serving the mobile app as ${status?.machine ?? "this machine"}.`
+              : "Start it to control this machine's agents from your phone."
+          }
+        >
+          <button
+            className="btn-sm"
+            disabled={busy != null}
+            onClick={running ? stop : start}
+          >
+            {busy === "start"
+              ? "Starting…"
+              : busy === "stop"
+                ? "Stopping…"
+                : running
+                  ? "Stop"
+                  : "Start"}
+          </button>
+        </Row>
+
+        {running && urls.length > 0 && (
+          <Row
+            title="Address"
+            sub="The address your phone uses. Tailscale is recommended: it gives trusted HTTPS with no open ports and works away from home."
+            stack
+          >
+            <div className="mobile-urls">
+              {urls.map((u) => (
+                <button
+                  key={u.url}
+                  className={`mobile-url ${chosenUrl === u.url ? "on" : ""}`}
+                  onClick={() => setChosenUrl(u.url)}
+                >
+                  <span className="mobile-url-text">{u.url}</span>
+                  <span className="mobile-url-kind">{u.kind}</span>
+                </button>
+              ))}
+            </div>
+          </Row>
+        )}
+
+        {running && tailscale && chosenUrl === tailscale.url && (
+          <Row
+            title="One-time Tailscale setup"
+            sub="Run this once on this machine so the address above serves over HTTPS. Install Tailscale on your phone and sign in with the same account — there is no QR shortcut for joining a tailnet."
+            stack
+          >
+            <code className="mobile-cmd">{tailscale.serveCommand}</code>
+          </Row>
+        )}
+
+        {error && <Row title="Error" sub={error} />}
+      </Card>
+
+      {running && (
+        <Card title="Pair a phone">
+          {!pairing ? (
+            <Row
+              title="Scan to pair"
+              sub="Generates a QR code holding this machine's address and a one-time code that expires in 10 minutes."
+            >
+              <button className="btn-sm" disabled={busy != null} onClick={pair}>
+                {busy === "pair" ? "Generating…" : "Show QR code"}
+              </button>
+            </Row>
+          ) : (
+            <>
+              <Row
+                title="Scan with your phone's camera"
+                sub="It opens the AgentBench app and pairs automatically. Anyone who scans this gets full control of this machine's agents — treat it like a password."
+                stack
+              >
+                <div
+                  className="mobile-qr"
+                  dangerouslySetInnerHTML={{ __html: pairing.qr }}
+                />
+              </Row>
+              <Row title="Or type it in" sub={`Code ${pairing.code} · ${pairing.url}`}>
+                <button
+                  className="btn-sm"
+                  onClick={() => {
+                    setPairing(null);
+                    invoke("gateway_cancel_pair").catch(() => {});
+                  }}
+                >
+                  Done
+                </button>
+              </Row>
+            </>
+          )}
+        </Card>
+      )}
+
+      {running && (
+        <Card title="Paired devices">
+          {devices.length === 0 && (
+            <Row title="No devices" sub="Nothing is paired with this machine yet." />
+          )}
+          {devices.map((d) => (
+            <Row
+              key={d.id}
+              title={d.name}
+              sub={`Last seen ${relTime(d.lastSeen)}`}
+            >
+              <button
+                className="btn-sm danger"
+                onClick={() =>
+                  invoke("gateway_revoke", { id: d.id }).then(refresh).catch(() => {})
+                }
+              >
+                Revoke
+              </button>
+            </Row>
+          ))}
+        </Card>
+      )}
+
+      <Card title="Security">
+        <Row
+          title="This is remote control of a permission-skipped agent"
+          sub="Anyone who reaches the gateway with a valid device token can run code on this machine as you. Keep it on your tailnet, never port-forward it to the internet, and revoke devices you no longer use."
+        />
+      </Card>
+    </section>
+  );
+}
+
+function relTime(ms) {
+  if (!ms) return "never";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 const SECTIONS = [
   { id: "appearance", label: "Appearance", icon: PaintBrushBroad },
   { id: "workspace", label: "Workspace", icon: SquaresFour },
   { id: "agents", label: "Agents", icon: Robot },
+  { id: "mobile", label: "Mobile access", icon: DeviceMobile },
   { id: "notifications", label: "Notifications", icon: BellSimple },
   { id: "keyboard", label: "Keyboard", icon: Keyboard },
 ];
@@ -690,6 +915,8 @@ export default function SettingsWindow() {
             </Card>
           </section>
         )}
+
+        {section === "mobile" && <MobileAccess />}
 
         {section === "notifications" && (
           <section className="settings-section">
