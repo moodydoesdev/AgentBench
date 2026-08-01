@@ -96,9 +96,15 @@ function paneOpen(machine, pane) {
 
 /**
  * Long-press (or right-click, for a desktop browser) on top of a normal tap.
- * A drag cancels it — scrolling a list must never pop the sheet — and the
- * click that the browser fires after a completed hold is swallowed so the
- * row doesn't also open.
+ * A drag cancels it — scrolling a list must never pop the sheet.
+ *
+ * The click a browser synthesizes when the finger finally lifts is the trap:
+ * by then the sheet's backdrop is covering the row, so that ghost click lands
+ * on the BACKDROP and instantly closes what the hold just opened. It has to
+ * be swallowed at the document level, capture phase — a handler on the row
+ * never sees it. The swallow disarms on the next fresh pointerdown (a real
+ * tap on the sheet), which also covers browsers that never fire the ghost
+ * click at all.
  */
 function useLongPress(fire) {
   const s = useRef({ timer: 0, x: 0, y: 0, fired: false }).current;
@@ -109,6 +115,20 @@ function useLongPress(fire) {
   const held = () => {
     s.fired = true;
     navigator.vibrate?.(10);
+    const cleanup = () => {
+      document.removeEventListener("click", swallow, true);
+      document.removeEventListener("pointerdown", disarm, true);
+    };
+    const swallow = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      cleanup();
+    };
+    // pointerdown of the NEXT gesture runs before its click, so real taps
+    // land; only the lift of the press that opened the sheet is eaten.
+    const disarm = () => cleanup();
+    document.addEventListener("click", swallow, true);
+    document.addEventListener("pointerdown", disarm, true);
     fire();
   };
   return {
@@ -124,13 +144,6 @@ function useLongPress(fire) {
     },
     onPointerUp: clear,
     onPointerCancel: clear,
-    onClickCapture: (e) => {
-      if (s.fired) {
-        e.preventDefault();
-        e.stopPropagation();
-        s.fired = false;
-      }
-    },
     // Android fires contextmenu at its own long-press threshold; ours usually
     // lands first, so only fire when it hasn't. On desktop this is the
     // right-click path.
