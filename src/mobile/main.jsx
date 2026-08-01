@@ -1,8 +1,13 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import MobileApp from "./MobileApp";
+import { applyTheme, loadThemeId } from "./theme";
 import "../styles.css";
 import "./mobile.css";
+
+// Before the first paint, so a saved non-default theme never flashes the
+// :root fallback palette.
+applyTheme(loadThemeId());
 
 // Keyboard-aware height. `interactive-widget=resizes-content` covers modern
 // Chrome, but iOS Safari still overlays the keyboard and leaves 100dvh
@@ -12,9 +17,21 @@ function trackViewport() {
   const vv = window.visualViewport;
   if (!vv) return;
   const apply = () => {
-    // Only the keyboard's overlap matters; ignore pinch-zoom (scale != 1),
-    // where a shrunken visual viewport is the user zooming in, not a keyboard.
-    const overlap = vv.scale > 1.01 ? 0 : window.innerHeight - vv.height - vv.offsetTop;
+    // Ignore pinch-zoom (scale != 1), where a shrunken visual viewport is the
+    // user zooming in, not a keyboard.
+    if (vv.scale > 1.01) return;
+    // The shell height comes straight from vv.height — the one number that is
+    // "what's actually visible" on both Android (resizes-content) and iOS
+    // (overlay keyboard). Deriving it as innerHeight - vv.height raced: with
+    // resizes-content both values change on keyboard close but not in the same
+    // event, and a stale difference stuck the shell at keyboard-up height.
+    document.documentElement.style.setProperty(
+      "--mob-vh",
+      `${Math.round(vv.height)}px`,
+    );
+    // Overlap still drives the composer's safe-area padding: nonzero only on
+    // overlay keyboards (iOS), ~0 on Android where the viewport itself shrinks.
+    const overlap = window.innerHeight - vv.height - vv.offsetTop;
     document.documentElement.style.setProperty(
       "--mob-keyboard",
       `${Math.max(0, Math.round(overlap))}px`,
@@ -23,6 +40,15 @@ function trackViewport() {
   apply();
   vv.addEventListener("resize", apply);
   vv.addEventListener("scroll", apply);
+  // Layout-viewport resizes can land after the last visualViewport event;
+  // recompute so the final state is always consistent.
+  window.addEventListener("resize", apply);
+  // Browsers can still scroll a clipped document (focus-scroll, scrollIntoView
+  // bubbling to the viewport). The shell is anchored to the top of the
+  // document, so any document scroll shows as a dead band — undo it.
+  window.addEventListener("scroll", () => {
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+  });
 }
 trackViewport();
 
