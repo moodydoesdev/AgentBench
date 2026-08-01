@@ -345,28 +345,37 @@ export default function MobileApp() {
   // Activity feed: one entry per agent event across every machine.
   useEffect(() => {
     const offs = [];
+    const push = (m, paneId, kind) =>
+      setActivity((list) =>
+        [
+          {
+            // Date.now() alone collides when two events land in one ms
+            key: `${m.url}-${paneId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            machine: m.machine ?? m.name,
+            paneId,
+            url: m.url,
+            kind,
+            at: Date.now(),
+          },
+          ...list,
+        ].slice(0, 100),
+      );
     for (const m of machines) {
       if (!m.transport) continue;
       offs.push(
         m.transport.listen("agent-event", ({ payload }) =>
-          setActivity((list) =>
-            [
-              {
-                key: `${m.url}-${payload.id}-${Date.now()}`,
-                machine: m.machine ?? m.name,
-                paneId: payload.id,
-                url: m.url,
-                kind: payload.kind,
-                at: Date.now(),
-              },
-              ...list,
-            ].slice(0, 50),
-          ),
+          push(m, payload.id, payload.kind),
         ),
+        // a question is the most feed-worthy event there is
+        m.transport.listen("ask", ({ payload }) => push(m, payload.id, "ask")),
       );
     }
     return () => offs.forEach((p) => p.then?.((f) => f?.()));
-  }, [machines.map((m) => m.url).join(",")]);
+    // The transport arrives a render AFTER its machine does. Keying this on
+    // the URL list alone meant it ran once while every transport was still
+    // null, attached nothing, and never ran again — the feed stayed
+    // permanently empty. The dep has to change when a transport appears.
+  }, [machines.map((m) => `${m.url}${m.transport ? "+" : "-"}`).join(",")]);
 
   const unread = activity.filter((a) => a.at > activityRead).length;
   const waiting = waitingItems(machines);
@@ -1035,7 +1044,16 @@ function sendToPane(transport, pane, text) {
   setTimeout(submit, 1300);
 }
 
+const ACTIVITY_LABEL = {
+  done: "finished",
+  ask: "asked a question",
+};
+
 function ActivityScreen({ items, readAt, machines, onOpen, onClear }) {
+  // What counted as read when this tab was OPENED. The live readAt updates
+  // the moment the tab shows (that is what clears the badge), so styling
+  // against it would dim every row before it could be seen as new.
+  const [seenAt] = useState(readAt);
   if (!items.length) {
     return (
       <div className="mob-empty">
@@ -1053,13 +1071,14 @@ function ActivityScreen({ items, readAt, machines, onOpen, onClear }) {
         return (
           <button
             key={a.key}
-            className={`mob-activity-row${a.at > readAt ? " unread" : ""}`}
+            className={`mob-activity-row${a.at > seenAt ? " unread" : ""}${pane ? "" : " stale"}`}
+            title={pane ? undefined : "This agent has since closed"}
             onClick={() => m && pane && onOpen(paneOpen(m, pane))}
           >
             <span className={`mob-dot ${a.kind === "done" ? "done" : "input"}`} />
             <span className="mob-activity-text">
               {title || `Agent ${a.paneId}`}{" "}
-              {a.kind === "done" ? "finished" : "needs input"}
+              {ACTIVITY_LABEL[a.kind] ?? "needs input"}
             </span>
             <span className="mob-activity-meta">
               {a.machine} · {ago(a.at)}

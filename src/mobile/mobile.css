@@ -394,6 +394,11 @@ body {
   color: var(--text-dim);
 }
 
+/* The agent this row points at is gone — nothing to open. */
+.mob-activity-row.stale {
+  opacity: 0.55;
+}
+
 .mob-activity-clear {
   min-height: 44px;
   margin-top: 10px;
