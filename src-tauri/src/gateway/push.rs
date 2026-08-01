@@ -67,6 +67,45 @@ pub struct Subscription {
     /// endpoint is not retried forever.
     #[serde(default)]
     pub failed: bool,
+    /// Per-device delivery preferences, set from the phone:
+    /// `{ quiet: { startUtc, endUtc } | null, muted: [cwd, …] }`. Quiet hours
+    /// are minutes-of-day in UTC — the phone converts from its local time when
+    /// saving, because this process has no reliable local timezone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefs: Option<Value>,
+}
+
+/// Whether `prefs` says "not now". A window that wraps midnight works too:
+/// start 1320 (22:00) end 420 (07:00) means late evening through early morning.
+fn quiet_now(prefs: &Value) -> bool {
+    let q = &prefs["quiet"];
+    let (Some(start), Some(end)) = (q["startUtc"].as_u64(), q["endUtc"].as_u64()) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 60) % 1440)
+        .unwrap_or(0);
+    in_window(now, start, end)
+}
+
+fn in_window(now: u64, start: u64, end: u64) -> bool {
+    if start == end {
+        return false;
+    }
+    if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
+}
+
+fn muted_for(prefs: &Value, cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd else { return false };
+    prefs["muted"]
+        .as_array()
+        .map(|list| list.iter().any(|m| m.as_str() == Some(cwd)))
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -134,6 +173,12 @@ impl Push {
     }
 
     fn persist(&self) {
+        // Unit tests construct Push directly and subscribe fake endpoints;
+        // without this guard `cargo test` overwrites the machine's real
+        // subscription file and silently unsubscribes every paired phone.
+        if cfg!(test) {
+            return;
+        }
         let subs = self.subs.lock().unwrap();
         let _ = std::fs::create_dir_all(crate::broker::config_dir());
         if let Ok(text) = serde_json::to_string_pretty(&*subs) {
@@ -158,6 +203,12 @@ impl Push {
             return Err("subscription keys are not base64url".into());
         }
         let mut subs = self.subs.lock().unwrap();
+        // A resubscribe replaces the endpoint but must not silently drop the
+        // preferences set on the one it replaces.
+        let prefs = subs
+            .iter()
+            .find(|s| s.endpoint == endpoint)
+            .and_then(|s| s.prefs.clone());
         subs.retain(|s| s.endpoint != endpoint);
         subs.push(Subscription {
             endpoint: endpoint.to_string(),
@@ -166,10 +217,32 @@ impl Push {
             device: device.to_string(),
             created: now_ms(),
             failed: false,
+            prefs,
         });
         drop(subs);
         self.persist();
         Ok(())
+    }
+
+    /// Store delivery preferences for one subscription.
+    pub fn set_prefs(&self, endpoint: &str, prefs: Value) -> Result<(), String> {
+        let mut subs = self.subs.lock().unwrap();
+        let sub = subs
+            .iter_mut()
+            .find(|s| s.endpoint == endpoint)
+            .ok_or("no such subscription")?;
+        sub.prefs = if prefs.is_null() { None } else { Some(prefs) };
+        drop(subs);
+        self.persist();
+        Ok(())
+    }
+
+    pub fn prefs_of(&self, endpoint: &str) -> Value {
+        let subs = self.subs.lock().unwrap();
+        subs.iter()
+            .find(|s| s.endpoint == endpoint)
+            .and_then(|s| s.prefs.clone())
+            .unwrap_or(Value::Null)
     }
 
     pub fn unsubscribe(&self, endpoint: &str) {
@@ -197,7 +270,8 @@ impl Push {
         self.subs.lock().unwrap().iter().filter(|s| !s.failed).count()
     }
 
-    /// Deliver one notification to every live subscription.
+    /// Deliver one notification to every live subscription, preferences
+    /// ignored — the test button must always prove the path end to end.
     ///
     /// Returns what each push service said. "Send a test" surfaces this: a
     /// notification that never arrives is otherwise completely silent, and the
@@ -207,6 +281,27 @@ impl Push {
             let subs = self.subs.lock().unwrap();
             subs.iter().filter(|s| !s.failed).cloned().collect()
         };
+        self.deliver(targets, payload).await
+    }
+
+    /// Deliver an agent event, honouring each device's preferences: quiet
+    /// hours and muted projects drop it for that device only.
+    pub async fn notify_event(&self, payload: &Value, cwd: Option<&str>) -> Value {
+        let targets: Vec<Subscription> = {
+            let subs = self.subs.lock().unwrap();
+            subs.iter()
+                .filter(|s| !s.failed)
+                .filter(|s| {
+                    let prefs = s.prefs.as_ref().unwrap_or(&Value::Null);
+                    !quiet_now(prefs) && !muted_for(prefs, cwd)
+                })
+                .cloned()
+                .collect()
+        };
+        self.deliver(targets, payload).await
+    }
+
+    async fn deliver(&self, targets: Vec<Subscription>, payload: &Value) -> Value {
         if targets.is_empty() {
             return json!([]);
         }
@@ -309,6 +404,50 @@ impl Push {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_hours_wrap_midnight() {
+        // 22:00 → 07:00
+        assert!(in_window(1380, 1320, 420)); // 23:00 — quiet
+        assert!(in_window(300, 1320, 420)); // 05:00 — quiet
+        assert!(!in_window(600, 1320, 420)); // 10:00 — loud
+        // plain daytime window 09:00 → 17:00
+        assert!(in_window(600, 540, 1020));
+        assert!(!in_window(60, 540, 1020));
+        // degenerate window means "no quiet hours", not "always quiet"
+        assert!(!in_window(600, 600, 600));
+    }
+
+    #[test]
+    fn muting_is_per_project() {
+        let prefs = json!({ "muted": ["A:\\Code\\AgentBench"] });
+        assert!(muted_for(&prefs, Some("A:\\Code\\AgentBench")));
+        assert!(!muted_for(&prefs, Some("A:\\Code\\Other")));
+        assert!(!muted_for(&prefs, None));
+        assert!(!muted_for(&Value::Null, Some("A:\\Code\\AgentBench")));
+    }
+
+    #[test]
+    fn prefs_survive_a_resubscribe() {
+        let push = Push {
+            private: String::new(),
+            public_key: String::new(),
+            subs: Mutex::new(Vec::new()),
+            client: reqwest::Client::new(),
+        };
+        let sub = json!({
+            "endpoint": "https://push.example/abc",
+            "keys": { "p256dh": "BBBB", "auth": "AAAA" }
+        });
+        push.subscribe(sub.clone(), "phone").unwrap();
+        push.set_prefs("https://push.example/abc", json!({ "muted": ["X"] }))
+            .unwrap();
+        push.subscribe(sub, "phone").unwrap();
+        assert_eq!(
+            push.prefs_of("https://push.example/abc"),
+            json!({ "muted": ["X"] })
+        );
+    }
 
     #[test]
     fn subscriptions_must_be_well_formed() {

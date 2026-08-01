@@ -289,6 +289,183 @@ pub fn newest_session_id(cwd: &str) -> Option<String> {
     best.map(|(_, sid)| sid)
 }
 
+/// Run one git command in `cwd` with no console window, returning stdout on
+/// success. Any failure — git missing, not a repo, bad cwd — reads as None.
+fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Working-tree state of a project, phone-shaped: branch, changed files, and
+/// one unified diff (unstaged + staged), capped so a huge refactor doesn't
+/// push megabytes at a phone on cellular.
+pub fn git_changes(cwd: &str) -> Result<Value, String> {
+    if cwd.is_empty() || !Path::new(cwd).is_dir() {
+        return Err("no such directory".into());
+    }
+    let Some(status) = run_git(cwd, &["status", "--porcelain=v1", "-b", "--no-renames"]) else {
+        return Ok(json!({ "git": false }));
+    };
+    let mut branch = None;
+    let mut files: Vec<Value> = Vec::new();
+    for line in status.lines() {
+        if let Some(b) = line.strip_prefix("## ") {
+            branch = Some(b.split("...").next().unwrap_or(b).to_string());
+            continue;
+        }
+        if line.len() < 4 {
+            continue;
+        }
+        files.push(json!({
+            "status": line[..2].trim(),
+            "path": line[3..].to_string(),
+        }));
+    }
+    const CAP: usize = 200 * 1024;
+    let mut diff = run_git(cwd, &["diff", "--no-color"]).unwrap_or_default();
+    if let Some(staged) = run_git(cwd, &["diff", "--cached", "--no-color"]) {
+        if !staged.trim().is_empty() {
+            if !diff.trim().is_empty() {
+                diff.push('\n');
+            }
+            diff.push_str(&staged);
+        }
+    }
+    let truncated = diff.len() > CAP;
+    if truncated {
+        let mut end = CAP;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
+    }
+    Ok(json!({
+        "git": true,
+        "branch": branch,
+        "files": files,
+        "diff": diff,
+        "truncated": truncated,
+    }))
+}
+
+/// Token totals for one session transcript, summed from the usage block each
+/// assistant record carries. Cost is only present when the harness wrote a
+/// result record (headless runs); token counts are always derivable.
+pub fn session_stats(project: &str, sid: &str) -> Result<Value, String> {
+    // sid becomes a filename component — refuse anything path-shaped
+    if sid.is_empty() || !sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("bad session id".into());
+    }
+    let path = dirs::home_dir()
+        .ok_or("no home dir")?
+        .join(".claude")
+        .join("projects")
+        .join(cwd_slug(project))
+        .join(format!("{sid}.jsonl"));
+    let f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let (mut input, mut output, mut cache_read, mut cache_write) = (0u64, 0u64, 0u64, 0u64);
+    let mut turns = 0u64;
+    let mut model: Option<String> = None;
+    let mut cost: Option<f64> = None;
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        // cheap pre-filter: parsing every record of a megabyte transcript is
+        // what this call must not do
+        if !line.contains("\"usage\"") && !line.contains("total_cost_usd") {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if rec["type"] == "assistant" {
+            let u = &rec["message"]["usage"];
+            input += u["input_tokens"].as_u64().unwrap_or(0);
+            output += u["output_tokens"].as_u64().unwrap_or(0);
+            cache_read += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            cache_write += u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            turns += 1;
+            if let Some(m) = rec["message"]["model"].as_str() {
+                model = Some(m.to_string());
+            }
+        }
+        if let Some(c) = rec["total_cost_usd"].as_f64() {
+            cost = Some(cost.unwrap_or(0.0) + c);
+        }
+    }
+    Ok(json!({
+        "sid": sid,
+        "inputTokens": input,
+        "outputTokens": output,
+        "cacheReadTokens": cache_read,
+        "cacheWriteTokens": cache_write,
+        "turns": turns,
+        "model": model,
+        "costUsd": cost,
+    }))
+}
+
+/// The agent's closing words in a session, for a notification body that says
+/// what happened instead of only that something did. Tail-bounded like
+/// `session_title` — this runs on every push.
+pub fn last_assistant_text(cwd: &str, sid: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 192 * 1024;
+    let path = dirs::home_dir()?
+        .join(".claude")
+        .join("projects")
+        .join(cwd_slug(cwd))
+        .join(format!("{sid}.jsonl"));
+    let mut f = std::fs::File::open(&path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut last: Option<String> = None;
+    for line in text.lines() {
+        if !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if rec["type"].as_str() != Some("assistant") {
+            continue;
+        }
+        let t = match &rec["message"]["content"] {
+            Value::Array(blocks) => blocks
+                .iter()
+                .rev()
+                .find_map(|b| {
+                    (b["type"] == "text")
+                        .then(|| b["text"].as_str().unwrap_or("").trim().to_string())
+                })
+                .unwrap_or_default(),
+            Value::String(s) => s.trim().to_string(),
+            _ => String::new(),
+        };
+        if !t.is_empty() {
+            last = Some(t);
+        }
+    }
+    last.map(|t| {
+        let clipped: String = t.chars().take(160).collect();
+        if t.chars().count() > 160 {
+            format!("{clipped}…")
+        } else {
+            clipped
+        }
+    })
+}
+
 /// Resumable Claude sessions for a project: scan its transcript dir
 /// (~/.claude/projects/<slug>/*.jsonl) and return { sid, mtime, preview, msgs }
 /// newest-first, so the UI can offer "resume a previous session". The slug is

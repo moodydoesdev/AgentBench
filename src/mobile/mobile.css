@@ -559,6 +559,23 @@ body {
   font-size: 16px;
 }
 
+/* The bloom behind the empty state is sized for a desktop pane; at phone
+   width its square edges show, reading as a floating card. Pin it to the
+   viewport so the glow is the background rather than a box. */
+.mob-chat-screen .chat-empty::before {
+  position: fixed;
+  inset: 0;
+  width: auto;
+  height: auto;
+  transform: none;
+  background: radial-gradient(
+    circle at 50% 40%,
+    rgba(var(--green), 0.06) 0%,
+    rgba(var(--green), 0.02) 42%,
+    transparent 70%
+  );
+}
+
 .mob-agent-id {
   color: var(--text-dim);
   font-family: var(--font-mono);
@@ -728,6 +745,64 @@ body {
 .mob-sheet-item small {
   color: var(--text-dim);
   font-size: 11px;
+}
+
+.mob-sheet-sub {
+  padding: 10px 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.mob-sheet-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.mob-sheet-session small {
+  white-space: nowrap;
+}
+
+.mob-kill-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(var(--red), 0.35);
+  background: rgba(var(--red), 0.1);
+  font-size: 13px;
+}
+
+.mob-kill-bar span {
+  flex: 1;
+  color: var(--text);
+}
+
+.mob-kill-go,
+.mob-kill-keep {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  border: none;
+}
+
+.mob-kill-go {
+  background: rgb(var(--red));
+  color: #fff;
+  font-weight: 600;
+}
+
+.mob-kill-keep {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
 }
 
 .mob-sheet-cancel {
