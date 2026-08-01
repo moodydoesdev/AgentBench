@@ -104,6 +104,8 @@ async fn main() {
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/push/test", post(push_test))
+        .route("/api/push/prefs", post(push_prefs))
+        .route("/api/answer", post(answer))
         .fallback_service(pwa_service())
         .layer(
             // Multi-bench: the shell is served by whichever machine you
@@ -294,8 +296,50 @@ async fn push_subscribe(
     };
     let device = agentbench_lib::gateway::tokens::token_id(&token);
     match gw.push.subscribe(body["subscription"].clone(), &device) {
+        Ok(()) => {
+            // hand back whatever prefs survived the resubscribe, so the app
+            // can render them without keeping its own copy authoritative
+            let endpoint = body["subscription"]["endpoint"].as_str().unwrap_or_default();
+            Json(json!({ "ok": true, "prefs": gw.push.prefs_of(endpoint) })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Store this device's delivery preferences (quiet hours, muted projects)
+/// against its push subscription.
+async fn push_prefs(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    let endpoint = body["endpoint"].as_str().unwrap_or_default();
+    match gw.push.set_prefs(endpoint, body["prefs"].clone()) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Answer a pending question from a notification action — the service worker
+/// POSTs here with no window open. Same claim discipline as the in-app card,
+/// so a second device (or the desktop) can't interleave keystrokes.
+async fn answer(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(token) = require_device(&gw, &headers) else {
+        return unauthorized();
+    };
+    let who = format!("push:{}", agentbench_lib::gateway::tokens::token_id(&token));
+    let pane = body["paneId"].as_u64().unwrap_or(0) as u32;
+    let pick = body["pick"].as_u64().unwrap_or(0) as usize;
+    match gw.answer_ask(pane, body["toolId"].as_str(), pick, &who).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
     }
 }
 

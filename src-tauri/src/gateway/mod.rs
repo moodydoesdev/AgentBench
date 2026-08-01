@@ -73,6 +73,8 @@ const FS_READS: &[&str] = &[
     "pane_buffer",
     "save_image",
     "pane_titles",
+    "git_changes",
+    "session_stats",
 ];
 
 pub fn gateway_file() -> std::path::PathBuf {
@@ -335,6 +337,17 @@ impl Snapshot {
     }
 }
 
+/// What names and locates one pane, for notifications and stats.
+#[derive(Default)]
+struct PaneContext {
+    /// registered project name, or the cwd's folder name
+    project: Option<String>,
+    /// the session's ai-title (what it is about)
+    title: Option<String>,
+    cwd: Option<String>,
+    sid: Option<String>,
+}
+
 pub struct Gateway {
     pub broker: Arc<BrokerLink>,
     pub tokens: TokenStore,
@@ -389,7 +402,7 @@ impl Gateway {
         }
         let kind = ev["ev"].as_str().unwrap_or_default();
         let id = ev["id"].as_u64().unwrap_or(0) as u32;
-        let (title, body, tag) = match kind {
+        let (title, fallback, tag) = match kind {
             "agent-event" => match ev["kind"].as_str() {
                 Some("done") => ("Agent finished", "finished its turn", "done"),
                 Some("needs_input") => ("Agent needs you", "is waiting for input", "input"),
@@ -402,17 +415,53 @@ impl Gateway {
 
         // Name the pane by what it is working on; a bare number in a
         // notification is useless.
-        let (project, session) = self.pane_context(id).await;
-        let heading = match &session {
-            Some(title) => title.clone(),
-            None => project.clone().unwrap_or_else(|| format!("Agent {id}")),
-        };
-        let payload = json!({
+        let ctx = self.pane_context(id).await;
+        let heading = ctx
+            .title
+            .clone()
+            .or_else(|| ctx.project.clone())
+            .unwrap_or_else(|| format!("Agent {id}"));
+
+        // Say the thing, not just that there is a thing: a question carries its
+        // own text (and its options, as buttons the phone can answer from the
+        // notification), a finish carries the agent's closing words. Many
+        // notifications then need no tap at all.
+        let mut body: Option<String> = None;
+        let mut actions: Vec<String> = Vec::new();
+        let mut tool_id: Option<String> = None;
+        if tag == "ask" {
+            let questions = ev["questions"].as_array().cloned().unwrap_or_default();
+            if let Some(q) = questions.first() {
+                if let Some(text) = q["question"].as_str().filter(|t| !t.trim().is_empty()) {
+                    body = Some(format!("{heading}: {}", text.trim()));
+                }
+                // Buttons only for the simple shape — one single-select
+                // question. Anything richer needs the app's real form.
+                if questions.len() == 1 && q["multiSelect"].as_bool() != Some(true) {
+                    actions = q["options"]
+                        .as_array()
+                        .map(|opts| {
+                            opts.iter()
+                                .filter_map(|o| o["label"].as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+            }
+            tool_id = ev["tool_id"].as_str().map(String::from);
+        } else if tag == "done" {
+            if let (Some(cwd), Some(sid)) = (&ctx.cwd, &ctx.sid) {
+                body = fsdata::last_assistant_text(cwd, sid)
+                    .map(|snippet| format!("{heading} — {snippet}"));
+            }
+        }
+        let body = body.unwrap_or_else(|| match &ctx.project {
+            Some(p) => format!("{heading} — {fallback} in {p}"),
+            None => format!("{heading} {fallback}"),
+        });
+        let mut payload = json!({
             "title": format!("{title} · {}", self.machine),
-            "body": match &project {
-                Some(p) => format!("{heading} — {body} in {p}"),
-                None => format!("{heading} {body}"),
-            },
+            "body": body,
             // one notification per pane per kind, so a chatty agent replaces
             // its own notification instead of stacking a wall of them
             "tag": format!("{}-{}-{}", self.machine, id, tag),
@@ -420,18 +469,24 @@ impl Gateway {
             "paneId": id,
             "kind": tag,
         });
-        let _ = self.push.notify(&payload).await;
+        if !actions.is_empty() {
+            payload["actions"] = json!(actions);
+        }
+        if let Some(t) = tool_id {
+            payload["toolId"] = json!(t);
+        }
+        let _ = self.push.notify_event(&payload, ctx.cwd.as_deref()).await;
     }
 
-    /// (project name, session title) for a pane, best effort.
-    async fn pane_context(&self, id: u32) -> (Option<String>, Option<String>) {
+    /// Whatever names and locates a pane, best effort.
+    async fn pane_context(&self, id: u32) -> PaneContext {
         let Ok(list) = self.broker.request(json!({ "op": "list" })).await else {
-            return (None, None);
+            return PaneContext::default();
         };
         let panes = list.as_array().cloned().unwrap_or_default();
         let solo = solo_projects(&panes);
         let Some(pane) = panes.iter().find(|p| p["id"].as_u64() == Some(id as u64)) else {
-            return (None, None);
+            return PaneContext::default();
         };
         let cwd = pane["cwd"].as_str().unwrap_or_default().to_string();
         let projects = fsdata::read_projects();
@@ -444,7 +499,66 @@ impl Gateway {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
             });
-        (name, pane_title(pane, &solo))
+        // same solo-only fallback pane_title uses: with several agents in one
+        // directory the newest transcript could be any of theirs
+        let sid = pane["session"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| {
+                solo.contains(cwd.as_str())
+                    .then(|| fsdata::newest_session_id(&cwd))
+                    .flatten()
+            });
+        PaneContext {
+            title: pane_title(pane, &solo),
+            project: name,
+            sid,
+            cwd: (!cwd.is_empty()).then_some(cwd),
+        }
+    }
+
+    /// Answer a pending single-select question with option `pick`, on behalf of
+    /// a notification action — no window, no WebSocket, just an authenticated
+    /// POST. Drives the terminal picker exactly like the app's question card:
+    /// the picker starts on row 0, so the pick is ↓×index then Enter.
+    pub async fn answer_ask(
+        &self,
+        pane: u32,
+        tool_id: Option<&str>,
+        pick: usize,
+        who: &str,
+    ) -> Result<(), String> {
+        let ask = self
+            .snapshot
+            .asks
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .cloned()
+            .ok_or("no question waiting on that pane")?;
+        // A stale notification must not answer a *newer* question that happens
+        // to be pending on the same pane.
+        if let Some(t) = tool_id {
+            if ask["tool_id"].as_str() != Some(t) {
+                return Err("that question was already resolved".into());
+            }
+        }
+        let questions = ask["questions"].as_array().cloned().unwrap_or_default();
+        let q = questions.first().ok_or("malformed question")?;
+        if questions.len() != 1 || q["multiSelect"].as_bool() == Some(true) {
+            return Err("this question needs the app".into());
+        }
+        let options = q["options"].as_array().map(|o| o.len()).unwrap_or(0);
+        if pick >= options {
+            return Err("no such option".into());
+        }
+        if !self.snapshot.claim_ask(pane, who) {
+            return Err("already being handled".into());
+        }
+        let data = format!("{}\r", "\x1b[B".repeat(pick));
+        self.broker
+            .send(json!({ "op": "write", "id": pane, "data": data }))
+            .await
     }
 
     /// The reconnect contract: everything a phone needs to render a correct
@@ -476,6 +590,8 @@ impl Gateway {
                         // what the session is about, so the fleet can say more
                         // than "claude 17"
                         "title": title,
+                        // lets the phone ask for this session's stats
+                        "session": p["session"],
                     }));
                 }
                 Value::Array(out)
@@ -541,6 +657,11 @@ impl Gateway {
                 self.pane_buffer(id, limit.min(512 * 1024)).await
             }
             "save_image" => save_image(args["dataUrl"].as_str().unwrap_or_default()),
+            "git_changes" => fsdata::git_changes(args["cwd"].as_str().unwrap_or_default()),
+            "session_stats" => fsdata::session_stats(
+                project,
+                args["sid"].as_str().unwrap_or_default(),
+            ),
             // Titles are refined while a session runs, so they are refreshable
             // rather than fixed at connect time.
             "pane_titles" => {

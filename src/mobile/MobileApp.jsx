@@ -453,9 +453,23 @@ function FleetScreen({ machines, waiting, onOpen, onAdd }) {
 function NewAgentSheet({ project, machine, onClose, onStarted }) {
   const [busy, setBusy] = useState(null);
   const [error, setError] = useState(null);
+  // Recent Claude sessions in this project — resuming one is at least as
+  // common a reason to open this sheet as starting cold.
+  const [sessions, setSessions] = useState(null);
 
-  const start = async (harness) => {
-    setBusy(harness.id);
+  useEffect(() => {
+    let dead = false;
+    machine.transport
+      .invoke("list_sessions", { project: project.cwd })
+      .then((s) => !dead && setSessions(Array.isArray(s) ? s.slice(0, 5) : []))
+      .catch(() => !dead && setSessions([]));
+    return () => {
+      dead = true;
+    };
+  }, [project.cwd]);
+
+  const start = async (harness, resume) => {
+    setBusy(resume ?? harness.id);
     setError(null);
     try {
       const id = await machine.transport.invoke("create_pane", {
@@ -463,6 +477,7 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
         // a phone-sized terminal; the desktop resizes it when it attaches
         cols: 100,
         rows: 30,
+        resume: resume ?? null,
         // theme only means something to Claude's settings file
         theme: harness.claude ? getTheme(loadThemeId()).claudeTheme ?? null : null,
         harness: {
@@ -487,6 +502,8 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
     }
   };
 
+  const claude = BUILTIN_HARNESSES.find((h) => h.claude);
+
   return (
     <div className="mob-sheet-backdrop" onClick={onClose}>
       <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
@@ -509,6 +526,30 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
             )}
           </button>
         ))}
+        {claude && sessions?.length > 0 && (
+          <>
+            <div className="mob-sheet-sub">Resume a recent session</div>
+            {sessions.map((s) => (
+              <button
+                key={s.sid}
+                className="mob-sheet-item mob-sheet-session"
+                disabled={busy != null}
+                onClick={() => start(claude, s.sid)}
+              >
+                <span className="mob-sheet-preview">
+                  {s.preview || "(no message text)"}
+                </span>
+                {busy === s.sid ? (
+                  <small>starting…</small>
+                ) : (
+                  <small>
+                    {ago(s.mtime)} · {s.msgs} msg{s.msgs === 1 ? "" : "s"}
+                  </small>
+                )}
+              </button>
+            ))}
+          </>
+        )}
         {error && <div className="mob-warn">{error}</div>}
         <button className="mob-sheet-cancel" onClick={onClose}>
           Cancel
@@ -635,6 +676,8 @@ function MachineSection({ machine, onOpen }) {
 }
 
 function ChatScreen({ machine, pane, onBack }) {
+  const [confirmKill, setConfirmKill] = useState(false);
+  const [killError, setKillError] = useState(null);
   if (!machine?.transport) {
     return (
       <div className="mob">
@@ -672,7 +715,43 @@ function ChatScreen({ machine, pane, onBack }) {
         <span className={`mob-agent-status ${status}`}>
           {STATUS_LABEL[status] ?? status}
         </span>
+        <button
+          className="mob-icon"
+          aria-label="End session"
+          onClick={() => setConfirmKill(true)}
+        >
+          <Trash size={16} />
+        </button>
       </header>
+      {confirmKill && (
+        <div className="mob-kill-bar">
+          <span>
+            {killError
+              ? `Couldn't end it: ${killError}`
+              : "End this session? The pane closes on every device."}
+          </span>
+          <button
+            className="mob-kill-go"
+            onClick={() =>
+              machine.transport
+                .invoke("kill_pane", { id: pane.paneId })
+                .then(onBack)
+                .catch((err) => setKillError(String(err.message ?? err)))
+            }
+          >
+            End
+          </button>
+          <button
+            className="mob-kill-keep"
+            onClick={() => {
+              setConfirmKill(false);
+              setKillError(null);
+            }}
+          >
+            Keep
+          </button>
+        </div>
+      )}
       {chat ? (
         <TransportProvider transport={machine.transport}>
           <ChatView
