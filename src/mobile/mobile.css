@@ -608,21 +608,11 @@ body {
   font-size: 16px;
 }
 
-/* The bloom behind the empty state is sized for a desktop pane; at phone
-   width its square edges show, reading as a floating card. Pin it to the
-   viewport so the glow is the background rather than a box. */
+/* No bloom on the phone. At screen scale the near-transparent gradient
+   quantizes into visible bands on OLED — it reads as a low-res texture, not
+   light. Flat is cleaner; the logo keeps its own small glow. */
 .mob-chat-screen .chat-empty::before {
-  position: fixed;
-  inset: 0;
-  width: auto;
-  height: auto;
-  transform: none;
-  background: radial-gradient(
-    circle at 50% 40%,
-    rgba(var(--green), 0.06) 0%,
-    rgba(var(--green), 0.02) 42%,
-    transparent 70%
-  );
+  display: none;
 }
 
 .mob-agent-id {
