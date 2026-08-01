@@ -86,6 +86,55 @@ body {
   min-height: 0;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  animation: mob-tab-in 0.16s ease-out;
+}
+
+@keyframes mob-tab-in {
+  from {
+    transform: translateY(6px);
+    opacity: 0;
+  }
+}
+
+/* Pane screen slides in over the fleet like a native detail view, and slides
+   back out before it unmounts (.closing holds until the timer fires). */
+.mob-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  height: var(--mob-vh, 100dvh);
+  background: var(--bg);
+  animation: mob-screen-in 0.24s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+.mob-screen.closing {
+  animation: mob-screen-out 0.2s cubic-bezier(0.5, 0, 0.8, 0.5) forwards;
+  pointer-events: none;
+}
+
+@keyframes mob-screen-in {
+  from {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes mob-screen-out {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+/* Motion is decoration here; honor the OS-level opt-out. */
+@media (prefers-reduced-motion: reduce) {
+  .mob-body,
+  .mob-screen,
+  .mob-screen.closing,
+  .mob-sheet,
+  .mob-sheet-backdrop {
+    animation-duration: 0.01ms;
+  }
 }
 
 /* ---- fleet ---- */
@@ -763,6 +812,8 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* replays on display:none -> flex too, so returning to Chat gets it */
+  animation: mob-tab-in 0.14s ease-out;
 }
 
 /* ---- changes (diff) ---- */

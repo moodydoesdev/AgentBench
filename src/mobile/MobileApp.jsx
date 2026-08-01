@@ -94,6 +94,41 @@ function paneOpen(machine, pane) {
   };
 }
 
+// Monotonic depth for stacked back-layers; comparisons only, so it never
+// needs to shrink.
+let layerSeq = 0;
+
+/**
+ * Make the system back gesture peel this layer instead of leaving the app.
+ *
+ * A PWA starts with no history to go back through, so Android's back button
+ * exits immediately — from anywhere. While `active`, one history entry stands
+ * in for this layer: gesture-back pops it and we close the layer; closing via
+ * the UI consumes the entry silently so the next back doesn't need pressing
+ * twice.
+ */
+function useBackLayer(active, close) {
+  const closeRef = useRef(close);
+  closeRef.current = close;
+  useEffect(() => {
+    if (!active) return;
+    const depth = ++layerSeq;
+    history.pushState({ mobLayer: depth }, "");
+    const onPop = () => {
+      // our entry (or one above it) was popped — anything at or below us in
+      // the stack is someone else's business
+      if ((history.state?.mobLayer ?? 0) < depth) closeRef.current();
+    };
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      // closed by the UI, not the gesture: the entry is still there — consume
+      // it after our listener is gone so no other layer reacts to it
+      if ((history.state?.mobLayer ?? 0) >= depth) history.back();
+    };
+  }, [active]);
+}
+
 /**
  * Long-press (or right-click, for a desktop browser) on top of a normal tap.
  * A drag cancels it — scrolling a list must never pop the sheet.
@@ -390,6 +425,22 @@ export default function MobileApp() {
     if (paneSheet && !sheetPane) setPaneSheet(null);
   }, [paneSheet, sheetPane]);
 
+  // Closing the pane screen plays its slide-out before the unmount; both the
+  // header back button and the system back gesture come through here.
+  const [closingPane, setClosingPane] = useState(false);
+  const requestBack = () => {
+    setClosingPane((already) => {
+      if (already) return already;
+      setTimeout(() => {
+        setClosingPane(false);
+        setOpen(null);
+      }, 200);
+      return true;
+    });
+  };
+  useBackLayer(!!open, requestBack);
+  useBackLayer(!!(sheetMachine && sheetPane), () => setPaneSheet(null));
+
   // The home-screen icon carries the count of panes blocked on an answer —
   // the number that decides whether the phone is worth picking up.
   useEffect(() => {
@@ -399,22 +450,6 @@ export default function MobileApp() {
       : navigator.clearAppBadge()
     )?.catch?.(() => {});
   }, [waiting.length]);
-
-  if (open) {
-    const machine = machines.find((m) => m.url === open.url);
-    return (
-      <>
-        {updateReady && <UpdateBanner />}
-        <ChatScreen
-          // remount per pane: tab choice and kill-confirm are per-session state
-          key={`${open.url}-${open.paneId}`}
-          machine={machine}
-          pane={open}
-          onBack={() => setOpen(null)}
-        />
-      </>
-    );
-  }
 
   return (
     <div className="mob">
@@ -434,7 +469,9 @@ export default function MobileApp() {
         </div>
       )}
 
-      <main className="mob-body">
+      {/* keyed so switching tabs remounts the screen and replays its
+          entrance; scroll position resetting per switch is the native feel */}
+      <main className="mob-body" key={tab}>
         {tab === "fleet" && (
           <FleetScreen
             machines={machines}
@@ -478,6 +515,19 @@ export default function MobileApp() {
           pane={sheetPane}
           onClose={() => setPaneSheet(null)}
           onOpen={setOpen}
+        />
+      )}
+
+      {/* An overlay, not a replacement: the fleet stays mounted (and keeps
+          its scroll) so the slide-out reveals it rather than a void. */}
+      {open && (
+        <ChatScreen
+          // remount per pane: tab choice and kill-confirm are per-session state
+          key={`${open.url}-${open.paneId}`}
+          machine={machines.find((m) => m.url === open.url)}
+          pane={open}
+          closing={closingPane}
+          onBack={requestBack}
         />
       )}
     </div>
@@ -767,6 +817,7 @@ function PaneActionSheet({ machine, pane, onClose, onOpen }) {
 function MachineSection({ machine, onOpen, onActions }) {
   const projects = groupPanes(machine);
   const [spawnIn, setSpawnIn] = useState(null);
+  useBackLayer(spawnIn != null, () => setSpawnIn(null));
   const stale =
     machine.protocolVersion != null && machine.protocolVersion !== CLIENT_PROTOCOL;
   return (
@@ -870,14 +921,14 @@ function MachineSection({ machine, onOpen, onActions }) {
   );
 }
 
-function ChatScreen({ machine, pane, onBack }) {
+function ChatScreen({ machine, pane, closing, onBack }) {
   const [confirmKill, setConfirmKill] = useState(false);
   const [killError, setKillError] = useState(null);
   // The action sheet can open a pane straight onto a tab ("View changes").
   const [view, setView] = useState(pane.view ?? "chat");
   if (!machine?.transport) {
     return (
-      <div className="mob">
+      <div className={`mob mob-screen${closing ? " closing" : ""}`}>
         <header className="mob-top">
           <button className="mob-icon" onClick={onBack}>
             <CaretLeft size={18} />
@@ -896,7 +947,7 @@ function ChatScreen({ machine, pane, onBack }) {
   const status = machine.statuses?.[pane.paneId] ?? "working";
   const chat = pane.chat;
   return (
-    <div className="mob mob-chat-screen">
+    <div className={`mob mob-chat-screen mob-screen${closing ? " closing" : ""}`}>
       <header className="mob-top">
         <button className="mob-icon" onClick={onBack} aria-label="Back">
           <CaretLeft size={18} />
