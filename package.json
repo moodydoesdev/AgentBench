@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "deploy:local": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "preview": "vite preview",
     "tauri": "tauri",
     "dev:self": "tauri dev --no-watch"
