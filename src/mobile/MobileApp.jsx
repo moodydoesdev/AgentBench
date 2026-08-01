@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import {
   ArrowClockwise,
   Bell,
@@ -14,12 +14,25 @@ import {
 } from "@phosphor-icons/react";
 import ChatView from "../chat/ChatView";
 import LogView from "./LogView";
+import ChangesView from "./ChangesView";
+import UsageView from "./UsageView";
+
+// The MDX toolchain behind plan rendering is the heaviest dependency in the
+// app; almost every session never opens a plan, so it loads on first use.
+const PlanView = lazy(() => import("./PlanView"));
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
 import { BUILTIN_HARNESSES } from "../settings";
 import { THEMES, getTheme } from "../themes";
 import { applyTheme, loadThemeId, saveThemeId } from "./theme";
-import { disablePush, enablePush, isSubscribed, pushSupported, testPush } from "./push";
+import {
+  disablePush,
+  enablePush,
+  isSubscribed,
+  pushSupported,
+  setPushPrefs,
+  testPush,
+} from "./push";
 import {
   CLIENT_PROTOCOL,
   baseName,
@@ -76,6 +89,7 @@ function paneOpen(machine, pane) {
     subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
     kind: pane.kind,
     chat: isChatPane(pane),
+    session: pane.session ?? null,
     machine: machine.machine ?? machine.name,
   };
 }
@@ -678,6 +692,7 @@ function MachineSection({ machine, onOpen }) {
 function ChatScreen({ machine, pane, onBack }) {
   const [confirmKill, setConfirmKill] = useState(false);
   const [killError, setKillError] = useState(null);
+  const [view, setView] = useState("chat");
   if (!machine?.transport) {
     return (
       <div className="mob">
@@ -752,36 +767,77 @@ function ChatScreen({ machine, pane, onBack }) {
           </button>
         </div>
       )}
-      {chat ? (
-        <TransportProvider transport={machine.transport}>
-          <ChatView
-            id={pane.paneId}
-            cwd={pane.cwd}
-            mode={pane.kind === "chat" ? "stream" : "transcript"}
-            placeholder="Message Claude…"
-            // A question posed while the phone was asleep only exists in the
-            // fleet snapshot; without this the agent looks idle rather than
-            // blocked on an answer.
-            pendingAsks={(machine.asks ?? []).filter((a) => a.id === pane.paneId)}
-            onSend={(text) => sendToPane(machine.transport, pane, text)}
-            onStop={(resubmit) =>
+      <nav className="mob-pane-tabs">
+        {[
+          ["chat", chat ? "Chat" : "Log"],
+          ["changes", "Changes"],
+          ...(chat ? [["plan", "Plan"], ["usage", "Usage"]] : []),
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            className={`mob-pane-tab${view === id ? " on" : ""}`}
+            onClick={() => setView(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+      {/* The chat stays mounted while other tabs show: unmounting drops the
+          transcript watch and scroll position, and a diff peek shouldn't
+          cost a full reload on the way back. */}
+      <div className="mob-pane-view" style={view === "chat" ? undefined : { display: "none" }}>
+        {chat ? (
+          <TransportProvider transport={machine.transport}>
+            <ChatView
+              id={pane.paneId}
+              cwd={pane.cwd}
+              mode={pane.kind === "chat" ? "stream" : "transcript"}
+              placeholder="Message Claude…"
+              // A question posed while the phone was asleep only exists in the
+              // fleet snapshot; without this the agent looks idle rather than
+              // blocked on an answer.
+              pendingAsks={(machine.asks ?? []).filter((a) => a.id === pane.paneId)}
+              onSend={(text) => sendToPane(machine.transport, pane, text)}
+              onStop={(resubmit) =>
+                machine.transport
+                  .invoke("interrupt_pane", { id: pane.paneId, resubmit })
+                  .catch(() => {})
+              }
+              status={status}
+            />
+          </TransportProvider>
+        ) : (
+          <LogView
+            transport={machine.transport}
+            paneId={pane.paneId}
+            onStop={() =>
               machine.transport
-                .invoke("interrupt_pane", { id: pane.paneId, resubmit })
+                .invoke("interrupt_pane", { id: pane.paneId, resubmit: false })
                 .catch(() => {})
             }
-            status={status}
           />
-        </TransportProvider>
-      ) : (
-        <LogView
-          transport={machine.transport}
-          paneId={pane.paneId}
-          onStop={() =>
-            machine.transport
-              .invoke("interrupt_pane", { id: pane.paneId, resubmit: false })
-              .catch(() => {})
-          }
-        />
+        )}
+      </div>
+      {view === "changes" && (
+        <div className="mob-pane-view">
+          <ChangesView transport={machine.transport} cwd={pane.cwd} />
+        </div>
+      )}
+      {view === "plan" && (
+        <div className="mob-pane-view">
+          <Suspense fallback={<div className="mob-note" style={{ margin: 14 }}>Loading plan viewer…</div>}>
+            <PlanView
+              transport={machine.transport}
+              cwd={pane.cwd}
+              onSend={(text) => sendToPane(machine.transport, pane, text)}
+            />
+          </Suspense>
+        </div>
+      )}
+      {view === "usage" && (
+        <div className="mob-pane-view">
+          <UsageView transport={machine.transport} cwd={pane.cwd} sid={pane.session} />
+        </div>
       )}
     </div>
   );
@@ -841,6 +897,102 @@ function ActivityScreen({ items, readAt, machines, onOpen, onClear }) {
       <button className="mob-activity-clear" onClick={onClear}>
         Clear history
       </button>
+    </div>
+  );
+}
+
+/** Local-time "HH:MM" → minutes-of-day in UTC, for the gateway's quiet-hours
+    check. DST shifts the mapping until re-saved; close enough for sleep. */
+function toUtcMinutes(hm) {
+  const [h, m] = hm.split(":").map(Number);
+  return ((h * 60 + m + new Date().getTimezoneOffset()) % 1440 + 1440) % 1440;
+}
+
+/** Quiet hours + per-project muting for one machine's notifications. The
+    display copy lives on the phone; the gateway holds what it enforces. */
+function PushPrefs({ gateway, projects }) {
+  const KEY = `agentbench.pushPrefs.${gateway.url}`;
+  const [prefs, setPrefs] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(KEY)) ?? { from: "", to: "", muted: [] };
+    } catch {
+      return { from: "", to: "", muted: [] };
+    }
+  });
+  const [note, setNote] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = async (next) => {
+    setPrefs(next);
+    localStorage.setItem(KEY, JSON.stringify(next));
+    setBusy(true);
+    setNote(null);
+    try {
+      await setPushPrefs(gateway, {
+        quiet:
+          next.from && next.to
+            ? { startUtc: toUtcMinutes(next.from), endUtc: toUtcMinutes(next.to) }
+            : null,
+        muted: next.muted,
+      });
+      setNote("Saved.");
+    } catch (err) {
+      setNote(String(err.message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mob-push-prefs">
+      <div className="mob-push-quiet">
+        <span>Quiet hours</span>
+        <input
+          type="time"
+          value={prefs.from}
+          onChange={(e) => save({ ...prefs, from: e.target.value })}
+        />
+        <span>to</span>
+        <input
+          type="time"
+          value={prefs.to}
+          onChange={(e) => save({ ...prefs, to: e.target.value })}
+        />
+        {(prefs.from || prefs.to) && (
+          <button
+            className="mob-push-clear"
+            onClick={() => save({ ...prefs, from: "", to: "" })}
+          >
+            clear
+          </button>
+        )}
+      </div>
+      {projects.length > 0 && (
+        <div className="mob-push-mutes">
+          {projects.map((p) => {
+            const muted = prefs.muted.includes(p.path);
+            return (
+              <button
+                key={p.path}
+                className={`mob-plan-chip${muted ? " off" : ""}`}
+                disabled={busy}
+                onClick={() =>
+                  save({
+                    ...prefs,
+                    muted: muted
+                      ? prefs.muted.filter((x) => x !== p.path)
+                      : [...prefs.muted, p.path],
+                  })
+                }
+              >
+                {muted ? "🔕 " : ""}
+                {p.name || baseName(p.path)}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {note && <div className="mob-note">{note}</div>}
     </div>
   );
 }
@@ -919,6 +1071,9 @@ function PushRow({ gateway, machines }) {
           </button>
         )}
       </div>
+      {state === "on" && (
+        <PushPrefs gateway={gateway} projects={live?.projects ?? []} />
+      )}
       {note && <div className="mob-note">{note}</div>}
     </div>
   );
