@@ -198,6 +198,11 @@ body {
   color: var(--text);
   font-size: 14px;
   text-align: left;
+  /* long-press opens the action sheet; the OS must not also start a text
+     selection or show its own callout mid-hold */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
 
 .mob-agent:active {
@@ -961,6 +966,27 @@ body {
   background: rgba(0, 0, 0, 0.55);
 }
 
+@keyframes mob-sheet-up {
+  from {
+    transform: translateY(28px);
+    opacity: 0.5;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@keyframes mob-backdrop-in {
+  from {
+    background: rgba(0, 0, 0, 0);
+  }
+}
+
+.mob-sheet-backdrop {
+  animation: mob-backdrop-in 0.18s ease-out;
+}
+
 .mob-sheet {
   width: 100%;
   display: flex;
@@ -971,6 +997,16 @@ body {
   border-top-right-radius: 18px;
   background: var(--panel);
   border-top: 1px solid var(--border);
+  animation: mob-sheet-up 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+.mob-sheet-danger {
+  color: rgb(var(--red));
+  border-color: rgba(var(--red), 0.35);
+}
+
+.mob-sheet-danger small {
+  color: rgba(var(--red), 0.8);
 }
 
 .mob-sheet-head {

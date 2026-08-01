@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowClockwise,
   Bell,
@@ -94,6 +94,64 @@ function paneOpen(machine, pane) {
   };
 }
 
+/**
+ * Long-press (or right-click, for a desktop browser) on top of a normal tap.
+ * A drag cancels it — scrolling a list must never pop the sheet — and the
+ * click that the browser fires after a completed hold is swallowed so the
+ * row doesn't also open.
+ */
+function useLongPress(fire) {
+  const s = useRef({ timer: 0, x: 0, y: 0, fired: false }).current;
+  const clear = () => {
+    clearTimeout(s.timer);
+    s.timer = 0;
+  };
+  const held = () => {
+    s.fired = true;
+    navigator.vibrate?.(10);
+    fire();
+  };
+  return {
+    onPointerDown: (e) => {
+      s.fired = false;
+      s.x = e.clientX;
+      s.y = e.clientY;
+      clearTimeout(s.timer);
+      s.timer = setTimeout(held, 450);
+    },
+    onPointerMove: (e) => {
+      if (s.timer && Math.hypot(e.clientX - s.x, e.clientY - s.y) > 12) clear();
+    },
+    onPointerUp: clear,
+    onPointerCancel: clear,
+    onClickCapture: (e) => {
+      if (s.fired) {
+        e.preventDefault();
+        e.stopPropagation();
+        s.fired = false;
+      }
+    },
+    // Android fires contextmenu at its own long-press threshold; ours usually
+    // lands first, so only fire when it hasn't. On desktop this is the
+    // right-click path.
+    onContextMenu: (e) => {
+      e.preventDefault();
+      clear();
+      if (!s.fired) held();
+    },
+  };
+}
+
+/** An agent row that taps to open and holds for the action sheet. */
+function PaneRow({ className, onTap, onHold, children }) {
+  const press = useLongPress(onHold);
+  return (
+    <button className={className} onClick={onTap} {...press}>
+      {children}
+    </button>
+  );
+}
+
 function ago(ts) {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
   if (s < 60) return "now";
@@ -144,6 +202,10 @@ export default function MobileApp() {
       : null;
   });
   const [pairing, setPairing] = useState(null); // { state, message }
+  // Long-pressed row → action sheet. Held as ids, not objects: the fleet
+  // keeps updating underneath, and the sheet should show live status (and
+  // vanish if the pane exits while it's up).
+  const [paneSheet, setPaneSheet] = useState(null); // { url, paneId }
   const [updateReady, setUpdateReady] = useState(false);
   const [theme, setTheme] = useState(loadThemeId);
   const { machines, refresh } = useFleet(gateways);
@@ -296,6 +358,16 @@ export default function MobileApp() {
   const unread = activity.filter((a) => a.at > activityRead).length;
   const waiting = waitingItems(machines);
 
+  const sheetMachine = paneSheet
+    ? machines.find((m) => m.url === paneSheet.url)
+    : null;
+  const sheetPane = sheetMachine?.panes?.find(
+    (p) => String(p.id) === String(paneSheet.paneId),
+  );
+  useEffect(() => {
+    if (paneSheet && !sheetPane) setPaneSheet(null);
+  }, [paneSheet, sheetPane]);
+
   // The home-screen icon carries the count of panes blocked on an answer —
   // the number that decides whether the phone is worth picking up.
   useEffect(() => {
@@ -311,7 +383,13 @@ export default function MobileApp() {
     return (
       <>
         {updateReady && <UpdateBanner />}
-        <ChatScreen machine={machine} pane={open} onBack={() => setOpen(null)} />
+        <ChatScreen
+          // remount per pane: tab choice and kill-confirm are per-session state
+          key={`${open.url}-${open.paneId}`}
+          machine={machine}
+          pane={open}
+          onBack={() => setOpen(null)}
+        />
       </>
     );
   }
@@ -340,6 +418,9 @@ export default function MobileApp() {
             machines={machines}
             waiting={waiting}
             onOpen={setOpen}
+            onActions={(machine, pane) =>
+              setPaneSheet({ url: machine.url, paneId: pane.id })
+            }
             onAdd={() => setTab("settings")}
           />
         )}
@@ -368,6 +449,15 @@ export default function MobileApp() {
         <TabButton icon={Bell} label="Activity" badge={unread} on={tab === "activity"} onClick={() => setTab("activity")} />
         <TabButton icon={Gear} label="Settings" on={tab === "settings"} onClick={() => setTab("settings")} />
       </nav>
+
+      {sheetMachine && sheetPane && (
+        <PaneActionSheet
+          machine={sheetMachine}
+          pane={sheetPane}
+          onClose={() => setPaneSheet(null)}
+          onOpen={setOpen}
+        />
+      )}
     </div>
   );
 }
@@ -401,7 +491,7 @@ function TabButton({ icon: Icon, label, on, badge, onClick }) {
 
 /** Everything blocked on an answer, across all machines, in one tappable
     place — the reason the app got opened, so it goes first. */
-function WaitingSection({ waiting, onOpen }) {
+function WaitingSection({ waiting, onOpen, onActions }) {
   if (!waiting.length) return null;
   return (
     <section className="mob-waiting">
@@ -412,10 +502,11 @@ function WaitingSection({ waiting, onOpen }) {
       {waiting.map(({ machine, pane, ask }) => {
         const title = machine.titles?.[pane.id] ?? pane.title;
         return (
-          <button
+          <PaneRow
             key={`${machine.url}-${pane.id}`}
             className="mob-agent"
-            onClick={() => onOpen(paneOpen(machine, pane))}
+            onTap={() => onOpen(paneOpen(machine, pane))}
+            onHold={() => onActions(machine, pane)}
           >
             <span className="mob-agent-name">
               <span className="mob-agent-title">
@@ -426,14 +517,14 @@ function WaitingSection({ waiting, onOpen }) {
               </span>
             </span>
             <span className="mob-ask">{ask ? "question" : "needs input"}</span>
-          </button>
+          </PaneRow>
         );
       })}
     </section>
   );
 }
 
-function FleetScreen({ machines, waiting, onOpen, onAdd }) {
+function FleetScreen({ machines, waiting, onOpen, onActions, onAdd }) {
   if (machines.length === 0) {
     return (
       <div className="mob-empty">
@@ -451,9 +542,9 @@ function FleetScreen({ machines, waiting, onOpen, onAdd }) {
   }
   return (
     <div className="mob-fleet">
-      <WaitingSection waiting={waiting} onOpen={onOpen} />
+      <WaitingSection waiting={waiting} onOpen={onOpen} onActions={onActions} />
       {machines.map((m) => (
-        <MachineSection key={m.url} machine={m} onOpen={onOpen} />
+        <MachineSection key={m.url} machine={m} onOpen={onOpen} onActions={onActions} />
       ))}
     </div>
   );
@@ -573,7 +664,85 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
   );
 }
 
-function MachineSection({ machine, onOpen }) {
+/**
+ * Held-down agent row: everything you'd want to do to a session without
+ * opening it. Ending a session confirms in place — the sheet is one hold and
+ * one tap away, which is too easy a path to a kill to make it single-tap.
+ */
+function PaneActionSheet({ machine, pane, onClose, onOpen }) {
+  const [confirmKill, setConfirmKill] = useState(false);
+  const [error, setError] = useState(null);
+  const title = machine.titles?.[pane.id] ?? pane.title;
+  const status = machine.statuses?.[pane.id] ?? "working";
+  const chat = isChatPane(pane);
+
+  const go = (view) => {
+    onClose();
+    onOpen({ ...paneOpen(machine, pane), view });
+  };
+  const run = (cmd, args) => {
+    machine.transport.invoke(cmd, args).catch(() => {});
+    onClose();
+  };
+
+  return (
+    <div className="mob-sheet-backdrop" onClick={onClose}>
+      <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-head">
+          <strong>{title || `${pane.harness ?? "agent"} ${pane.id}`}</strong>
+          <small className="mob-mono">
+            {baseName(pane.cwd)} · {machine.machine ?? machine.name} ·{" "}
+            {STATUS_LABEL[status] ?? status}
+          </small>
+        </div>
+        <button className="mob-sheet-item" onClick={() => go("chat")}>
+          <span>{chat ? "Open chat" : "Open log"}</span>
+        </button>
+        <button className="mob-sheet-item" onClick={() => go("changes")}>
+          <span>View changes</span>
+          <small>git diff</small>
+        </button>
+        {chat && (
+          <button className="mob-sheet-item" onClick={() => go("usage")}>
+            <span>Usage</span>
+            <small>tokens · cost</small>
+          </button>
+        )}
+        {status === "working" && (
+          <button
+            className="mob-sheet-item"
+            onClick={() =>
+              run("interrupt_pane", { id: pane.id, resubmit: false })
+            }
+          >
+            <span>Stop the current turn</span>
+            <small>like Esc</small>
+          </button>
+        )}
+        <button
+          className="mob-sheet-item mob-sheet-danger"
+          onClick={() =>
+            confirmKill
+              ? machine.transport
+                  .invoke("kill_pane", { id: pane.id })
+                  .then(onClose)
+                  .catch((e) => setError(String(e.message ?? e)))
+              : setConfirmKill(true)
+          }
+        >
+          <span>{confirmKill ? "Tap again to end it" : "End session"}</span>
+          <small>{confirmKill ? "closes on every device" : ""}</small>
+        </button>
+        {error && <div className="mob-warn">{error}</div>}
+        <button className="mob-sheet-cancel" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MachineSection({ machine, onOpen, onActions }) {
   const projects = groupPanes(machine);
   const [spawnIn, setSpawnIn] = useState(null);
   const stale =
@@ -625,21 +794,11 @@ function MachineSection({ machine, onOpen }) {
               </span>
             </div>
             {proj.panes.map((pane) => (
-              <button
+              <PaneRow
                 key={pane.id}
                 className="mob-agent"
-                onClick={() =>
-                  onOpen({
-                    url: machine.url,
-                    paneId: pane.id,
-                    cwd: pane.cwd,
-                    label: pane.title || `${pane.harness ?? "agent"} ${pane.id}`,
-                    subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
-                    kind: pane.kind,
-                    chat: isChatPane(pane),
-                    machine: machine.machine ?? machine.name,
-                  })
-                }
+                onTap={() => onOpen(paneOpen(machine, pane))}
+                onHold={() => onActions(machine, pane)}
               >
                 {/* What the session is about beats what it is called: several
                     agents per project is the norm and they all run the same
@@ -666,7 +825,7 @@ function MachineSection({ machine, onOpen }) {
                 <span className={`mob-agent-status ${pane.status}`}>
                   {STATUS_LABEL[pane.status] ?? pane.status}
                 </span>
-              </button>
+              </PaneRow>
             ))}
             <button className="mob-agent mob-new" onClick={() => setSpawnIn(proj)}>
               <Plus size={13} weight="bold" />
@@ -692,7 +851,8 @@ function MachineSection({ machine, onOpen }) {
 function ChatScreen({ machine, pane, onBack }) {
   const [confirmKill, setConfirmKill] = useState(false);
   const [killError, setKillError] = useState(null);
-  const [view, setView] = useState("chat");
+  // The action sheet can open a pane straight onto a tab ("View changes").
+  const [view, setView] = useState(pane.view ?? "chat");
   if (!machine?.transport) {
     return (
       <div className="mob">
