@@ -121,3 +121,15 @@ export async function disablePush(gateway) {
 export async function testPush(gateway) {
   return api(gateway, "/api/push/test", {});
 }
+
+/**
+ * Store delivery preferences against this device's subscription on one
+ * machine. Quiet hours travel as UTC minutes-of-day: the gateway has no
+ * reliable local timezone, so the phone converts before sending.
+ */
+export async function setPushPrefs(gateway, prefs) {
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (!sub) throw new Error("Turn notifications on first.");
+  return api(gateway, "/api/push/prefs", { endpoint: sub.endpoint, prefs });
+}

@@ -437,6 +437,55 @@ body {
   font-family: var(--font-ui);
 }
 
+/* ---- notification preferences ---- */
+
+.mob-push-prefs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 10px;
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.mob-push-quiet {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.mob-push-quiet input[type="time"] {
+  min-height: 36px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-head);
+  color: var(--text);
+  font-size: 14px;
+  font-family: var(--font-ui);
+}
+
+.mob-push-clear {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.mob-push-mutes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mob-plan-chip.off {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
 /* ---- theme picker ---- */
 
 .mob-theme-picker {
@@ -681,6 +730,226 @@ body {
 .mob-chat-screen .chat-stop {
   width: 34px;
   height: 34px;
+}
+
+/* ---- pane tabs (chat / changes / plan / usage) ---- */
+
+.mob-pane-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-head);
+}
+
+.mob-pane-tab {
+  flex: 1;
+  min-height: 34px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.mob-pane-tab.on {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mob-pane-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- changes (diff) ---- */
+
+.mob-changes {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 10px 0 24px;
+}
+
+.mob-changes-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 8px 14px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.mob-changes-head .mob-mono {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.mob-changes-files {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 14px 10px;
+}
+
+.mob-changes-file {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.mob-file-status {
+  flex: 0 0 auto;
+  min-width: 58px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.mob-file-status.s-A,
+.mob-file-status.s-new {
+  color: rgb(var(--green));
+}
+
+.mob-file-status.s-D {
+  color: rgb(var(--red));
+}
+
+.mob-file-status.s-M {
+  color: rgb(var(--amber));
+}
+
+.mob-diff {
+  margin: 0;
+  padding: 8px 14px 24px;
+  overflow-x: auto;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 4;
+  color: var(--text);
+}
+
+.mob-diff .add {
+  color: rgb(var(--green));
+  background: rgba(var(--green), 0.07);
+}
+
+.mob-diff .del {
+  color: rgb(var(--red));
+  background: rgba(var(--red), 0.07);
+}
+
+.mob-diff .hunk {
+  color: rgb(var(--blue));
+  padding-top: 6px;
+}
+
+.mob-diff .meta {
+  color: var(--text-dim);
+}
+
+@keyframes mob-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.mob-spin {
+  animation: mob-spin 0.9s linear infinite;
+}
+
+/* ---- usage ---- */
+
+.mob-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  overflow-y: auto;
+}
+
+.mob-usage-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 32px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.mob-usage-row:first-child {
+  border-top: none;
+}
+
+.mob-usage-row .mob-mono {
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* ---- plan ---- */
+
+.mob-plan {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.mob-plan-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mob-plan-title {
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mob-plan-picker {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.mob-plan-chip {
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.mob-plan-chip.on {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.mob-plan-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 24px;
 }
 
 /* ---- new agent sheet ---- */
