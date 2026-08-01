@@ -191,14 +191,20 @@ export default memo(function ChatView({
   // The phone has no drag-and-drop and a much narrower composer, so it passes
   // a shorter prompt instead of the desktop's hint-laden one.
   placeholder,
-  // Staging an image needs the desktop's save_pasted_image command to write it
-  // somewhere Claude can read by path. Without it the picker would take a
-  // photo and then quietly drop it, so the phone hides the affordance.
+  // Staging an image needs save_pasted_image to write it somewhere Claude can
+  // read by path. Both transports have it — the desktop as a Tauri command,
+  // the phone via the gateway's save_image — so a phone photo works too; the
+  // picker there offers the camera natively.
   allowImages = mode === "transcript",
   // A phone has no Esc key, so hints that name one are worse than useless and
   // anything only reachable by keyboard needs a button of its own.
   touch = typeof window !== "undefined" &&
     window.matchMedia?.("(pointer: coarse)")?.matches === true,
+  // Questions already waiting when this view opened. The live `ask` ping only
+  // reaches whoever was connected at the time, so a client that arrives later
+  // — a phone that was asleep, or a chat opened after the fact — would never
+  // learn the agent is blocked on an answer.
+  pendingAsks,
 }) {
   // Desktop: Tauri IPC. Phone: the WebSocket to the machine owning this pane.
   const { invoke, listen } = useTransport();
@@ -206,6 +212,10 @@ export default memo(function ChatView({
   if (!storeRef.current) storeRef.current = createChatStore();
   const [, forceRender] = useReducer((n) => n + 1, 0);
   const [waiting, setWaiting] = useState(mode === "transcript");
+  // Zero messages means "backfill not here yet" until the watcher answers —
+  // over a phone's network that gap is long enough to flash the welcome
+  // panel over a conversation that very much exists.
+  const [loading, setLoading] = useState(mode === "transcript");
   const [watchError, setWatchError] = useState(null);
   const [tailCap, setTailCap] = useState(TAIL);
   const listRef = useRef(null);
@@ -390,6 +400,7 @@ export default memo(function ChatView({
         .then((res) => {
           if (dead) return;
           setWaiting(!res?.sid);
+          setLoading(false);
           if (res?.text) {
             try {
               applyLines(storeRef.current, res.text.split("\n"));
@@ -401,7 +412,10 @@ export default memo(function ChatView({
         })
         .catch((err) => {
           // an old broker answers "unknown op" — surface it, don't spin
-          if (!dead) setWatchError(String(err));
+          if (!dead) {
+            setWatchError(String(err));
+            setLoading(false);
+          }
         });
       unlistens.push(
         // storeRef.current, NOT a captured store: transcript-reset swaps the
@@ -410,6 +424,7 @@ export default memo(function ChatView({
         listen("transcript-lines", (e) => {
           if (e.payload.id !== id) return;
           setWaiting(false);
+          setLoading(false);
           if (applyLines(storeRef.current, e.payload.lines)) bump();
         }),
         listen("transcript-reset", (e) => {
@@ -457,6 +472,21 @@ export default memo(function ChatView({
     register?.({ focus: () => inputRef.current?.focus() });
     return () => register?.(null);
   }, [id]);
+
+  // Render questions that were already waiting. applyAsk dedupes by question
+  // signature, so this is a no-op once the live ping or the transcript has
+  // delivered the same one.
+  useEffect(() => {
+    if (!pendingAsks?.length) return;
+    let added = false;
+    for (const ask of pendingAsks) {
+      if (applyAsk(storeRef.current, ask.tool_id, ask.questions)) added = true;
+    }
+    if (added) {
+      setWaiting(false);
+      bump();
+    }
+  }, [pendingAsks]);
 
   const submit = async () => {
     const el = inputRef.current;
@@ -608,7 +638,10 @@ export default memo(function ChatView({
               {`chat view couldn't reach the transcript watcher (${watchError}).\nThe broker probably predates this build — use Settings → Workspace →\nRestart broker (or the command menu's "Restart broker").`}
             </pre>
           )}
-          {empty && !watchError && (
+          {empty && !watchError && loading && (
+            <div className="chat-loading" role="status" aria-label="loading conversation" />
+          )}
+          {empty && !watchError && !loading && (
             <div className="chat-empty">
               <LogoMark className="chat-empty-mark" aria-hidden="true" />
               <h2>{waiting ? "Ready when you are" : "New conversation"}</h2>
