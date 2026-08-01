@@ -2,11 +2,29 @@
    The chat itself is the desktop's own markup and styles — only the shell
    around it is phone-shaped, so a session reads the same on both. */
 
+/* Pin the document. overflow: hidden alone does not stop touch panning of the
+   root on mobile browsers once anything overflows — a swipe drags the whole
+   shell up and leaves a dead band below it. position: fixed makes the body
+   exactly viewport-sized so the document has nothing to scroll; only the inner
+   scrollers (.mob-body, the chat list) move. */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+}
+
 .mob {
-  /* --mob-keyboard is how much of the viewport the on-screen keyboard covers
-     (0 when closed); subtracting it keeps the composer sitting on top of the
-     keyboard instead of leaving a dead band beneath it. */
-  height: calc(100dvh - var(--mob-keyboard, 0px));
+  /* --mob-vh is visualViewport.height — the visible height with the keyboard
+     accounted for on every platform. 100dvh is only the fallback for browsers
+     without visualViewport. */
+  height: var(--mob-vh, 100dvh);
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -215,6 +233,27 @@
   font-size: 11px;
 }
 
+/* ---- waiting on you ---- */
+
+.mob-waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px 4px;
+  border: 1px solid rgba(var(--amber), 0.5);
+  border-radius: 14px;
+  background: rgba(var(--amber), 0.06);
+}
+
+.mob-waiting-head {
+  color: rgb(var(--amber));
+  padding-bottom: 4px;
+}
+
+.mob-waiting .mob-agent:first-of-type {
+  border-top: none;
+}
+
 /* ---- notes, warnings, empty states ---- */
 
 .mob-note,
@@ -326,6 +365,38 @@
 .mob-activity-meta {
   color: var(--text-dim);
   font-size: 12px;
+  white-space: nowrap;
+}
+
+/* Unread rows carry the accent bar; read ones recede. */
+.mob-activity-row {
+  position: relative;
+  padding-left: 8px;
+}
+
+.mob-activity-row.unread::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 2px;
+  background: rgb(var(--amber));
+}
+
+.mob-activity-row:not(.unread) {
+  color: var(--text-dim);
+}
+
+.mob-activity-clear {
+  min-height: 44px;
+  margin-top: 10px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
 }
 
 /* ---- settings ---- */
@@ -364,6 +435,36 @@
   /* 16px keeps iOS Safari from zooming the viewport on focus */
   font-size: 16px;
   font-family: var(--font-ui);
+}
+
+/* ---- theme picker ---- */
+
+.mob-theme-picker {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.mob-theme {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-head);
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.mob-theme.on {
+  color: rgb(var(--green));
+  border-color: rgba(var(--green), 0.55);
+  background: rgba(var(--green), 0.08);
 }
 
 /* ---- tab bar ---- */
@@ -431,6 +532,9 @@
 
 .mob-chat-title strong {
   font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mob-chat-title small {

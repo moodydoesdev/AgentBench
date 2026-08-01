@@ -30,6 +30,28 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+// The app mirrors its paired-gateway list (url + token per machine) into
+// IndexedDB, because a notification action handled here has to reach the
+// gateway itself — there is no window, and a service worker cannot read
+// localStorage.
+function readGateways() {
+  return new Promise((resolve) => {
+    const req = indexedDB.open("agentbench", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("kv");
+    req.onerror = () => resolve([]);
+    req.onsuccess = () => {
+      const db = req.result;
+      try {
+        const get = db.transaction("kv").objectStore("kv").get("gateways");
+        get.onsuccess = () => resolve(Array.isArray(get.result) ? get.result : []);
+        get.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    };
+  });
+}
+
 // A push arrives whether or not the app is open — that is the entire point of
 // carrying it on a phone rather than watching a screen.
 self.addEventListener("push", (event) => {
@@ -39,7 +61,16 @@ self.addEventListener("push", (event) => {
   } catch {
     data = { title: "AgentBench", body: event.data?.text() ?? "" };
   }
-  event.waitUntil(
+  // A question can carry its options as buttons: answering happens right on
+  // the notification, without the app ever opening. Capped — Android shows at
+  // most three actions, and "Open" must always survive the cut.
+  const actions = Array.isArray(data.actions)
+    ? data.actions
+        .slice(0, 2)
+        .map((title, i) => ({ action: `pick:${i}`, title: String(title) }))
+    : [];
+  if (actions.length) actions.push({ action: "open", title: "Open" });
+  const jobs = [
     self.registration.showNotification(data.title || "AgentBench", {
       body: data.body || "",
       // Replacing by tag keeps a busy agent from stacking a wall of
@@ -47,18 +78,61 @@ self.addEventListener("push", (event) => {
       tag: data.tag || "agentbench",
       renotify: true,
       icon: "/icon-192.png",
-      badge: "/icon-192.png",
+      // Android draws the badge from the alpha channel alone — an opaque
+      // square renders as a solid white blob, so this must be the monochrome
+      // white-on-transparent silhouette, not the app icon.
+      badge: "/badge-96.png",
       timestamp: Date.now(),
+      actions,
       data,
     }),
-  );
+  ];
+  // Something is waiting on the user — dot the app icon. The app itself owns
+  // the exact count and clears it; from here "nonzero" is all that's knowable.
+  if (data.kind && data.kind !== "done" && data.kind !== "test" && navigator.setAppBadge) {
+    jobs.push(navigator.setAppBadge().catch(() => {}));
+  }
+  event.waitUntil(Promise.all(jobs));
 });
 
+/** POST the picked option straight to the gateway that raised the question. */
+async function answerFromNotification(data, pick) {
+  const gateways = await readGateways();
+  const gw = gateways.find(
+    (g) => g.machine === data.machine || g.name === data.machine,
+  );
+  if (!gw) throw new Error("machine not paired");
+  const res = await fetch(`${gw.url.replace(/\/+$/, "")}/api/answer`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${gw.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ paneId: data.paneId, toolId: data.toolId ?? null, pick }),
+  });
+  if (!res.ok) throw new Error(`answer failed (${res.status})`);
+}
+
 // Tapping a notification should land on the agent it is about, reusing an
-// open window rather than piling up new ones.
+// open window rather than piling up new ones. Tapping an answer button
+// resolves the question in place instead.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const { machine, paneId } = event.notification.data ?? {};
+  const data = event.notification.data ?? {};
+  const { machine, paneId } = data;
+  const m = /^pick:(\d+)$/.exec(event.action ?? "");
+  if (m) {
+    event.waitUntil(
+      answerFromNotification(data, Number(m[1])).catch(() =>
+        // The gateway refused (someone else answered, claim expired, offline)
+        // — fall back to opening the pane so the question is still reachable.
+        self.clients.openWindow(
+          `/?pane=${paneId}&machine=${encodeURIComponent(machine ?? "")}`,
+        ),
+      ),
+    );
+    return;
+  }
   const target = paneId ? `/?pane=${paneId}&machine=${encodeURIComponent(machine ?? "")}` : "/";
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {

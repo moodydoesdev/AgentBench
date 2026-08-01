@@ -47,6 +47,14 @@ const FS_FOR = {
   // Same contract as the desktop command: an image goes to a temp file and
   // Claude is handed the path.
   save_pasted_image: (a) => ({ fs: "save_image", dataUrl: a.dataUrl }),
+  // Was allowlisted on the gateway but never mapped here, so every refresh
+  // rejected with "not available on mobile" and titles froze at connect time.
+  pane_titles: () => ({ fs: "pane_titles" }),
+  // Working-tree changes for a project, so a run can be reviewed from the
+  // phone before anyone says "ship it".
+  git_changes: (a) => ({ fs: "git_changes", cwd: a.cwd }),
+  // Token totals for one session transcript.
+  session_stats: (a) => ({ fs: "session_stats", project: a.project, sid: a.sid }),
 };
 
 /** Desktop: straight through to the Tauri backend. */
