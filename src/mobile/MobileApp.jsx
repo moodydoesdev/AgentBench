@@ -254,6 +254,40 @@ export default function MobileApp() {
   // keeps updating underneath, and the sheet should show live status (and
   // vanish if the pane exits while it's up).
   const [paneSheet, setPaneSheet] = useState(null); // { url, paneId }
+  // Back pressed at the home screen: armed for a moment, exits on the second
+  // press — the Android convention, instead of a blocking dialog.
+  const [exitArmed, setExitArmed] = useState(false);
+  const exitArmedRef = useRef(false);
+
+  // Exit guard: one sentinel entry sits UNDER every layer's entry, so a back
+  // press at the home screen pops the sentinel (not the app) and lands here.
+  useEffect(() => {
+    history.pushState({ mobRoot: true }, "");
+    let timer = 0;
+    const onPop = () => {
+      const s = history.state ?? {};
+      // a layer's entry or the sentinel itself — someone else's pop
+      if (s.mobLayer || s.mobRoot) return;
+      if (exitArmedRef.current) {
+        // second press while armed: really leave
+        history.back();
+        return;
+      }
+      exitArmedRef.current = true;
+      setExitArmed(true);
+      history.pushState({ mobRoot: true }, ""); // re-arm the sentinel
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        exitArmedRef.current = false;
+        setExitArmed(false);
+      }, 2200);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      clearTimeout(timer);
+    };
+  }, []);
   const [updateReady, setUpdateReady] = useState(false);
   const [theme, setTheme] = useState(loadThemeId);
   const { machines, refresh } = useFleet(gateways);
@@ -305,7 +339,8 @@ export default function MobileApp() {
     const t = q.get("tab");
     if (t === "activity" || t === "settings") setTab(t);
     if (t || q.get("pane"))
-      history.replaceState(null, "", location.pathname + location.hash);
+      // history.state, not null — see the pairing consume above
+      history.replaceState(history.state, "", location.pathname + location.hash);
   }, []);
 
   useEffect(() => {
@@ -345,7 +380,9 @@ export default function MobileApp() {
     const consumeHandshake = () => {
       const handshake = readPairingHash();
       if (!handshake) return;
-      history.replaceState(null, "", location.pathname + location.search);
+      // keep the entry's state: this may be the exit-guard sentinel, and
+      // nulling its marker would make closing a layer look like an exit
+      history.replaceState(history.state, "", location.pathname + location.search);
       setTab("fleet");
       setGateways((list) => {
         if (list.some((g) => g.url === handshake.url)) {
@@ -508,6 +545,10 @@ export default function MobileApp() {
         <TabButton icon={Bell} label="Activity" badge={unread} on={tab === "activity"} onClick={() => setTab("activity")} />
         <TabButton icon={Gear} label="Settings" on={tab === "settings"} onClick={() => setTab("settings")} />
       </nav>
+
+      {exitArmed && (
+        <div className="mob-exit-toast">Press back again to exit AgentBench</div>
+      )}
 
       {sheetMachine && sheetPane && (
         <PaneActionSheet

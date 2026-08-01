@@ -126,6 +126,24 @@ body {
   }
 }
 
+/* "Press back again to exit" — floats above the tab bar, self-dismisses. */
+.mob-exit-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + 76px);
+  transform: translateX(-50%);
+  z-index: 70;
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-head);
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  animation: mob-tab-in 0.16s ease-out;
+}
+
 /* Motion is decoration here; honor the OS-level opt-out. */
 @media (prefers-reduced-motion: reduce) {
   .mob-body,
