@@ -5,6 +5,7 @@ import {
   CaretLeft,
   Desktop,
   Gear,
+  HandPalm,
   Plugs,
   Plus,
   SquaresFour,
@@ -16,12 +17,15 @@ import LogView from "./LogView";
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
 import { BUILTIN_HARNESSES } from "../settings";
+import { THEMES, getTheme } from "../themes";
+import { applyTheme, loadThemeId, saveThemeId } from "./theme";
 import { disablePush, enablePush, isSubscribed, pushSupported, testPush } from "./push";
 import {
   CLIENT_PROTOCOL,
   baseName,
   groupPanes,
   loadGateways,
+  mirrorGatewaysForSw,
   saveGateways,
   useFleet,
 } from "./gateways";
@@ -32,6 +36,57 @@ const STATUS_LABEL = {
   input: "needs input",
   exited: "exited",
 };
+
+const ACTIVITY_KEY = "agentbench.activity";
+const ACTIVITY_READ_KEY = "agentbench.activityRead";
+
+/** The feed survives reloads — a phone reloads constantly (memory pressure,
+    update banner), and losing the night's history every time made it useless
+    for catching up. */
+function loadActivity() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(ACTIVITY_KEY) ?? "[]");
+    return Array.isArray(raw) ? raw.filter((a) => a?.key).slice(0, 100) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Panes blocked on the user, across every machine. */
+function waitingItems(machines) {
+  const out = [];
+  for (const m of machines) {
+    for (const pane of m.panes ?? []) {
+      const ask = (m.asks ?? []).some((a) => a.id === pane.id);
+      if (!ask && m.statuses?.[pane.id] !== "input") continue;
+      out.push({ machine: m, pane, ask });
+    }
+  }
+  return out;
+}
+
+/** The one shape ChatScreen needs, built the same from every entry point. */
+function paneOpen(machine, pane) {
+  const title = machine.titles?.[pane.id] ?? pane.title;
+  return {
+    url: machine.url,
+    paneId: pane.id,
+    cwd: pane.cwd,
+    label: title || `${pane.harness ?? "agent"} ${pane.id}`,
+    subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
+    kind: pane.kind,
+    chat: isChatPane(pane),
+    machine: machine.machine ?? machine.name,
+  };
+}
+
+function ago(ts) {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
 
 /**
  * Only Claude panes keep a transcript, which is what the chat view reads.
@@ -61,10 +116,28 @@ export default function MobileApp() {
   const [gateways, setGateways] = useState(loadGateways);
   const [tab, setTab] = useState("fleet");
   const [open, setOpen] = useState(null); // { url, paneId, cwd, label }
-  const [activity, setActivity] = useState([]);
+  const [activity, setActivity] = useState(loadActivity);
+  const [activityRead, setActivityRead] = useState(
+    () => Number(localStorage.getItem(ACTIVITY_READ_KEY)) || 0,
+  );
+  // A notification tapped with no window open lands on /?pane=…&machine=…
+  // (sw.js falls back to a URL when there is no client to postMessage); a
+  // manifest shortcut lands on /?tab=…. Held until the fleet knows the pane.
+  const [pendingOpen, setPendingOpen] = useState(() => {
+    const q = new URLSearchParams(location.search);
+    return q.get("pane")
+      ? { paneId: q.get("pane"), machine: q.get("machine") }
+      : null;
+  });
   const [pairing, setPairing] = useState(null); // { state, message }
   const [updateReady, setUpdateReady] = useState(false);
+  const [theme, setTheme] = useState(loadThemeId);
   const { machines, refresh } = useFleet(gateways);
+
+  useEffect(() => {
+    saveThemeId(theme);
+    applyTheme(theme);
+  }, [theme]);
 
   // A new build is on the workstation; reloading is the user's call so it
   // cannot interrupt a message being typed.
@@ -76,6 +149,54 @@ export default function MobileApp() {
 
   useEffect(() => saveGateways(gateways), [gateways]);
 
+  useEffect(() => {
+    localStorage.setItem(ACTIVITY_KEY, JSON.stringify(activity.slice(0, 100)));
+  }, [activity]);
+
+  // Keep the service worker's copy of the pairings fresh — including the
+  // machine name each gateway reported, which is what push payloads carry.
+  useEffect(() => {
+    mirrorGatewaysForSw(
+      machines.map((m) => ({
+        url: m.url,
+        token: m.token,
+        name: m.name ?? null,
+        machine: m.machine ?? null,
+      })),
+    );
+  }, [machines.map((m) => `${m.url}|${m.machine ?? ""}`).join(",")]);
+
+  // Opening the tab is what "reading" means here; new rows arriving while the
+  // tab is showing are read too, hence activity.length in the deps.
+  useEffect(() => {
+    if (tab !== "activity") return;
+    const now = Date.now();
+    setActivityRead(now);
+    localStorage.setItem(ACTIVITY_READ_KEY, String(now));
+  }, [tab, activity.length]);
+
+  // Shortcut / cold-notification URL params, consumed once.
+  useEffect(() => {
+    const q = new URLSearchParams(location.search);
+    const t = q.get("tab");
+    if (t === "activity" || t === "settings") setTab(t);
+    if (t || q.get("pane"))
+      history.replaceState(null, "", location.pathname + location.hash);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingOpen) return;
+    const target = machines.find(
+      (m) => m.machine === pendingOpen.machine || m.name === pendingOpen.machine,
+    );
+    const pane = target?.panes?.find(
+      (p) => String(p.id) === String(pendingOpen.paneId),
+    );
+    if (!target || !pane) return;
+    setPendingOpen(null);
+    setOpen(paneOpen(target, pane));
+  }, [machines, pendingOpen]);
+
   // Tapping a notification focuses the app; the service worker tells us which
   // agent it was about so the tap lands somewhere useful.
   useEffect(() => {
@@ -85,18 +206,9 @@ export default function MobileApp() {
       const target = machines.find(
         (m) => m.machine === machine || m.name === machine,
       );
-      const pane = target?.panes?.find((p) => p.id === paneId);
+      const pane = target?.panes?.find((p) => String(p.id) === String(paneId));
       if (!target || !pane) return;
-      setOpen({
-        url: target.url,
-        paneId: pane.id,
-        cwd: pane.cwd,
-        label: pane.title || `${pane.harness ?? "agent"} ${pane.id}`,
-        subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
-        kind: pane.kind,
-        chat: isChatPane(pane),
-        machine: target.machine ?? target.name,
-      });
+      setOpen(paneOpen(target, pane));
     };
     navigator.serviceWorker?.addEventListener("message", onMessage);
     return () => navigator.serviceWorker?.removeEventListener("message", onMessage);
@@ -167,7 +279,18 @@ export default function MobileApp() {
     return () => offs.forEach((p) => p.then?.((f) => f?.()));
   }, [machines.map((m) => m.url).join(",")]);
 
-  const unread = activity.filter((a) => a.kind !== "done").length;
+  const unread = activity.filter((a) => a.at > activityRead).length;
+  const waiting = waitingItems(machines);
+
+  // The home-screen icon carries the count of panes blocked on an answer —
+  // the number that decides whether the phone is worth picking up.
+  useEffect(() => {
+    if (!("setAppBadge" in navigator)) return;
+    (waiting.length
+      ? navigator.setAppBadge(waiting.length)
+      : navigator.clearAppBadge()
+    )?.catch?.(() => {});
+  }, [waiting.length]);
 
   if (open) {
     const machine = machines.find((m) => m.url === open.url);
@@ -199,14 +322,29 @@ export default function MobileApp() {
 
       <main className="mob-body">
         {tab === "fleet" && (
-          <FleetScreen machines={machines} onOpen={setOpen} onAdd={() => setTab("settings")} />
+          <FleetScreen
+            machines={machines}
+            waiting={waiting}
+            onOpen={setOpen}
+            onAdd={() => setTab("settings")}
+          />
         )}
-        {tab === "activity" && <ActivityScreen items={activity} machines={machines} onOpen={setOpen} />}
+        {tab === "activity" && (
+          <ActivityScreen
+            items={activity}
+            readAt={activityRead}
+            machines={machines}
+            onOpen={setOpen}
+            onClear={() => setActivity([])}
+          />
+        )}
         {tab === "settings" && (
           <SettingsScreen
             gateways={gateways}
             machines={machines}
             onChange={setGateways}
+            theme={theme}
+            onTheme={setTheme}
           />
         )}
       </main>
@@ -247,7 +385,41 @@ function TabButton({ icon: Icon, label, on, badge, onClick }) {
   );
 }
 
-function FleetScreen({ machines, onOpen, onAdd }) {
+/** Everything blocked on an answer, across all machines, in one tappable
+    place — the reason the app got opened, so it goes first. */
+function WaitingSection({ waiting, onOpen }) {
+  if (!waiting.length) return null;
+  return (
+    <section className="mob-waiting">
+      <div className="mob-machine-head mob-waiting-head">
+        <HandPalm size={13} weight="bold" />
+        <span>Waiting on you</span>
+      </div>
+      {waiting.map(({ machine, pane, ask }) => {
+        const title = machine.titles?.[pane.id] ?? pane.title;
+        return (
+          <button
+            key={`${machine.url}-${pane.id}`}
+            className="mob-agent"
+            onClick={() => onOpen(paneOpen(machine, pane))}
+          >
+            <span className="mob-agent-name">
+              <span className="mob-agent-title">
+                {title || `${pane.harness ?? "agent"} ${pane.id}`}
+              </span>
+              <span className="mob-agent-id">
+                {baseName(pane.cwd)} · {machine.machine ?? machine.name}
+              </span>
+            </span>
+            <span className="mob-ask">{ask ? "question" : "needs input"}</span>
+          </button>
+        );
+      })}
+    </section>
+  );
+}
+
+function FleetScreen({ machines, waiting, onOpen, onAdd }) {
   if (machines.length === 0) {
     return (
       <div className="mob-empty">
@@ -265,6 +437,7 @@ function FleetScreen({ machines, onOpen, onAdd }) {
   }
   return (
     <div className="mob-fleet">
+      <WaitingSection waiting={waiting} onOpen={onOpen} />
       {machines.map((m) => (
         <MachineSection key={m.url} machine={m} onOpen={onOpen} />
       ))}
@@ -290,6 +463,8 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
         // a phone-sized terminal; the desktop resizes it when it attaches
         cols: 100,
         rows: 30,
+        // theme only means something to Claude's settings file
+        theme: harness.claude ? getTheme(loadThemeId()).claudeTheme ?? null : null,
         harness: {
           id: harness.id,
           command: harness.command,
@@ -505,6 +680,10 @@ function ChatScreen({ machine, pane, onBack }) {
             cwd={pane.cwd}
             mode={pane.kind === "chat" ? "stream" : "transcript"}
             placeholder="Message Claude…"
+            // A question posed while the phone was asleep only exists in the
+            // fleet snapshot; without this the agent looks idle rather than
+            // blocked on an answer.
+            pendingAsks={(machine.asks ?? []).filter((a) => a.id === pane.paneId)}
             onSend={(text) => sendToPane(machine.transport, pane, text)}
             onStop={(resubmit) =>
               machine.transport
@@ -548,7 +727,7 @@ function sendToPane(transport, pane, text) {
   setTimeout(submit, 1300);
 }
 
-function ActivityScreen({ items, machines, onOpen }) {
+function ActivityScreen({ items, readAt, machines, onOpen, onClear }) {
   if (!items.length) {
     return (
       <div className="mob-empty">
@@ -559,32 +738,30 @@ function ActivityScreen({ items, machines, onOpen }) {
   }
   return (
     <div className="mob-activity">
-      {items.map((a) => (
-        <button
-          key={a.key}
-          className="mob-activity-row"
-          onClick={() => {
-            const m = machines.find((x) => x.url === a.url);
-            const pane = m?.panes?.find((p) => p.id === a.paneId);
-            if (m && pane)
-              onOpen({
-                url: m.url,
-                paneId: pane.id,
-                cwd: pane.cwd,
-                label: `${pane.harness ?? "agent"} ${pane.id}`,
-                kind: pane.kind,
-                chat: isChatPane(pane),
-                machine: m.machine ?? m.name,
-              });
-          }}
-        >
-          <span className={`mob-dot ${a.kind === "done" ? "done" : "input"}`} />
-          <span className="mob-activity-text">
-            Agent {a.paneId} {a.kind === "done" ? "finished" : "needs input"}
-          </span>
-          <span className="mob-activity-meta">{a.machine}</span>
-        </button>
-      ))}
+      {items.map((a) => {
+        const m = machines.find((x) => x.url === a.url);
+        const pane = m?.panes?.find((p) => String(p.id) === String(a.paneId));
+        const title = m?.titles?.[a.paneId] ?? pane?.title;
+        return (
+          <button
+            key={a.key}
+            className={`mob-activity-row${a.at > readAt ? " unread" : ""}`}
+            onClick={() => m && pane && onOpen(paneOpen(m, pane))}
+          >
+            <span className={`mob-dot ${a.kind === "done" ? "done" : "input"}`} />
+            <span className="mob-activity-text">
+              {title || `Agent ${a.paneId}`}{" "}
+              {a.kind === "done" ? "finished" : "needs input"}
+            </span>
+            <span className="mob-activity-meta">
+              {a.machine} · {ago(a.at)}
+            </span>
+          </button>
+        );
+      })}
+      <button className="mob-activity-clear" onClick={onClear}>
+        Clear history
+      </button>
     </div>
   );
 }
@@ -668,7 +845,7 @@ function PushRow({ gateway, machines }) {
   );
 }
 
-function SettingsScreen({ gateways, machines, onChange }) {
+function SettingsScreen({ gateways, machines, onChange, theme, onTheme }) {
   const [url, setUrl] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -729,6 +906,26 @@ function SettingsScreen({ gateways, machines, onChange }) {
           <PushRow key={g.url} gateway={g} machines={machines} />
         ))
       )}
+
+      <h2>Appearance</h2>
+      <div className="mob-card">
+        <div className="mob-theme-picker">
+          {Object.entries(THEMES).map(([id, t]) => (
+            <button
+              key={id}
+              className={`mob-theme${theme === id ? " on" : ""}`}
+              onClick={() => onTheme(id)}
+            >
+              <span className="theme-chips" style={{ background: t.vars["--bg"] }}>
+                <i style={{ background: `rgb(${t.vars["--green"]})` }} />
+                <i style={{ background: `rgb(${t.vars["--amber"]})` }} />
+                <i style={{ background: t.vars["--text"] }} />
+              </span>
+              {t.name}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <h2>This app</h2>
       <div className="mob-card">

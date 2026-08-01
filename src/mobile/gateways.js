@@ -28,6 +28,30 @@ export function saveGateways(list) {
 }
 
 /**
+ * Mirror the pairing list into IndexedDB for the service worker: answering a
+ * question from a notification button happens with no window open, and a
+ * service worker cannot read localStorage.
+ */
+export function mirrorGatewaysForSw(list) {
+  try {
+    const req = indexedDB.open("agentbench", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("kv");
+    req.onsuccess = () => {
+      try {
+        req.result
+          .transaction("kv", "readwrite")
+          .objectStore("kv")
+          .put(list, "gateways");
+      } catch {
+        /* mirror is best-effort */
+      }
+    };
+  } catch {
+    /* no IndexedDB — actions just fall back to opening the app */
+  }
+}
+
+/**
  * Opens one connection per enabled gateway and keeps a merged view of the
  * fleet. Each entry exposes its own transport, so a pane's chat is always
  * driven by the machine that actually owns it.
