@@ -235,11 +235,17 @@ function MobileAccess() {
     }
   };
 
-  const pair = async (force = false) => {
+  // force === true only — this lands on <button onClick={pair}>, where the
+  // first argument is the click event. Passing that through to invoke() made
+  // Tauri JSON.stringify a SyntheticEvent (whose .view is window — cyclic),
+  // which WebKit rejects: "Show QR code" errored on macOS.
+  const pair = async (force) => {
     setBusy("pair");
     setError(null);
     try {
-      setPairing(await invoke("gateway_pair", { url: chosenUrl || null, force }));
+      setPairing(
+        await invoke("gateway_pair", { url: chosenUrl || null, force: force === true }),
+      );
     } catch (err) {
       setError(String(err));
     } finally {
