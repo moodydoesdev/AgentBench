@@ -1072,6 +1072,12 @@ body {
   background: var(--panel);
   border-top: 1px solid var(--border);
   animation: mob-sheet-up 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+  /* A tall sheet (harness list + recent sessions) must scroll, not grow past
+     the top of the screen with its first rows unreachable. */
+  max-height: calc(var(--mob-vh, 100dvh) - 48px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .mob-sheet-danger {
