@@ -98,6 +98,22 @@ function paneOpen(machine, pane) {
 // needs to shrink.
 let layerSeq = 0;
 
+// A layer closed by its own UI still owns one history entry, consumed with
+// history.back(). That back is ASYNC — and it can race a layer pushed in the
+// same commit (new-agent sheet closing while the pane screen opens): the pop
+// lands on the NEW entry and the pane closes in the same breath it opened.
+// This listener registers at module init — before any layer's — so it sees
+// the pop of our own consumption first and stops it reaching layer handlers.
+if (typeof window !== "undefined" && !window.__mobBackConsume) {
+  window.__mobBackConsume = { n: 0 };
+  window.addEventListener("popstate", (e) => {
+    if (window.__mobBackConsume.n > 0) {
+      window.__mobBackConsume.n -= 1;
+      e.stopImmediatePropagation();
+    }
+  });
+}
+
 /**
  * Make the system back gesture peel this layer instead of leaving the app.
  *
@@ -123,8 +139,12 @@ function useBackLayer(active, close) {
     return () => {
       window.removeEventListener("popstate", onPop);
       // closed by the UI, not the gesture: the entry is still there — consume
-      // it after our listener is gone so no other layer reacts to it
-      if ((history.state?.mobLayer ?? 0) >= depth) history.back();
+      // it, flagging the pop as ours so no live layer mistakes it for the
+      // user navigating
+      if ((history.state?.mobLayer ?? 0) >= depth) {
+        window.__mobBackConsume.n += 1;
+        history.back();
+      }
     };
   }, [active]);
 }
@@ -1019,6 +1039,9 @@ function ChatBody({ machine, pane, status }) {
       cwd={pane.cwd}
       mode={headless ? "stream" : "transcript"}
       initialLines={lines}
+      // headless panes ingest images the same way — the gateway writes the
+      // photo to a temp file and Claude reads it by path
+      allowImages
       placeholder="Message Claude…"
       // A question posed while the phone was asleep only exists in the
       // fleet snapshot; without this the agent looks idle rather than
