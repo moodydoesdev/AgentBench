@@ -571,8 +571,23 @@ impl Gateway {
     /// only needs identity and status; a pane's backlog is fetched when one is
     /// actually opened (`pane_buffer`).
     pub async fn hello(&self) -> Value {
+        json!({
+            "ev": "hello",
+            "machine": self.machine,
+            "protocolVersion": PROTOCOL_VERSION,
+            "brokerConnected": self.broker.is_connected(),
+            "startedAt": self.started_at,
+            "panes": self.panes_json().await,
+            "statuses": self.snapshot.statuses_json(),
+            "asks": self.snapshot.asks_json(),
+            "projects": fsdata::read_projects(),
+        })
+    }
+
+    /// Identity and naming of every pane — the fleet list, no scrollback.
+    async fn panes_json(&self) -> Value {
         let panes = self.broker.request(json!({ "op": "list" })).await;
-        let panes = match panes {
+        match panes {
             Ok(Value::Array(list)) => {
                 let solo = solo_projects(&list);
                 let mut out = Vec::with_capacity(list.len());
@@ -597,18 +612,19 @@ impl Gateway {
                 Value::Array(out)
             }
             _ => Value::Array(vec![]),
-        };
-        json!({
-            "ev": "hello",
-            "machine": self.machine,
-            "protocolVersion": PROTOCOL_VERSION,
-            "brokerConnected": self.broker.is_connected(),
-            "startedAt": self.started_at,
-            "panes": panes,
+        }
+    }
+
+    /// Tell every connected phone the pane list changed. A pane created on
+    /// one device must appear on the rest now, not at their next reconnect —
+    /// the broker itself has no pane-created event, so the gateway (which
+    /// just performed the create) is the one place that knows.
+    async fn broadcast_panes(&self) {
+        let _ = self.broker.events.send(json!({
+            "ev": "panes",
+            "panes": self.panes_json().await,
             "statuses": self.snapshot.statuses_json(),
-            "asks": self.snapshot.asks_json(),
-            "projects": fsdata::read_projects(),
-        })
+        }));
     }
 
     /// One pane's scrollback, for a log view that has just been opened. Pty
@@ -702,7 +718,14 @@ impl Gateway {
             obj.remove("id_");
         }
         if REQUEST_OPS.contains(&op) {
-            Ok(Some(self.broker.request(fwd).await?))
+            let result = self.broker.request(fwd).await?;
+            if matches!(op, "create" | "create-chat") {
+                if let Some(id) = result.as_u64() {
+                    self.snapshot.seed_pane(id as u32);
+                }
+                self.broadcast_panes().await;
+            }
+            Ok(Some(result))
         } else {
             self.broker.send(fwd).await?;
             Ok(None)

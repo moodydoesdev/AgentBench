@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowClockwise,
   Bell,
@@ -686,31 +686,43 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
     };
   }, [project.cwd]);
 
-  const start = async (harness, resume) => {
-    setBusy(resume ?? harness.id);
+  const start = async (harness, resume, terminal = false) => {
+    setBusy(resume ?? (terminal ? `${harness.id}-tty` : harness.id));
     setError(null);
     try {
-      const id = await machine.transport.invoke("create_pane", {
-        cwd: project.cwd,
-        // a phone-sized terminal; the desktop resizes it when it attaches
-        cols: 100,
-        rows: 30,
-        resume: resume ?? null,
-        // theme only means something to Claude's settings file
-        theme: harness.claude ? getTheme(loadThemeId()).claudeTheme ?? null : null,
-        harness: {
-          id: harness.id,
-          command: harness.command,
-          resume: harness.resume ?? null,
-          claude: !!harness.claude,
-          interactive: !!harness.interactive,
-        },
-      });
+      // Claude starts headless by default (claude -p, stream-json): the pane
+      // exists the moment the process spawns — no PowerShell or TUI boot to
+      // sit through — and anything typed early queues in its stdin instead of
+      // leaking into a half-started shell. The terminal variant stays for
+      // sessions that need the real TUI (dialogs, permission prompts).
+      const headless = !!harness.claude && !terminal;
+      const id = headless
+        ? await machine.transport.invoke("create_chat_pane", {
+            cwd: project.cwd,
+            resume: resume ?? null,
+          })
+        : await machine.transport.invoke("create_pane", {
+            cwd: project.cwd,
+            // a phone-sized terminal; the desktop resizes it when it attaches
+            cols: 100,
+            rows: 30,
+            resume: resume ?? null,
+            // theme only means something to Claude's settings file
+            theme: harness.claude ? getTheme(loadThemeId()).claudeTheme ?? null : null,
+            harness: {
+              id: harness.id,
+              command: harness.command,
+              resume: harness.resume ?? null,
+              claude: !!harness.claude,
+              interactive: !!harness.interactive,
+            },
+          });
       onStarted({
         url: machine.url,
         paneId: id,
         cwd: project.cwd,
         label: `${harness.id} ${id}`,
+        kind: headless ? "chat" : undefined,
         chat: !!harness.claude,
         machine: machine.machine ?? machine.name,
       });
@@ -730,19 +742,36 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
           <small className="mob-mono">{project.cwd}</small>
         </div>
         {BUILTIN_HARNESSES.map((h) => (
-          <button
-            key={h.id}
-            className="mob-sheet-item"
-            disabled={busy != null}
-            onClick={() => start(h)}
-          >
-            <span>{h.name}</span>
-            {busy === h.id ? (
-              <small>starting…</small>
-            ) : (
-              <small className="mob-mono">{h.command.split(" ")[0]}</small>
+          <Fragment key={h.id}>
+            <button
+              className="mob-sheet-item"
+              disabled={busy != null}
+              onClick={() => start(h)}
+            >
+              <span>{h.name}</span>
+              {busy === h.id ? (
+                <small>starting…</small>
+              ) : (
+                <small className="mob-mono">
+                  {h.claude ? "instant · claude -p" : h.command.split(" ")[0]}
+                </small>
+              )}
+            </button>
+            {h.claude && (
+              <button
+                className="mob-sheet-item"
+                disabled={busy != null}
+                onClick={() => start(h, null, true)}
+              >
+                <span>{h.name} · terminal</span>
+                {busy === `${h.id}-tty` ? (
+                  <small>starting…</small>
+                ) : (
+                  <small className="mob-mono">full TUI, slower start</small>
+                )}
+              </button>
             )}
-          </button>
+          </Fragment>
         ))}
         {claude && sessions?.length > 0 && (
           <>
@@ -962,6 +991,50 @@ function MachineSection({ machine, onOpen, onActions }) {
   );
 }
 
+/**
+ * Chat-rendered pane body. Headless (kind "chat") panes replay their
+ * scrollback from pane_buffer before going live — the stream only carries
+ * what happens from now on, so without the backfill a reopened chat pane
+ * would look brand new.
+ */
+function ChatBody({ machine, pane, status }) {
+  const headless = pane.kind === "chat";
+  const [lines, setLines] = useState(headless ? null : []);
+  useEffect(() => {
+    if (!headless) return;
+    let dead = false;
+    machine.transport
+      .invoke("pane_buffer", { id: pane.paneId })
+      .then((res) => !dead && setLines(res?.lines ?? []))
+      .catch(() => !dead && setLines([]));
+    return () => {
+      dead = true;
+    };
+  }, [pane.paneId]);
+  if (lines == null)
+    return <div className="mob-note" style={{ margin: 14 }}>Opening…</div>;
+  return (
+    <ChatView
+      id={pane.paneId}
+      cwd={pane.cwd}
+      mode={headless ? "stream" : "transcript"}
+      initialLines={lines}
+      placeholder="Message Claude…"
+      // A question posed while the phone was asleep only exists in the
+      // fleet snapshot; without this the agent looks idle rather than
+      // blocked on an answer.
+      pendingAsks={(machine.asks ?? []).filter((a) => a.id === pane.paneId)}
+      onSend={(text) => sendToPane(machine.transport, pane, text)}
+      onStop={(resubmit) =>
+        machine.transport
+          .invoke("interrupt_pane", { id: pane.paneId, resubmit })
+          .catch(() => {})
+      }
+      status={status}
+    />
+  );
+}
+
 function ChatScreen({ machine, pane, closing, onBack }) {
   const [confirmKill, setConfirmKill] = useState(false);
   const [killError, setKillError] = useState(null);
@@ -1062,23 +1135,7 @@ function ChatScreen({ machine, pane, closing, onBack }) {
       <div className="mob-pane-view" style={view === "chat" ? undefined : { display: "none" }}>
         {chat ? (
           <TransportProvider transport={machine.transport}>
-            <ChatView
-              id={pane.paneId}
-              cwd={pane.cwd}
-              mode={pane.kind === "chat" ? "stream" : "transcript"}
-              placeholder="Message Claude…"
-              // A question posed while the phone was asleep only exists in the
-              // fleet snapshot; without this the agent looks idle rather than
-              // blocked on an answer.
-              pendingAsks={(machine.asks ?? []).filter((a) => a.id === pane.paneId)}
-              onSend={(text) => sendToPane(machine.transport, pane, text)}
-              onStop={(resubmit) =>
-                machine.transport
-                  .invoke("interrupt_pane", { id: pane.paneId, resubmit })
-                  .catch(() => {})
-              }
-              status={status}
-            />
+            <ChatBody machine={machine} pane={pane} status={status} />
           </TransportProvider>
         ) : (
           <LogView

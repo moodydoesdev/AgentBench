@@ -133,6 +133,14 @@ export function useFleet(gateways) {
           asks: [...(c.asks ?? []).filter((a) => a.id !== payload.id), payload],
         })),
       );
+      // The gateway rebroadcasts the pane list after a create — a pane
+      // started on any device shows up everywhere without a reconnect.
+      t.listen("panes", ({ payload }) =>
+        patch2(setConns, url, () => ({
+          panes: payload.panes ?? [],
+          ...(payload.statuses ? { statuses: payload.statuses } : {}),
+        })),
+      );
       t.listen("turn", ({ payload }) =>
         patch2(setConns, url, (c) =>
           payload.active
