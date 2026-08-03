@@ -646,7 +646,21 @@ pub fn kill_pane(core: &Core, id: u32) {
         let _ = pane.killer.kill();
     }
     if let Some(pane) = core.chat_panes.lock().unwrap().get(&id) {
-        let _ = pane.child.lock().unwrap().kill();
+        let mut child = pane.child.lock().unwrap();
+        // On Windows `child` is the shell that launched claude, and killing it
+        // strands the grandchild with the pipes open: the stream never closes,
+        // pane-exit never fires, and the pane refuses to die. (Unix `exec`s,
+        // so shell and claude are the same process.) Take down the whole tree.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+        let _ = child.kill();
     }
 }
 
