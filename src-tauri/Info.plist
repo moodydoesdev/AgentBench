@@ -11,6 +11,17 @@
 	  process (not the broker, which is a bare executable with no bundle and so
 	  can never be granted), so the keys have to live here.
 	-->
+	<!--
+	  Linked benches and dev-server previews are plain HTTP on LAN or Tailscale
+	  IP literals (the gateway's TLS story is `tailscale serve`, not certs of
+	  our own). Without this, ATS silently blocks the webview's fetch/WebSocket
+	  to a linked machine and preview windows render nothing.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>AgentBench uses the microphone to dictate messages into the chat composer.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

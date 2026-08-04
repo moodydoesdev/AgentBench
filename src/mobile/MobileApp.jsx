@@ -5,6 +5,7 @@ import {
   CaretLeft,
   Desktop,
   Gear,
+  Globe,
   HandPalm,
   Plugs,
   Plus,
@@ -827,6 +828,171 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
 }
 
 /**
+ * Preview a dev server on this phone. The gateway stands up a cookie-gated
+ * proxy port in front of the chosen loopback port; this sheet opens it in the
+ * browser via the handshake URL, which sets the auth cookie and bounces to /.
+ * Candidates are scraped from the project's pane scrollback (vite and friends
+ * print their local URL on boot); the manual field covers servers AgentBench
+ * never saw start.
+ */
+function PreviewSheet({ project, machine, onClose }) {
+  const [detected, setDetected] = useState(null); // null = still looking
+  const [active, setActive] = useState([]);
+  const [hosts, setHosts] = useState([]);
+  const [manual, setManual] = useState("");
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+
+  const refresh = () => {
+    machine.transport
+      .invoke("preview_detect", { cwd: project.cwd })
+      .then((d) => setDetected(Array.isArray(d) ? d : []))
+      .catch((err) => {
+        setDetected([]);
+        setError(String(err.message ?? err));
+      });
+    machine.transport
+      .invoke("preview_list", {})
+      .then((res) => {
+        setActive(res?.previews ?? []);
+        setHosts(res?.hosts ?? []);
+      })
+      .catch(() => setActive([]));
+  };
+  useEffect(refresh, [project.cwd]);
+
+  // The phone already reaches the gateway by some address; if that is an IP
+  // it is proven routable and the preview should ride it. A named gateway
+  // (MagicDNS behind tailscale serve) falls back to the gateway's candidate
+  // list — always IPs, because dev servers' host checks allow IP literals
+  // and block unknown names.
+  const pickHost = (fresh) => {
+    try {
+      const h = new URL(machine.url).hostname;
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return h;
+    } catch {
+      /* fall through to the gateway's list */
+    }
+    return (fresh?.length ? fresh : hosts)[0] ?? null;
+  };
+
+  const openTab = (p, fresh) => {
+    const h = pickHost(fresh);
+    if (!h) {
+      setError("No reachable address for this machine — is Tailscale connected?");
+      return;
+    }
+    const path = p.handshakePath ?? "/__abpv";
+    window.open(`http://${h}:${p.publicPort}${path}?t=${p.secret}`, "_blank", "noopener");
+  };
+
+  const start = async (port) => {
+    setBusy(port);
+    setError(null);
+    try {
+      const res = await machine.transport.invoke("preview_start", {
+        cwd: project.cwd,
+        port,
+      });
+      openTab(res, res.hosts);
+      refresh();
+    } catch (err) {
+      setError(String(err.message ?? err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const stop = (port) =>
+    machine.transport.invoke("preview_stop", { port }).then(refresh).catch(() => {});
+
+  const paneName = (id) => {
+    const p = machine.panes?.find((x) => String(x.id) === String(id));
+    return p ? `${p.harness ?? "pane"} ${p.id}` : `pane ${id}`;
+  };
+
+  const mine = active.filter((p) => p.cwd === project.cwd);
+  const activePorts = new Set(mine.map((p) => p.targetPort));
+  const candidates = (detected ?? [])
+    .filter((d) => !activePorts.has(d.port))
+    // dead mentions in old scrollback sort under anything actually listening
+    .sort((a, b) => (b.live === true) - (a.live === true));
+
+  return (
+    <div className="mob-sheet-backdrop" onClick={onClose}>
+      <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-head">
+          <strong>Preview — {project.name}</strong>
+          <small className="mob-mono">
+            serves the workstation's dev server to this phone
+          </small>
+        </div>
+
+        {mine.length > 0 && <div className="mob-sheet-sub">Being previewed</div>}
+        {mine.map((p) => (
+          <div key={p.targetPort} className="mob-sheet-item mob-preview-row">
+            <button className="mob-preview-open" onClick={() => openTab(p)}>
+              <span className="mob-mono mob-preview-port">:{p.targetPort}</span>
+              <small>{p.live === false ? "server stopped — tap Stop" : "tap to open"}</small>
+            </button>
+            <button className="mob-preview-stop" onClick={() => stop(p.targetPort)}>
+              Stop
+            </button>
+          </div>
+        ))}
+
+        {detected == null && <div className="mob-note">Looking for dev servers…</div>}
+        {candidates.length > 0 && <div className="mob-sheet-sub">Detected in this project</div>}
+        {candidates.map((d) => (
+          <button
+            key={d.port}
+            className="mob-sheet-item"
+            disabled={busy != null || !d.live}
+            onClick={() => start(d.port)}
+          >
+            <span className="mob-mono mob-preview-port">:{d.port}</span>
+            {busy === d.port ? (
+              <small>starting…</small>
+            ) : (
+              <small>{d.live ? `seen in ${paneName(d.paneId)}` : "not listening"}</small>
+            )}
+          </button>
+        ))}
+        {detected != null && candidates.length === 0 && mine.length === 0 && (
+          <div className="mob-note">
+            No dev server spotted in this project's panes. Start one in a run
+            pane, or enter its port below.
+          </div>
+        )}
+
+        <div className="mob-sheet-sub">Any port</div>
+        <div className="mob-preview-manual">
+          <input
+            className="mob-input"
+            placeholder="Port, e.g. 5173"
+            inputMode="numeric"
+            value={manual}
+            onChange={(e) => setManual(e.target.value.replace(/\D/g, "").slice(0, 5))}
+          />
+          <button
+            className="mob-primary"
+            disabled={!manual || busy != null}
+            onClick={() => start(Number(manual))}
+          >
+            {busy != null && String(busy) === manual ? "…" : "Start"}
+          </button>
+        </div>
+
+        {error && <div className="mob-warn">{error}</div>}
+        <button className="mob-sheet-cancel" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Held-down agent row: everything you'd want to do to a session without
  * opening it. Ending a session confirms in place — the sheet is one hold and
  * one tap away, which is too easy a path to a kill to make it single-tap.
@@ -907,7 +1073,9 @@ function PaneActionSheet({ machine, pane, onClose, onOpen }) {
 function MachineSection({ machine, onOpen, onActions }) {
   const projects = groupPanes(machine);
   const [spawnIn, setSpawnIn] = useState(null);
+  const [previewIn, setPreviewIn] = useState(null);
   useBackLayer(spawnIn != null, () => setSpawnIn(null));
+  useBackLayer(previewIn != null, () => setPreviewIn(null));
   const stale =
     machine.protocolVersion != null && machine.protocolVersion !== CLIENT_PROTOCOL;
   return (
@@ -990,10 +1158,16 @@ function MachineSection({ machine, onOpen, onActions }) {
                 </span>
               </PaneRow>
             ))}
-            <button className="mob-agent mob-new" onClick={() => setSpawnIn(proj)}>
-              <Plus size={13} weight="bold" />
-              <span className="mob-agent-name">New agent</span>
-            </button>
+            <div className="mob-card-actions">
+              <button className="mob-agent mob-new" onClick={() => setSpawnIn(proj)}>
+                <Plus size={13} weight="bold" />
+                <span className="mob-agent-name">New agent</span>
+              </button>
+              <button className="mob-agent mob-new" onClick={() => setPreviewIn(proj)}>
+                <Globe size={13} weight="bold" />
+                <span className="mob-agent-name">Preview</span>
+              </button>
+            </div>
           </div>
         ))}
       {spawnIn && (
@@ -1005,6 +1179,13 @@ function MachineSection({ machine, onOpen, onActions }) {
             setSpawnIn(null);
             onOpen(pane);
           }}
+        />
+      )}
+      {previewIn && (
+        <PreviewSheet
+          project={previewIn}
+          machine={machine}
+          onClose={() => setPreviewIn(null)}
         />
       )}
     </section>

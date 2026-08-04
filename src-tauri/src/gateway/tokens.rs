@@ -92,6 +92,10 @@ pub struct Device {
     pub paired_at: u64,
     #[serde(default)]
     pub last_seen: u64,
+    /// "phone" (default) or "bench" — another AgentBench install. Cosmetic:
+    /// both kinds hold exactly the same capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 struct PendingCode {
@@ -187,7 +191,7 @@ impl TokenStore {
     /// Exchange a pairing code for a device token. Success consumes the code,
     /// so it is strictly single-use; a wrong guess only counts against the
     /// window, which closes after `MAX_MISSES`.
-    pub fn redeem(&self, code: &str, device_name: &str) -> Option<String> {
+    pub fn redeem(&self, code: &str, device_name: &str, kind: Option<&str>) -> Option<String> {
         {
             let mut pending = self.pending.lock().unwrap();
             let live = pending.as_mut()?;
@@ -212,6 +216,10 @@ impl TokenStore {
             name: name.chars().take(60).collect(),
             paired_at: now_ms(),
             last_seen: now_ms(),
+            kind: kind
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(|k| k.chars().take(20).collect()),
         });
         self.persist();
         Some(token)
@@ -250,6 +258,7 @@ impl TokenStore {
                 "name": d.name,
                 "pairedAt": d.paired_at,
                 "lastSeen": d.last_seen,
+                "kind": d.kind,
             }))
             .collect::<Vec<_>>())
     }
@@ -282,19 +291,19 @@ mod tests {
     fn code_is_single_use() {
         let store = TokenStore::ephemeral();
         let code = store.new_code(false);
-        assert!(store.redeem(&code, "Phone").is_some());
+        assert!(store.redeem(&code, "Phone", None).is_some());
         // a second redemption of the same code must fail — the pairing window
         // closes the instant it is used
-        assert!(store.redeem(&code, "Phone").is_none());
+        assert!(store.redeem(&code, "Phone", None).is_none());
     }
 
     #[test]
     fn a_typo_does_not_invalidate_the_displayed_code() {
         let store = TokenStore::ephemeral();
         let code = store.new_code(false);
-        assert!(store.redeem("0000-0000", "Phone").is_none());
+        assert!(store.redeem("0000-0000", "Phone", None).is_none());
         // the QR on screen must still work after a wrong guess
-        assert!(store.redeem(&code, "Phone").is_some());
+        assert!(store.redeem(&code, "Phone", None).is_some());
     }
 
     #[test]
@@ -302,9 +311,9 @@ mod tests {
         let store = TokenStore::ephemeral();
         let code = store.new_code(false);
         for _ in 0..MAX_MISSES {
-            assert!(store.redeem("0000-0000", "Phone").is_none());
+            assert!(store.redeem("0000-0000", "Phone", None).is_none());
         }
-        assert!(store.redeem(&code, "Phone").is_none());
+        assert!(store.redeem(&code, "Phone", None).is_none());
     }
 
     #[test]

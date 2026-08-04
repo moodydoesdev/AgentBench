@@ -7,6 +7,9 @@
 //! authentication, a phone-shaped event fan-out, and filesystem reads that
 //! never touch the broker at all.
 
+pub mod links;
+pub mod net;
+pub mod preview;
 pub mod push;
 pub mod tokens;
 
@@ -75,6 +78,10 @@ const FS_READS: &[&str] = &[
     "pane_titles",
     "git_changes",
     "session_stats",
+    "preview_start",
+    "preview_stop",
+    "preview_list",
+    "preview_detect",
 ];
 
 pub fn gateway_file() -> std::path::PathBuf {
@@ -353,6 +360,8 @@ pub struct Gateway {
     pub tokens: TokenStore,
     pub snapshot: Snapshot,
     pub push: push::Push,
+    pub previews: preview::Previews,
+    pub links: links::Links,
     pub machine: String,
     pub started_at: u64,
     pub conn_seq: AtomicU64,
@@ -365,6 +374,8 @@ impl Gateway {
             tokens: TokenStore::load(),
             snapshot: Snapshot::new(),
             push: push::Push::load(),
+            previews: preview::Previews::new(),
+            links: links::Links::load(),
             machine: machine_name(),
             started_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -678,6 +689,22 @@ impl Gateway {
                 project,
                 args["sid"].as_str().unwrap_or_default(),
             ),
+            // Dev-server previews: start/stop answer with the connection
+            // details the phone turns into a browser tab.
+            "preview_start" => {
+                let port = args["port"].as_u64().unwrap_or(0) as u16;
+                let mut info = self
+                    .previews
+                    .start(args["cwd"].as_str().unwrap_or_default(), port)
+                    .await?;
+                info["hosts"] = preview::hosts_off_thread().await;
+                Ok(info)
+            }
+            "preview_stop" => Ok(self
+                .previews
+                .stop(args["port"].as_u64().unwrap_or(0) as u16)),
+            "preview_list" => Ok(self.previews.list().await),
+            "preview_detect" => self.preview_detect(args["cwd"].as_str().unwrap_or_default()).await,
             // Titles are refined while a session runs, so they are refreshable
             // rather than fixed at connect time.
             "pane_titles" => {
@@ -695,6 +722,61 @@ impl Gateway {
             }
             _ => Err(format!("unknown fs read: {name}")),
         }
+    }
+
+    /// Dev-server ports mentioned in this project's pane output, so the
+    /// preview sheet opens pre-populated. Vite, next and friends print their
+    /// local URL when they boot; the scrollback is the closest thing to a
+    /// registry of what is running where.
+    async fn preview_detect(&self, cwd: &str) -> Result<Value, String> {
+        use base64::Engine;
+        let list = self.broker.request(json!({ "op": "list" })).await?;
+        let panes = list.as_array().cloned().unwrap_or_default();
+        let mut found: Vec<(u16, u64)> = Vec::new(); // port, first pane that named it
+        for pane in &panes {
+            if pane["cwd"].as_str() != Some(cwd) {
+                continue;
+            }
+            let id = pane["id"].as_u64().unwrap_or(0);
+            let mut text = String::new();
+            // pty scrollback (agent and run panes): base64 bytes; the recent
+            // tail is plenty, trimmed to a 4-char boundary to stay decodable
+            if let Some(b) = pane["buffer"].as_str() {
+                let start = b.len().saturating_sub(128 * 1024);
+                let start = start - (start % 4);
+                if let Ok(bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(&b[start..])
+                {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+            // headless chat panes: stream-json lines; a dev server Claude
+            // started shows up in its tool output
+            if let Some(lines) = pane["lines"].as_array() {
+                for line in lines.iter().rev().take(300) {
+                    if let Some(s) = line.as_str() {
+                        text.push_str(s);
+                        text.push('\n');
+                    }
+                }
+            }
+            for port in preview::detect_ports(&text) {
+                if !found.iter().any(|(p, _)| *p == port) {
+                    found.push((port, id));
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(found.len());
+        for (port, pane_id) in found {
+            out.push(json!({
+                "port": port,
+                "paneId": pane_id,
+                // dead mentions outnumber live servers in old scrollback, so
+                // each candidate is probed before the sheet shows it as real
+                "live": preview::probe(port).await,
+            }));
+        }
+        Ok(json!(out))
     }
 
     /// Forward one broker op, enforcing the phase allowlist. `answers` marks a

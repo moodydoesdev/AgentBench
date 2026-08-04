@@ -8,7 +8,7 @@
 //! agents here run permission-skipped, so an open port would be remote code
 //! execution.
 
-use agentbench_lib::gateway::{self, BrokerLink, Gateway, DEFAULT_PORT};
+use agentbench_lib::gateway::{self, net, BrokerLink, Gateway, DEFAULT_PORT};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -98,6 +98,7 @@ async fn main() {
     // phone must be able to load the app and pair before it has a token.
     let public = Router::new()
         .route("/api/pair", post(pair))
+        .route("/api/link-back", post(link_back))
         .route("/api/ws", any(ws_bridge))
         .route("/api/health", get(health))
         .route("/api/push/key", get(push_key))
@@ -125,6 +126,10 @@ async fn main() {
         .route("/local/code", post(local_code))
         .route("/local/code", axum::routing::delete(local_clear_code))
         .route("/local/devices", get(local_devices))
+        .route(
+            "/local/links",
+            get(local_links).delete(local_forget_link),
+        )
         .route("/local/revoke", post(local_revoke))
         .route("/local/quit", post(local_quit))
         .with_state(gw.clone());
@@ -257,7 +262,10 @@ async fn health(State(gw): State<Arc<Gateway>>) -> Json<Value> {
 async fn pair(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let code = body["code"].as_str().unwrap_or_default();
     let name = body["deviceName"].as_str().unwrap_or("Phone");
-    match gw.tokens.redeem(code, name) {
+    // "bench" marks another AgentBench install, so the Devices list can badge
+    // it. Purely cosmetic — the token is the same capability either way.
+    let kind = body["kind"].as_str();
+    match gw.tokens.redeem(code, name, kind) {
         Some(token) => Json(json!({
             "token": token,
             "machine": gw.machine,
@@ -270,6 +278,84 @@ async fn pair(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Respon
         )
             .into_response(),
     }
+}
+
+/// The second half of bench-to-bench pairing. A desktop that just paired with
+/// this machine hands over a fresh pairing code for *its own* gateway; this
+/// gateway redeems it and keeps the resulting token in `gateway-links.json`,
+/// which is how this machine's desktop learns it can reach back. Bearer-authed:
+/// only an already-paired device may ask this machine to pair outward.
+///
+/// The outbound POST goes to a caller-supplied URL, which is fine precisely
+/// because the caller is authenticated — a paired device already runs code on
+/// this machine through the broker ops; a URL fetch adds nothing.
+async fn link_back(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    let url = body["url"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let code = body["code"].as_str().unwrap_or_default().trim().to_string();
+    if code.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "link-back needs a url and a code" })),
+        )
+            .into_response();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+                .into_response()
+        }
+    };
+    let res = client
+        .post(format!("{url}/api/pair"))
+        .json(&json!({
+            "code": code,
+            "deviceName": format!("{} (bench)", gw.machine),
+            "kind": "bench",
+        }))
+        .send()
+        .await;
+    let res = match res {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("cannot reach {url}: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let ok = res.status().is_success();
+    let reply: Value = res.json().await.unwrap_or_default();
+    if !ok {
+        let why = reply["error"].as_str().unwrap_or("pairing refused");
+        return (StatusCode::BAD_GATEWAY, Json(json!({ "error": why }))).into_response();
+    }
+    let Some(token) = reply["token"].as_str() else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "no token in pair response" })),
+        )
+            .into_response();
+    };
+    let machine = reply["machine"].as_str().unwrap_or("bench");
+    gw.links.add(&url, token, machine);
+    Json(json!({ "ok": true, "machine": machine })).into_response()
 }
 
 /// Subscribing binds a phone's push subscription to this machine's VAPID key,
@@ -568,6 +654,16 @@ async fn local_devices(State(gw): State<Arc<Gateway>>) -> Json<Value> {
     Json(gw.tokens.list())
 }
 
+/// Benches this machine can reach out to, tokens included — loopback only,
+/// same trust level as the desktop app that reads it.
+async fn local_links(State(gw): State<Arc<Gateway>>) -> Json<Value> {
+    Json(gw.links.list_json())
+}
+
+async fn local_forget_link(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Json<Value> {
+    Json(json!({ "ok": gw.links.forget(body["url"].as_str().unwrap_or_default()) }))
+}
+
 async fn local_revoke(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Json<Value> {
     let id = body["id"].as_str().unwrap_or_default();
     Json(json!({ "ok": gw.tokens.revoke(id) }))
@@ -624,7 +720,7 @@ fn discover_urls() -> Vec<Value> {
         }
     }
 
-    let ts = tailscale_self();
+    let ts = net::tailscale_self();
     let ts_ips: Vec<String> = ts.as_ref().map(|t| t.ips.clone()).unwrap_or_default();
     let serving = ts.as_ref().map(|t| t.serving).unwrap_or(false);
 
@@ -653,11 +749,11 @@ fn discover_urls() -> Vec<Value> {
     }
 
     let mut lan: Vec<(u8, String)> = Vec::new();
-    for ip in local_ips() {
+    for ip in net::local_ips() {
         if ts_ips.iter().any(|t| t == &ip) {
             continue; // already listed as a tailscale address
         }
-        lan.push((address_rank(&ip), ip));
+        lan.push((net::address_rank(&ip), ip));
     }
     lan.sort_by_key(|(rank, _)| *rank);
     for (rank, ip) in lan {
@@ -667,130 +763,6 @@ fn discover_urls() -> Vec<Value> {
         }));
     }
     out
-}
-
-/// 0 = a real LAN address, 1 = an adapter that only talks to this machine's
-/// own virtual machines or containers.
-fn address_rank(ip: &str) -> u8 {
-    // VirtualBox host-only, and the Docker/Hyper-V 172.16/12 block
-    if ip.starts_with("192.168.56.") {
-        return 1;
-    }
-    if let Some(second) = ip.strip_prefix("172.").and_then(|r| r.split('.').next()) {
-        if let Ok(n) = second.parse::<u8>() {
-            if (16..=31).contains(&n) {
-                return 1;
-            }
-        }
-    }
-    0
-}
-
-struct TailscaleSelf {
-    name: Option<String>,
-    ips: Vec<String>,
-    serving: bool,
-}
-
-/// The Tailscale CLI is usually NOT on PATH on Windows, and a gateway started
-/// before Tailscale was installed would not see an updated PATH anyway, so the
-/// standard install locations are probed directly.
-fn tailscale_bins() -> Vec<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = vec!["tailscale".into()];
-    #[cfg(windows)]
-    {
-        candidates.push(r"C:\Program Files\Tailscale\tailscale.exe".into());
-        candidates.push(r"C:\Program Files (x86)\Tailscale\tailscale.exe".into());
-    }
-    #[cfg(unix)]
-    {
-        candidates.push("/usr/bin/tailscale".into());
-        candidates.push("/usr/local/bin/tailscale".into());
-        candidates.push("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into());
-    }
-    // The bare name stays first for PATH installs, but it cannot be *assumed*
-    // to work: probing it is the only way to tell, so callers try each in turn.
-    candidates
-}
-
-fn tailscale_cmd(bin: &std::path::Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let out = cmd.output().ok()?;
-    out.status.success().then_some(out.stdout)
-}
-
-fn tailscale_self() -> Option<TailscaleSelf> {
-    let (bin, status) = tailscale_bins().into_iter().find_map(|bin| {
-        let raw = tailscale_cmd(&bin, &["status", "--json"])?;
-        let status: Value = serde_json::from_slice(&raw).ok()?;
-        Some((bin, status))
-    })?;
-    if status["BackendState"].as_str() != Some("Running") {
-        return None;
-    }
-    let name = status["Self"]["DNSName"]
-        .as_str()
-        .map(|n| n.trim_end_matches('.').to_string())
-        .filter(|n| !n.is_empty());
-    let ips = status["Self"]["TailscaleIPs"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    // `serve status` is non-empty only once something is actually published,
-    // which is what decides whether the HTTPS name is usable today.
-    let serving = tailscale_cmd(&bin, &["serve", "status", "--json"])
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-        .map(|v| v.get("Web").is_some_and(|w| w.as_object().is_some_and(|o| !o.is_empty())))
-        .unwrap_or(false);
-    Some(TailscaleSelf { name, ips, serving })
-}
-
-/// Non-loopback IPv4 addresses, so the Settings window can offer a LAN URL
-/// when Tailscale is not set up yet.
-fn local_ips() -> Vec<String> {
-    let mut cmd;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd = std::process::Command::new("powershell");
-        cmd.args([
-            "-NoLogo",
-            "-Command",
-            "(Get-NetIPAddress -AddressFamily IPv4).IPAddress",
-        ]);
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(unix)]
-    {
-        cmd = std::process::Command::new("sh");
-        cmd.args(["-lc", "ifconfig 2>/dev/null | awk '/inet /{print $2}' || ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1"]);
-    }
-    let Ok(out) = cmd.output() else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|ip| {
-            !ip.is_empty()
-                && !ip.starts_with("127.")
-                && !ip.starts_with("169.254.")
-                && ip.split('.').count() == 4
-        })
-        .take(4)
-        .collect()
 }
 
 /// QR as a self-contained SVG string; the desktop drops it straight into the

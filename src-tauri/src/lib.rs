@@ -676,6 +676,161 @@ fn gateway_revoke(id: String) -> Result<Value, String> {
     gateway_control("POST", "/local/revoke", Some(json!({ "id": id })))
 }
 
+/// Like `restore_gateway`, but synchronous and with the caller waiting: bring
+/// the gateway up with whatever it was last configured with.
+fn ensure_gateway_running() -> Result<(), String> {
+    if gateway_status()["running"] == json!(true) {
+        return Ok(());
+    }
+    let prefs = gateway_prefs();
+    let port = prefs["port"].as_u64().map(|p| p as u16);
+    let url = prefs["url"].as_str().map(String::from);
+    gateway_start(port, url).map(|_| ())
+}
+
+/// Link this bench to another one — both directions in one action.
+///
+/// The user reads a pairing code off the other machine and enters it here.
+/// Step one redeems it, exactly as a phone would, which gives this desktop a
+/// token for the other machine. Step two runs the handshake the other way:
+/// our own gateway mints a fresh code and hands it to the other machine over
+/// the just-authenticated channel (`/api/link-back`), whose gateway redeems it
+/// against us. Runs in Rust rather than the webview so no platform's
+/// mixed-content or ATS rules can get between the two machines.
+///
+/// The reverse half failing (other machine on an older build, our gateway not
+/// coming up) is reported but not fatal — a working one-way link beats
+/// nothing, and the report says exactly what to do next.
+#[tauri::command]
+async fn link_bench(url: String, code: String) -> Result<Value, String> {
+    let base = url.trim().trim_end_matches('/').to_string();
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("the address should start with http:// or https://".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let res = client
+        .post(format!("{base}/api/pair"))
+        .json(&json!({
+            "code": code.trim(),
+            "deviceName": format!("{} (bench)", gateway::machine_name()),
+            "kind": "bench",
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach {base}: {e}"))?;
+    let ok = res.status().is_success();
+    let reply: Value = res
+        .json()
+        .await
+        .map_err(|_| "malformed pair response".to_string())?;
+    if !ok {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("pairing refused")
+            .to_string());
+    }
+    let token = reply["token"]
+        .as_str()
+        .ok_or("no token in pair response")?
+        .to_string();
+    let machine = reply["machine"].as_str().unwrap_or("bench").to_string();
+
+    let reverse = match pair_back(&client, &base, &token).await {
+        Ok(()) => json!({ "ok": true }),
+        Err(e) => json!({ "ok": false, "error": e }),
+    };
+
+    Ok(json!({
+        "url": base,
+        "token": token,
+        "machine": machine,
+        "kind": "bench",
+        "reverse": reverse,
+    }))
+}
+
+/// The reverse half of `link_bench`: mint a code on our own gateway and ask
+/// the other machine to redeem it.
+async fn pair_back(client: &reqwest::Client, base: &str, token: &str) -> Result<(), String> {
+    // The control channel and the startup poll are blocking; keep them off the
+    // async runtime.
+    tauri::async_runtime::spawn_blocking(ensure_gateway_running)
+        .await
+        .map_err(|e| e.to_string())??;
+    // force: the code is consumed by a machine, not scanned off a screen, so
+    // it must be fresh — reusing a code someone is mid-scan with would burn it.
+    let minted = tauri::async_runtime::spawn_blocking(|| {
+        gateway_control("POST", "/local/code", Some(json!({ "force": true })))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let our_code = minted["code"].as_str().ok_or("gateway minted no code")?;
+    let our_url = minted["url"].as_str().ok_or("no reachable address for this machine")?;
+    let res = client
+        .post(format!("{base}/api/link-back"))
+        .bearer_auth(token)
+        .json(&json!({ "url": our_url, "code": our_code }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let ok = res.status().is_success();
+    let reply: Value = res.json().await.unwrap_or_default();
+    if ok {
+        Ok(())
+    } else {
+        Err(reply["error"]
+            .as_str()
+            .unwrap_or("the other machine could not pair back — it may need updating")
+            .to_string())
+    }
+}
+
+/// Benches that linked *to* this machine (via link-back on our gateway). The
+/// desktop merges these into its own machine list at launch and whenever the
+/// Linked benches panel opens.
+#[tauri::command]
+fn gateway_links() -> Value {
+    gateway_control("GET", "/local/links", None).unwrap_or_else(|_| json!([]))
+}
+
+#[tauri::command]
+fn gateway_forget_link(url: String) -> Result<Value, String> {
+    gateway_control("DELETE", "/local/links", Some(json!({ "url": url })))
+}
+
+/// A proxied dev-server preview in its own window. The URL is the preview
+/// proxy's cookie handshake, so a plain webview pointed at it becomes a full
+/// working view of the remote app, HMR included. One window per proxy port:
+/// reopening navigates the existing window (the handshake mints a fresh
+/// cookie) instead of stacking duplicates.
+#[tauri::command]
+async fn open_preview_window(app: AppHandle, url: String, title: String) -> Result<(), String> {
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("bad preview url: {e}"))?;
+    let label = format!(
+        "preview-{}",
+        &gateway::tokens::hash(&format!(
+            "{}:{}",
+            parsed.host_str().unwrap_or_default(),
+            parsed.port().unwrap_or_default()
+        ))[..12]
+    );
+    if let Some(win) = app.get_webview_window(&label) {
+        win.navigate(parsed).map_err(|e| e.to_string())?;
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(parsed))
+        .title(title)
+        .inner_size(1100.0, 800.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Install/refresh the bundled plan-authoring skill into ~/.claude/skills so
 /// agents spawned in panes know how to publish visual plans.
 #[tauri::command]
@@ -776,6 +931,10 @@ pub fn run() {
             gateway_pair,
             gateway_cancel_pair,
             gateway_revoke,
+            link_bench,
+            gateway_links,
+            gateway_forget_link,
+            open_preview_window,
             list_slash_commands,
             list_sessions,
             read_file_base64,

@@ -8,10 +8,12 @@ import {
   BellSimple,
   DeviceMobile,
   Keyboard,
+  Laptop,
   PaintBrushBroad,
   Robot,
   SquaresFour,
 } from "@phosphor-icons/react";
+import { loadGateways, saveGateways } from "./lib/fleet";
 import { THEMES, themeVars } from "./themes";
 import {
   PROBEABLE,
@@ -411,6 +413,218 @@ function MobileAccess() {
   );
 }
 
+/**
+ * Settings → Linked benches.
+ *
+ * Bench-to-bench links: this machine as a *client* of another AgentBench
+ * install. The machine list lives in the same localStorage key the phone
+ * shell uses (`agentbench.gateways`), so `useFleet` drives both. Linking is
+ * one action both ways: `link_bench` redeems the code you read off the other
+ * machine, then hands it a fresh code of ours over the authenticated channel
+ * so its gateway pairs back (those reverse links arrive via `gateway_links`
+ * and are merged in here).
+ */
+function LinkedBenches() {
+  const [benches, setBenches] = useState(loadGateways);
+  const [url, setUrl] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(null); // "link" | "code"
+  const [linked, setLinked] = useState(null); // last link_bench result
+  const [error, setError] = useState(null);
+  const [ownCode, setOwnCode] = useState(null); // { code, url }
+  const [health, setHealth] = useState({}); // url -> boolean
+
+  const save = (list) => {
+    setBenches(list);
+    saveGateways(list);
+    // the main window's sidebar holds the live fleet — tell it to reload
+    emit("benches-changed").catch(() => {});
+  };
+
+  const upsert = (list, entry) => [
+    ...list.filter((b) => b.url !== entry.url),
+    entry,
+  ];
+
+  // Links other benches pushed to our gateway (their half of a reciprocal
+  // pairing) live in gateway-links.json until merged in here.
+  useEffect(() => {
+    invoke("gateway_links")
+      .then((links) => {
+        if (!Array.isArray(links) || !links.length) return;
+        setBenches((cur) => {
+          let next = cur;
+          for (const l of links) {
+            if (!l?.url || !l?.token) continue;
+            const known = cur.find((b) => b.url === l.url);
+            if (known?.token === l.token) continue;
+            next = upsert(next, {
+              url: l.url,
+              token: l.token,
+              machine: l.machine,
+              name: l.machine,
+              kind: "bench",
+            });
+          }
+          if (next !== cur) {
+            saveGateways(next);
+            emit("benches-changed").catch(() => {});
+          }
+          return next;
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  // Reachability, not auth: /api/health is the one unauthenticated probe.
+  useEffect(() => {
+    for (const b of benches) {
+      fetch(`${b.url}/api/health`, { signal: AbortSignal.timeout(4000) })
+        .then((r) => r.json())
+        .then((j) => setHealth((h) => ({ ...h, [b.url]: j?.ok === true })))
+        .catch(() => setHealth((h) => ({ ...h, [b.url]: false })));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [benches.map((b) => b.url).join("|")]);
+
+  const link = async () => {
+    setBusy("link");
+    setError(null);
+    setLinked(null);
+    try {
+      const res = await invoke("link_bench", { url: url.trim(), code: code.trim() });
+      save(
+        upsert(benches, {
+          url: res.url,
+          token: res.token,
+          machine: res.machine,
+          name: res.machine,
+          kind: "bench",
+        }),
+      );
+      setLinked(res);
+      setUrl("");
+      setCode("");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const showOwnCode = async () => {
+    setBusy("code");
+    setError(null);
+    try {
+      await invoke("gateway_start", { url: null });
+      const p = await invoke("gateway_pair", { url: null, force: false });
+      setOwnCode({ code: p.code, url: p.url });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const unlink = (b) => {
+    save(benches.filter((x) => x.url !== b.url));
+    // also drop the gateway's copy so a merge doesn't resurrect it
+    invoke("gateway_forget_link", { url: b.url }).catch(() => {});
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Linked benches</h2>
+
+      <Card title="Link this bench to another">
+        <Row
+          title="Other machine"
+          sub="On the other machine, open Settings → Linked benches → Show this machine's code, then enter its address and code here. One link works both ways."
+          stack
+        >
+          <div className="bench-link-form">
+            <input
+              className="harness-input cmd"
+              placeholder="http://100.x.y.z:8473"
+              value={url}
+              spellCheck={false}
+              autoCapitalize="off"
+              onChange={(ev) => setUrl(ev.target.value)}
+            />
+            <input
+              className="harness-input bench-code"
+              placeholder="0000-0000"
+              value={code}
+              spellCheck={false}
+              autoCapitalize="off"
+              onChange={(ev) => setCode(ev.target.value)}
+            />
+            <button
+              className="btn-sm"
+              disabled={busy != null || !url.trim() || !code.trim()}
+              onClick={link}
+            >
+              {busy === "link" ? "Linking…" : "Link both ways"}
+            </button>
+          </div>
+        </Row>
+        {linked && (
+          <Row
+            title={`Linked with ${linked.machine}`}
+            sub={
+              linked.reverse?.ok
+                ? "Both directions are set up — each machine now appears in the other's sidebar."
+                : `This machine can reach ${linked.machine}, but the reverse link failed: ${linked.reverse?.error ?? "unknown error"}. You can still link back manually from the other machine.`
+            }
+          />
+        )}
+        {error && <Row title="Error" sub={error} />}
+      </Card>
+
+      <Card title="This machine's code">
+        <Row
+          title="Show this machine's code"
+          sub="For typing into another bench. Starts the gateway if it isn't running; the code is one-time and expires in 10 minutes."
+        >
+          <button className="btn-sm" disabled={busy != null} onClick={showOwnCode}>
+            {busy === "code" ? "Preparing…" : ownCode ? "New code" : "Show code"}
+          </button>
+        </Row>
+        {ownCode && (
+          <Row title={`Code ${ownCode.code}`} sub="Enter it with this address on the other machine.">
+            <code className="mobile-cmd">{ownCode.url}</code>
+          </Row>
+        )}
+      </Card>
+
+      <Card title="Linked machines">
+        {benches.length === 0 && (
+          <Row title="No linked benches" sub="Machines you link appear here and in the main window's sidebar." />
+        )}
+        {benches.map((b) => (
+          <Row
+            key={b.url}
+            title={b.machine ?? b.name ?? b.url}
+            sub={`${b.url} · ${
+              health[b.url] == null ? "checking…" : health[b.url] ? "reachable" : "unreachable"
+            }`}
+          >
+            <button className="btn-sm danger" onClick={() => unlink(b)}>
+              Unlink
+            </button>
+          </Row>
+        ))}
+        {benches.length > 0 && (
+          <Row
+            title="About unlinking"
+            sub="Unlinking forgets this machine's access. The other machine keeps its own link until you revoke it there (Mobile access → Paired devices)."
+          />
+        )}
+      </Card>
+    </section>
+  );
+}
+
 function relTime(ms) {
   if (!ms) return "never";
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -427,6 +641,7 @@ const SECTIONS = [
   { id: "workspace", label: "Workspace", icon: SquaresFour },
   { id: "agents", label: "Agents", icon: Robot },
   { id: "mobile", label: "Mobile access", icon: DeviceMobile },
+  { id: "benches", label: "Linked benches", icon: Laptop },
   { id: "notifications", label: "Notifications", icon: BellSimple },
   { id: "keyboard", label: "Keyboard", icon: Keyboard },
 ];
@@ -944,6 +1159,8 @@ export default function SettingsWindow() {
         )}
 
         {section === "mobile" && <MobileAccess />}
+
+        {section === "benches" && <LinkedBenches />}
 
         {section === "notifications" && (
           <section className="settings-section">

@@ -3083,6 +3083,19 @@ button.chat-question-opt.choice.on {
   font-family: var(--font-ui);
 }
 
+/* Settings → Linked benches: address + code + link button on one line. */
+.bench-link-form {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.harness-input.bench-code {
+  width: 110px;
+  flex: none;
+  font-family: var(--font-mono);
+}
+
 /* Discard a dictated phrase. Esc does this on a keyboard; a phone needs a
    control it can actually reach. */
 .chat-mic-discard {
@@ -3101,4 +3114,197 @@ button.chat-question-opt.choice.on {
 
 .chat-mic-discard:hover {
   opacity: 1;
+}
+
+/* ------------------------------------------------------------------------
+   Linked benches: remote machines in the sidebar, their panes in the grid.
+   ------------------------------------------------------------------------ */
+
+.bench {
+  margin-top: 10px;
+}
+
+.bench-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.bench-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--border);
+}
+
+.bench-dot.on {
+  background: rgb(var(--green));
+}
+
+.bench-empty {
+  padding: 4px 12px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.remote-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.remote-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.remote-bar-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remote-bar-spacer {
+  flex: 1;
+}
+
+.remote-grid {
+  flex: 1;
+}
+
+/* which machine a remote pane lives on — sits beside the title */
+.pane-machine {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+/* .pane is position:relative, so the overlay covers the whole pane body */
+.remote-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--bg) 65%, transparent);
+}
+
+.remote-loading {
+  padding: 16px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Remote preview popover (desktop sibling of the phone's preview sheet). */
+.preview-pop {
+  width: 320px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.4);
+  z-index: 60;
+}
+
+.preview-pop-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  padding-bottom: 4px;
+}
+
+.preview-pop-head small {
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.preview-pop-sub {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.preview-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-pop-open {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.preview-pop-open:hover:not(:disabled) {
+  border-color: var(--text-dim);
+}
+
+.preview-pop-open:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.preview-pop-open small {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.preview-pop-port {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.preview-pop-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 6px 2px;
+}
+
+.preview-pop-warn {
+  font-size: 12px;
+  color: rgb(var(--red));
+  padding: 4px 2px;
+}
+
+.preview-pop-manual {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.preview-pop-manual .mobile-url-input {
+  flex: 1;
 }

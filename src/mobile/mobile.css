@@ -1144,6 +1144,69 @@ body {
   white-space: nowrap;
 }
 
+/* ---- dev-server preview ---- */
+
+.mob-card-actions {
+  display: flex;
+}
+
+.mob-card-actions .mob-agent {
+  flex: 1;
+}
+
+/* An active preview row holds two targets — open and stop — so the sheet
+   item becomes a container rather than a button. */
+.mob-preview-row {
+  padding: 0;
+  overflow: hidden;
+}
+
+.mob-preview-open {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  padding: 0 12px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 15px;
+  text-align: left;
+}
+
+.mob-preview-open small {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.mob-preview-stop {
+  align-self: stretch;
+  padding: 0 16px;
+  border: none;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: rgb(var(--red));
+  font-size: 13px;
+}
+
+.mob-preview-port {
+  font-size: 15px;
+  color: var(--text);
+}
+
+.mob-preview-manual {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.mob-preview-manual .mob-input {
+  flex: 1;
+  min-width: 0;
+}
+
 .mob-kill-bar {
   display: flex;
   align-items: center;

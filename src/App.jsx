@@ -11,6 +11,9 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import AgentPane from "./AgentPane";
+import RemotePane from "./RemotePane";
+import RemotePreviewPopover from "./RemotePreviewPopover";
+import { groupPanes, loadGateways, saveGateways, useFleet } from "./lib/fleet";
 
 // Lazy: keeps mdx/shiki out of the entry chunk until a plan is opened
 const PlanOverlay = lazy(() => import("./plan/PlanOverlay.jsx"));
@@ -126,6 +129,21 @@ export default function App() {
   const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
   const [sessionsOpen, setSessionsOpen] = useState(false); // resume-session picker
   const renameInputRef = useRef(null);
+
+  // Linked benches: other AgentBench installs this machine holds tokens for.
+  // Same storage and fleet hook as the phone shell — the sidebar below the
+  // local projects is, in effect, the phone's fleet view grown up.
+  const [benches, setBenches] = useState(loadGateways);
+  const { machines } = useFleet(benches);
+  const [remoteSel, setRemoteSel] = useState(null); // { url, cwd } — selected remote project
+
+  // A bench unlinked in Settings while one of its projects is on screen must
+  // not leave a dead selection behind.
+  useEffect(() => {
+    if (remoteSel && !machines.some((m) => m.url === remoteSel.url)) {
+      setRemoteSel(null);
+    }
+  }, [machines, remoteSel]);
 
   const panesRef = useRef(panes);
   panesRef.current = panes;
@@ -596,13 +614,45 @@ export default function App() {
       setSettings(e.payload);
     });
 
+    // Linked benches are edited in the settings window (shared localStorage);
+    // reload our copy so sockets open/close without an app restart.
+    const unBenches = listen("benches-changed", () => {
+      setBenches(loadGateways());
+    });
+
     return () => {
       unEvent.then((f) => f());
       unPlan.then((f) => f());
       unExit.then((f) => f());
       unColor.then((f) => f());
       unSettings.then((f) => f());
+      unBenches.then((f) => f());
     };
+  }, []);
+
+  // A bench that linked *to us* leaves its reverse credentials with our
+  // gateway (gateway-links.json). Merge them in at launch so the machine
+  // appears without anyone opening Settings here.
+  useEffect(() => {
+    invoke("gateway_links")
+      .then((links) => {
+        if (!Array.isArray(links) || !links.length) return;
+        setBenches((cur) => {
+          let next = cur;
+          for (const l of links) {
+            if (!l?.url || !l?.token) continue;
+            const known = cur.find((b) => b.url === l.url);
+            if (known?.token === l.token) continue;
+            next = [
+              ...next.filter((b) => b.url !== l.url),
+              { url: l.url, token: l.token, machine: l.machine, name: l.machine, kind: "bench" },
+            ];
+          }
+          if (next !== cur) saveGateways(next);
+          return next;
+        });
+      })
+      .catch(() => {});
   }, []);
 
   // Settings live in their own window, pre-spawned hidden at startup so
@@ -657,6 +707,7 @@ export default function App() {
       ps.some((p) => p.path === dir) ? ps : [...ps, { path: dir, name: baseName(dir) }],
     );
     setActivePath(dir);
+    setRemoteSel(null);
   };
 
   const removeProject = (path) => {
@@ -941,6 +992,7 @@ export default function App() {
     const pane = panesRef.current.find((p) => p.id === n.paneId);
     if (!pane) return; // agent closed since
     setNotifOpen(false);
+    setRemoteSel(null); // notifications are local panes; surface the local grid
     if (pane.projectPath !== activePathRef.current) {
       setActivePath(pane.projectPath);
       // pane mounts on next render; focus after it exists
@@ -1015,7 +1067,10 @@ export default function App() {
         e.preventDefault();
         e.stopPropagation();
         if (e.shiftKey) {
-          if (projects[digit - 1]) setActivePath(projects[digit - 1].path);
+          if (projects[digit - 1]) {
+            setActivePath(projects[digit - 1].path);
+            setRemoteSel(null);
+          }
         } else {
           focusAgent(inProject[digit - 1]);
         }
@@ -1151,7 +1206,10 @@ export default function App() {
         group: "Project",
         label: p.name,
         hint: i < 9 ? `⌘⇧${i + 1}` : undefined,
-        action: () => setActivePath(p.path),
+        action: () => {
+          setActivePath(p.path);
+          setRemoteSel(null);
+        },
       });
     });
     activePanes.forEach((p, i) => {
@@ -1193,13 +1251,13 @@ export default function App() {
           <Logo className="brand-logo" aria-label="AgentBench" />
         </div>
         <div className="topbar-right" data-tauri-drag-region>
-          {activeProject && (
+          {activeProject && !remoteSel && (
             <span className="agent-count" data-tauri-drag-region>
               {activeProject.name} · {activePanes.length} agent
               {activePanes.length === 1 ? "" : "s"}
             </span>
           )}
-          {activeProject && (
+          {activeProject && !remoteSel && (
             <button
               className={`btn-icon${showPlans ? " active" : ""}`}
               title={showPlans ? "Hide plans panel" : "Show plans panel"}
@@ -1273,6 +1331,7 @@ export default function App() {
             <GearSix size={15} />
           </button>
           {activeProject &&
+            !remoteSel &&
             ((activeProject.commands?.length ?? 0) === 0 ? (
               <button
                 className="btn-new"
@@ -1329,7 +1388,7 @@ export default function App() {
                 </DropdownMenu>
               </div>
             ))}
-          {activeProject && (
+          {activeProject && !remoteSel && (
             <div className="btn-new-split">
               <button className="btn-new" onClick={addAgent}>
                 <Plus size={13} weight="bold" /> New{" "}
@@ -1401,7 +1460,10 @@ export default function App() {
                       className={`project ${p.path === activePath ? "active" : ""} attn-${st} ${p.color ? "colored" : ""}`}
                       style={p.color ? { "--proj-color": p.color } : undefined}
                       title={p.path}
-                      onClick={() => setActivePath(p.path)}
+                      onClick={() => {
+                        setActivePath(p.path);
+                        setRemoteSel(null);
+                      }}
                     >
                       <span className={`dot ${st}`} />
                       {renaming === p.path ? (
@@ -1496,13 +1558,53 @@ export default function App() {
               );
             })}
           </nav>
+
+          {/* Linked benches: one section per machine, its projects grouped
+              from the fleet snapshot exactly like the phone's fleet tab. */}
+          {machines.map((m) => {
+            const groups = groupPanes(m);
+            const label = m.machine ?? m.name ?? baseName(m.url);
+            return (
+              <div className="bench" key={m.url}>
+                <div className="sidebar-head bench-head" title={m.url}>
+                  <span className={`bench-dot${m.connected ? " on" : ""}`} />
+                  {label}
+                </div>
+                <nav className="project-list">
+                  {groups.map((g) => {
+                    const on = remoteSel?.url === m.url && remoteSel?.cwd === g.cwd;
+                    return (
+                      <div
+                        key={g.cwd}
+                        className={`project remote ${on ? "active" : ""} attn-${g.status}`}
+                        title={`${g.cwd} — on ${label}`}
+                        onClick={() => setRemoteSel({ url: m.url, cwd: g.cwd })}
+                      >
+                        <span className={`dot ${g.status}`} />
+                        <span className="project-name">{g.name}</span>
+                        {g.panes.length > 0 && (
+                          <span className="project-count">{g.panes.length}</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {groups.length === 0 && (
+                    <div className="bench-empty">
+                      {m.connected ? "no projects yet" : "connecting…"}
+                    </div>
+                  )}
+                </nav>
+              </div>
+            );
+          })}
+
           <button className="btn-add-project" onClick={addProject}>
             <Plus size={12} weight="bold" /> Add project
           </button>
         </aside>
 
         <div className="content">
-          {!activeProject ? (
+          {remoteSel ? null : !activeProject ? (
             <div className="empty">
               <div className="empty-inner">
                 <Logo className="empty-logo" aria-label="AgentBench" />
@@ -1539,7 +1641,8 @@ export default function App() {
                 key={proj.path}
                 className="grid"
                 style={{
-                  display: proj.path === activePath ? undefined : "none",
+                  display:
+                    proj.path === activePath && !remoteSel ? undefined : "none",
                   gridTemplateColumns: `repeat(${settings.cols}, minmax(0, 1fr))`,
                 }}
               >
@@ -1581,9 +1684,90 @@ export default function App() {
             );
           })}
 
+          {/* Selected remote project: its panes render here, each driven by
+              the owning machine's transport. Unlike local grids these unmount
+              on switch-away — they rebuild from pane_buffer on reopen, the
+              same trade the phone makes. */}
+          {remoteSel &&
+            (() => {
+              const m = machines.find((x) => x.url === remoteSel.url);
+              if (!m) return null;
+              const group = groupPanes(m).find((g) => g.cwd === remoteSel.cwd);
+              const projName = group?.name ?? baseName(remoteSel.cwd);
+              const label = m.machine ?? m.name ?? baseName(m.url);
+              return (
+                <div className="remote-view">
+                  <div className="remote-bar">
+                    <span className="remote-bar-name" title={remoteSel.cwd}>
+                      {projName} · {label}
+                      {!m.connected && " · disconnected"}
+                    </span>
+                    <span className="remote-bar-spacer" />
+                    <RemotePreviewPopover
+                      machine={m}
+                      project={{ cwd: remoteSel.cwd, name: projName }}
+                    />
+                    <button
+                      className="btn-sm"
+                      title={`Start a headless Claude chat in ${projName} on ${label}`}
+                      disabled={!m.connected}
+                      onClick={() =>
+                        m.transport
+                          ?.invoke("create_chat_pane", { cwd: remoteSel.cwd })
+                          .catch((err) => console.error("remote spawn failed", err))
+                      }
+                    >
+                      <Plus size={12} weight="bold" /> Agent
+                    </button>
+                  </div>
+                  <main
+                    className="grid remote-grid"
+                    style={{
+                      gridTemplateColumns: `repeat(${settings.cols}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {(group?.panes ?? []).map((p) => (
+                      <RemotePane
+                        key={`${m.url}:${p.id}`}
+                        machine={m}
+                        pane={p}
+                        status={p.status}
+                        termTheme={termTheme}
+                        defaultView={settings.defaultPaneView ?? "chat"}
+                      />
+                    ))}
+                  </main>
+                  {(group?.panes ?? []).length === 0 && (
+                    <div className="empty">
+                      <div className="empty-inner">
+                        <LogoMark className="empty-mark" aria-hidden="true" />
+                        <h1>{projName}</h1>
+                        <p className="empty-path">
+                          {remoteSel.cwd} — on {label}
+                        </p>
+                        <button
+                          className="btn-new big"
+                          disabled={!m.connected}
+                          onClick={() =>
+                            m.transport
+                              ?.invoke("create_chat_pane", { cwd: remoteSel.cwd })
+                              .catch((err) =>
+                                console.error("remote spawn failed", err),
+                              )
+                          }
+                        >
+                          <Plus size={15} weight="bold" /> New Agent on {label}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
           {/* scoped to its project: switching projects hides the overlay,
               switching back restores it */}
-          {planView && planView.projectPath === activePath && (
+          {planView && planView.projectPath === activePath && !remoteSel && (
             <Suspense fallback={null}>
               <PlanOverlay
                 path={planView.path}
@@ -1600,7 +1784,7 @@ export default function App() {
           )}
         </div>
 
-        {activeProject && showPlans && (
+        {activeProject && showPlans && !remoteSel && (
           <aside className="plan-rail">
             <div className="plan-rail-head">
               <FileText size={13} />

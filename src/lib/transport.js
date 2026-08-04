@@ -55,6 +55,11 @@ const FS_FOR = {
   git_changes: (a) => ({ fs: "git_changes", cwd: a.cwd }),
   // Token totals for one session transcript.
   session_stats: (a) => ({ fs: "session_stats", project: a.project, sid: a.sid }),
+  // Dev-server previews: proxy a workstation-local port to this phone.
+  preview_start: (a) => ({ fs: "preview_start", cwd: a.cwd, port: a.port }),
+  preview_stop: (a) => ({ fs: "preview_stop", port: a.port }),
+  preview_list: () => ({ fs: "preview_list" }),
+  preview_detect: (a) => ({ fs: "preview_detect", cwd: a.cwd }),
 };
 
 /** Desktop: straight through to the Tauri backend. */
