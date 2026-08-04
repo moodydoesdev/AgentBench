@@ -638,14 +638,34 @@ fn gateway_stop() -> Result<(), String> {
 /// Bring the gateway back at launch if mobile access was left on. Runs off the
 /// main thread: the desktop must not wait on it, and a gateway that fails to
 /// start is a Settings problem, not a reason to block the app.
+///
+/// A running gateway is also checked for staleness: the daemon outlives app
+/// updates by design, so after an install it can keep serving last release's
+/// wire surface — new fs reads answer "not allowed", new routes 404, and it
+/// looks like the feature shipped broken. A version mismatch (or a gateway
+/// too old to report one) gets quit and respawned from the current install;
+/// phones and benches ride it out through their reconnect loops.
 fn restore_gateway() {
     std::thread::spawn(|| {
         let prefs = gateway_prefs();
-        if prefs["autoStart"].as_bool() != Some(true) {
+        let status = gateway_status();
+        let running = status["running"] == json!(true);
+        let stale = running && status["version"].as_str() != Some(env!("CARGO_PKG_VERSION"));
+        if running && !stale {
+            return; // survived the app restart, as it is designed to
+        }
+        if !running && prefs["autoStart"].as_bool() != Some(true) {
             return;
         }
-        if gateway_status()["running"] == json!(true) {
-            return; // survived the app restart, as it is designed to
+        if stale {
+            eprintln!(
+                "mobile gateway is from another build ({}); restarting it",
+                status["version"].as_str().unwrap_or("pre-0.1.19")
+            );
+            let _ = gateway_control("POST", "/local/quit", None);
+            // /local/quit exits ~100ms after answering and removes its
+            // advertisement; give it room before binding the port again
+            std::thread::sleep(Duration::from_millis(500));
         }
         let port = prefs["port"].as_u64().map(|p| p as u16);
         let url = prefs["url"].as_str().map(String::from);

@@ -586,7 +586,13 @@ async fn serve_socket(socket: WebSocket, gw: Arc<Gateway>, who: String) {
 /// Liveness only — no subprocesses, no network probing. Exists so "is a
 /// gateway already running?" is answerable in a millisecond.
 async fn local_ping(State(gw): State<Arc<Gateway>>) -> Json<Value> {
-    Json(json!({ "ok": true, "pid": std::process::id(), "machine": gw.machine }))
+    Json(json!({
+        "ok": true,
+        "pid": std::process::id(),
+        "machine": gw.machine,
+        // lets the desktop spot a gateway left running by a previous install
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn local_status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
@@ -595,6 +601,7 @@ async fn local_status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "machine": gw.machine,
         "brokerConnected": gw.broker.is_connected(),
         "protocolVersion": gateway::PROTOCOL_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
         "urls": candidate_urls(),
         "pairing": code.map(|(code, expires)| json!({ "code": code, "expiresAt": expires })),
         "devices": gw.tokens.list(),

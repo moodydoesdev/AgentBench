@@ -1447,6 +1447,10 @@ export default function App() {
       <div className="body">
         <aside className="sidebar">
           <div className="sidebar-head">Projects</div>
+          {/* one scroll container for local projects AND bench sections, so
+              linked machines sit right under the local list instead of being
+              pushed to the sidebar's bottom by a stretched project list */}
+          <div className="sidebar-scroll">
           <nav className="project-list">
             {projects.map((p, i) => {
               const st = projectStatus(p.path);
@@ -1597,6 +1601,7 @@ export default function App() {
               </div>
             );
           })}
+          </div>
 
           <button className="btn-add-project" onClick={addProject}>
             <Plus size={12} weight="bold" /> Add project

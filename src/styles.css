@@ -981,6 +981,21 @@ body {
   overflow-y: auto;
 }
 
+/* Local projects + linked-bench sections share one scroll area; the inner
+   lists must not stretch or the benches sink to the sidebar's bottom. */
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-scroll .project-list {
+  flex: none;
+  overflow-y: visible;
+}
+
 .project {
   display: flex;
   align-items: center;

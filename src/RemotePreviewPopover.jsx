@@ -16,6 +16,15 @@ import { Globe } from "@phosphor-icons/react";
  *
  * Desktop sibling of the mobile PreviewSheet, same wire calls.
  */
+// A gateway from an older install answers new fs reads with "not allowed" —
+// say what that actually means instead of parroting the wire error.
+function friendly(err, machineName) {
+  const s = String(err?.message ?? err);
+  return /not allowed/i.test(s)
+    ? `${machineName} is running an older gateway — update AgentBench there and relaunch it (or toggle Mobile access off and on).`
+    : s;
+}
+
 export default function RemotePreviewPopover({ machine, project }) {
   const [open, setOpen] = useState(false);
   const [detected, setDetected] = useState(null); // null = still looking
@@ -31,7 +40,7 @@ export default function RemotePreviewPopover({ machine, project }) {
       .then((d) => setDetected(Array.isArray(d) ? d : []))
       .catch((err) => {
         setDetected([]);
-        setError(String(err.message ?? err));
+        setError(friendly(err, machine.machine ?? machine.name));
       });
     machine.transport
       .invoke("preview_list", {})
@@ -98,7 +107,7 @@ export default function RemotePreviewPopover({ machine, project }) {
       openPreview(res, res.hosts);
       refresh();
     } catch (err) {
-      setError(String(err.message ?? err));
+      setError(friendly(err, machine.machine ?? machine.name));
     } finally {
       setBusy(null);
     }
