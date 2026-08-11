@@ -567,6 +567,7 @@ export default memo(function AgentPane({
   command, // run panes: the command line (shown where agents show cwd)
   onHide,
   onRestart,
+  onResumeRequest, // chat "/resume" → the app's searchable session picker
   status,
   focused,
   agentColor,
@@ -663,10 +664,16 @@ export default memo(function AgentPane({
     /^[\w./-]+$/.test(p) ? p : `'${p.replaceAll("'", `'\\''`)}'`;
 
   // OS file drops come via Tauri's native drag-drop event — WKWebView never
-  // exposes real file paths to HTML5 dnd. Every pane gets the event; each
-  // hit-tests the cursor against its own rect (positions are physical px,
-  // getBoundingClientRect is CSS px, so scale by devicePixelRatio).
+  // exposes real file paths to HTML5 dnd (which is also why dropping on the
+  // chat view can't be handled by its own onDrop). Every pane gets the event;
+  // each hit-tests the cursor against its own rect (positions are physical
+  // px, getBoundingClientRect is CSS px, so scale by devicePixelRatio).
+  //
+  // Term view: paths paste into the pty, terminal-style. Chat view: images
+  // stage in the composer (read to a data URL so they preview and send
+  // exactly like a paste); other files land as quoted paths in the input.
   useEffect(() => {
+    const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
     const inside = ({ x, y }) => {
       const el = sectionRef.current;
       if (!el) return false;
@@ -680,7 +687,26 @@ export default memo(function AgentPane({
       } else if (payload.type === "drop") {
         setDragOver(false);
         if (inside(payload.position) && payload.paths.length) {
-          sendData(payload.paths.map(shellQuote).join(" ") + " ");
+          const chat = chatVisibleRef.current ? chatHandleRef.current : null;
+          if (chat) {
+            const rest = payload.paths.filter((p) => !IMG_EXT.test(p));
+            for (const p of payload.paths.filter((p) => IMG_EXT.test(p))) {
+              invoke("read_image_data_url", { path: p })
+                .then((url) =>
+                  chat.addImage?.({
+                    url,
+                    name: p.split(/[\\/]/).filter(Boolean).pop(),
+                  }),
+                )
+                // unreadable/oversized image: at least hand over the path
+                .catch(() => chat.insertText?.(shellQuote(p) + " "));
+            }
+            if (rest.length) {
+              chat.insertText?.(rest.map(shellQuote).join(" ") + " ");
+            }
+          } else {
+            sendData(payload.paths.map(shellQuote).join(" ") + " ");
+          }
         }
       } else {
         setDragOver(false); // leave / cancelled
@@ -795,7 +821,12 @@ export default memo(function AgentPane({
       data-pane-id={id}
       onMouseDown={() => onActivity(id)}
       onKeyDownCapture={onWordJumpKey}
-      onContextMenu={(ev) => ev.preventDefault()}
+      // Suppress the browser menu over the terminal (right-click there is
+      // xterm's domain), but keep it in the chat view — it's real DOM text,
+      // and right-click → Copy on a selection is the whole point of it.
+      onContextMenu={(ev) => {
+        if (!ev.target.closest?.(".chat-view")) ev.preventDefault();
+      }}
     >
       <header className="pane-head" onPointerDown={onHeadPointerDown}>
         <span
@@ -896,6 +927,10 @@ export default memo(function AgentPane({
               console.error("interrupt failed", err),
             )
           }
+          onResume={onResumeRequest}
+          // the desktop always has save_pasted_image, so headless panes can
+          // take pasted/dropped images too — Claude reads them by path
+          allowImages
           status={status}
           register={registerChat}
         />
@@ -931,6 +966,7 @@ export default memo(function AgentPane({
             )
           }
                 onNeedsTerm={() => onViewChange?.(id, "term")}
+                onResume={onResumeRequest}
                 status={status}
                 register={registerChat}
               />

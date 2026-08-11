@@ -18,6 +18,11 @@ export function createChatStore() {
     toolMsg: new Map(), // tool_use_id -> owning message (rev bump on result)
     draft: null, // streaming assistant text (stream mode only)
     pending: [], // optimistic local user echoes awaiting their real record
+    // Long-running work worth a status strip: sub-agents (Task) and
+    // background shells (Bash run_in_background). tool_use_id ->
+    // { kind: "agent"|"shell", label, detail, msgKey, bg, bgId?, done }
+    activity: new Map(),
+    model: null, // full model id the session is actually on, once observed
     nextKey: 0,
     rev: 0, // bumped on every visible change — cheap render/scroll guard
   };
@@ -35,6 +40,8 @@ export function addLocalUser(store, text, images) {
     local: true,
   });
   store.pending.push(msg);
+  // echoes whose record never matched accumulate; keep the tail bounded
+  if (store.pending.length > 20) store.pending.shift();
   return msg;
 }
 
@@ -46,6 +53,29 @@ function confirmLocalUser(store, text) {
   msg.local = false;
   msg.rev = ++store.rev;
   return true;
+}
+
+/** Stop showing the "sending" spinner on every pending echo without dropping
+ *  it from `pending` (it still dedupes against the eventual record). Called
+ *  when something *proves* the prompt was consumed — the UserPromptSubmit
+ *  hook, or any assistant output — because the exact-text record can lag or
+ *  never match (queued sends, edited resubmits), and a message that visibly
+ *  went through in the terminal must not keep spinning in chat. */
+export function confirmPending(store) {
+  let changed = false;
+  for (const p of store.pending) {
+    if (p.local) {
+      p.local = false;
+      p.rev = ++store.rev;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** A local, never-sent system notice (errors, model switches, hints). */
+export function addNotice(store, title, body) {
+  push(store, { role: "system", kind: "notice", notice: { title, body: body ?? null } });
 }
 
 function push(store, msg) {
@@ -185,17 +215,35 @@ export function applyRecord(store, rec) {
         return true;
       }
       return false;
+    case "system":
+      // stream-json's init announces the session's model before any reply
+      if (rec.subtype === "init") return noteModel(store, rec.model);
+      return false;
     default:
-      // mode, file-history-snapshot, attachment, progress, summary, system…
+      // mode, file-history-snapshot, attachment, progress, summary…
       return false;
   }
+}
+
+/** Remember the model the session is actually on, as reported by the stream
+ *  init message or an assistant reply — so the picker can show it even when
+ *  the user never chose one here. Sidechain replies are subagents (often a
+ *  different model) and error records carry the placeholder "<synthetic>";
+ *  both are ignored. */
+function noteModel(store, model) {
+  if (!model || model === "<synthetic>" || model === store.model) return false;
+  store.model = model;
+  store.rev++;
+  return true;
 }
 
 function applyAssistant(store, rec) {
   const blocks = rec.message?.content;
   if (!Array.isArray(blocks)) return false;
   const sidechain = !!rec.isSidechain;
-  let changed = false;
+  // assistant output proves the prompt was consumed — stop any send spinner
+  let changed = confirmPending(store);
+  if (!sidechain) changed = noteModel(store, rec.message?.model) || changed;
   // a complete assistant message supersedes the streaming draft
   if (store.draft) {
     store.messages = store.messages.filter((m) => m !== store.draft);
@@ -226,11 +274,93 @@ function applyAssistant(store, rec) {
         store.tools.set(b.id, tool);
         const msg = push(store, { role: "assistant", kind: "tool", tool, sidechain });
         store.toolMsg.set(b.id, msg);
+        if (!sidechain) trackToolStart(store, tool, msg);
       }
       changed = true;
     }
   }
   return changed;
+}
+
+// ---- background-work tracking ---------------------------------------------
+
+// Tools that spawn work outliving their own tool_result: sub-agents (Task)
+// and background shells. Everything else finishes when its result lands.
+function trackToolStart(store, tool, msg) {
+  const input = tool.input ?? {};
+  const bg = input.run_in_background === true;
+  if (tool.name === "Task") {
+    store.activity.set(tool.id, {
+      kind: "agent",
+      label: input.description || input.subagent_type || "subagent",
+      detail: input.subagent_type,
+      msgKey: msg.key,
+      bg,
+      done: false,
+    });
+  } else if (tool.name === "Bash" && bg) {
+    store.activity.set(tool.id, {
+      kind: "shell",
+      label: input.description || (input.command ?? "shell").slice(0, 80),
+      detail: input.command,
+      msgKey: msg.key,
+      bg: true,
+      done: false,
+    });
+  } else if (
+    (tool.name === "KillShell" || tool.name === "KillBash" || tool.name === "TaskStop") &&
+    (input.shell_id || input.bash_id || input.task_id)
+  ) {
+    completeByBgId(store, input.shell_id ?? input.bash_id ?? input.task_id);
+  }
+}
+
+// A tool_result arriving for a tracked tool: synchronous work is over;
+// background launches instead reveal the id later notifications refer to.
+function trackToolResult(store, toolId, tool, resultText) {
+  const act = store.activity.get(toolId);
+  if (!act || act.done) {
+    // output polls report completion for a background id they were asked about
+    if (
+      tool &&
+      (tool.name === "BashOutput" || tool.name === "TaskOutput") &&
+      /\b(completed|failed|killed|exit code)\b/i.test(resultText ?? "")
+    ) {
+      const input = tool.input ?? {};
+      completeByBgId(store, input.bash_id ?? input.task_id ?? input.shell_id);
+    }
+    return;
+  }
+  if (!act.bg) {
+    act.done = true;
+    store.rev++;
+    return;
+  }
+  if (tool?.isError) {
+    act.done = true;
+    store.rev++;
+    return;
+  }
+  const m = /\bid\b\s*[:=]?\s*([A-Za-z0-9_-]{2,})/i.exec(resultText ?? "");
+  if (m) act.bgId = m[1];
+}
+
+function completeByBgId(store, id) {
+  if (!id) return;
+  for (const act of store.activity.values()) {
+    if (!act.done && act.bgId === id) {
+      act.done = true;
+      store.rev++;
+    }
+  }
+}
+
+// <task-notification> means one or more background tasks finished — retire
+// their strip entries by the ids the notification names.
+function completeNotifiedTasks(store, text) {
+  for (const m of text.matchAll(/<task-id>\s*([^<]+?)\s*<\/task-id>/g)) {
+    completeByBgId(store, m[1]);
+  }
 }
 
 function applyUser(store, rec) {
@@ -279,12 +409,14 @@ function applyUser(store, rec) {
           tool.done = true;
           const msg = store.toolMsg.get(b.tool_use_id);
           if (msg) msg.rev = ++store.rev;
+          trackToolResult(store, b.tool_use_id, tool, tool.result);
           changed = true;
         }
       } else if (b.type === "text" && b.text?.trim()) {
         const notice = harnessNotice(b.text);
         const chip = commandChip(b.text);
         if (notice) {
+          completeNotifiedTasks(store, b.text);
           push(store, { role: "system", kind: "notice", notice, sidechain });
           changed = true;
         } else if (chip) {
@@ -302,6 +434,7 @@ function applyUser(store, rec) {
     const notice = harnessNotice(content);
     const chip = commandChip(content);
     if (notice) {
+      completeNotifiedTasks(store, content);
       push(store, { role: "system", kind: "notice", notice, sidechain });
       changed = true;
     } else if (chip) {
@@ -322,6 +455,7 @@ function applyStreamEvent(store, rec) {
   if (!ev) return false;
   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
     if (!store.draft) {
+      confirmPending(store); // a reply started — the send definitely landed
       store.draft = push(store, { role: "assistant", kind: "draft", text: "" });
     }
     store.draft.text += ev.delta.text;

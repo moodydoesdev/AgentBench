@@ -1,9 +1,29 @@
 import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
 import { useTransport } from "../lib/TransportContext";
-import { ArrowUp, Bell, CaretUp, ImageSquare, Microphone, Robot, Stop, Terminal, X } from "@phosphor-icons/react";
+import {
+  ArrowUp,
+  Bell,
+  CaretUp,
+  CircleNotch,
+  Cpu,
+  ImageSquare,
+  Microphone,
+  Robot,
+  Stop,
+  Terminal,
+  X,
+} from "@phosphor-icons/react";
 import { LogoMark } from "../components/Logo";
 import useDictation from "./useDictation";
-import { createChatStore, applyLines, applyLine, applyAsk, addLocalUser } from "./records";
+import {
+  createChatStore,
+  applyLines,
+  applyLine,
+  applyAsk,
+  addLocalUser,
+  addNotice,
+  confirmPending,
+} from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
 
@@ -40,11 +60,58 @@ const BUILTIN_COMMANDS = [
   ["statusline", "Configure the status line", true],
   ["doctor", "Diagnose installation issues", true],
   ["help", "Show help"],
+  ["theme", "Change the color theme", true],
+  ["output-style", "Set the output style", true],
+  ["rewind", "Rewind the conversation or code", true],
+  ["bashes", "List background shells", true],
+  ["status", "Show version and connection status", true],
+  ["login", "Sign in to Claude", true],
+  ["logout", "Sign out", true],
+  ["bug", "Report a bug to Anthropic", true],
+  ["release-notes", "Show release notes"],
+  ["pr-comments", "Show comments on the current PR"],
+  ["security-review", "Security-review pending changes"],
+  ["vim", "Toggle vim editing mode"],
+  ["terminal-setup", "Configure terminal keybindings", true],
+  ["install-github-app", "Set up Claude GitHub Actions", true],
+  ["privacy-settings", "View privacy settings", true],
 ].map(([name, desc, tui]) => ({ name, desc, source: "built-in", tui: !!tui }));
 
 const TUI_COMMANDS = new Set(
   BUILTIN_COMMANDS.filter((c) => c.tui).map((c) => c.name),
 );
+
+// TUI commands that run directly (no dialog) once given an argument, so the
+// pane must NOT flip to Term for them: "/model opus", "/resume <sid>".
+const ARG_DIRECT = new Set(["model", "resume"]);
+
+// Commands the chat view re-implements itself, so they work in both modes
+// (and even on headless panes where there is no terminal at all).
+const CHAT_NATIVE = new Set(["model", "resume"]);
+
+// Model shortcuts Claude Code's `/model <name>` (and the stream-json
+// set_model control request) accept. Fable has no shortcut alias, so its
+// entry carries the exact model id — /model and set_model take those too.
+const MODELS = [
+  { id: "default", label: "Default", desc: "recommended for daily use" },
+  { id: "claude-fable-5", label: "Fable", desc: "most capable, deepest reasoning" },
+  { id: "opus", label: "Opus", desc: "great for complex work" },
+  { id: "sonnet", label: "Sonnet", desc: "fast and smart" },
+  { id: "sonnet[1m]", label: "Sonnet 1M", desc: "1M-token context" },
+  { id: "haiku", label: "Haiku", desc: "fastest" },
+  { id: "opusplan", label: "Opus Plan", desc: "Opus plans, Sonnet builds" },
+];
+
+// The transcript and init records report full model ids ("claude-opus-4-6",
+// "claude-3-5-haiku-20241022"); the picker's ids are the shortcuts. Map an
+// observed id onto a picker id so the button and menu can show where the
+// session actually is.
+function pickerIdFor(full) {
+  if (!full) return null;
+  if (MODELS.some((m) => m.id === full)) return full;
+  const fam = /^claude-(?:\d+(?:-\d+)*-)?(opus|sonnet|haiku|fable)/.exec(full)?.[1];
+  return fam ?? full;
+}
 
 // Rows re-render only when their message's rev changes — messages mutate in
 // place (tool results, draft tokens), so identity alone isn't enough.
@@ -186,6 +253,9 @@ export default memo(function ChatView({
   onSend,
   onStop,
   onNeedsTerm,
+  // Open the app's session picker ("/resume" from the composer). Optional —
+  // without it, bare /resume falls back to the terminal dialog.
+  onResume,
   status,
   register,
   // The phone has no drag-and-drop and a much narrower composer, so it passes
@@ -238,6 +308,19 @@ export default memo(function ChatView({
   // "/" autocomplete: query is the token after a leading slash, null = closed
   const [cmdQuery, setCmdQuery] = useState(null);
   const [cmdIndex, setCmdIndex] = useState(0);
+  // Model switcher: the label reflects the last explicit choice; null =
+  // whatever the session is already on.
+  const [model, setModel] = useState(null);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  // running sub-agents / background shells popup
+  const [activityOpen, setActivityOpen] = useState(false);
+  // First-message insurance (transcript mode): the paste-then-Enter dance can
+  // leave the text sitting in the TUI's input box (Enter coalesced into the
+  // paste — worst while Claude is still booting). If neither the
+  // UserPromptSubmit hook nor the transcript confirms the send, push another
+  // Enter; at an already-submitted (empty) prompt it's a no-op.
+  const submitGuardRef = useRef(null); // active timer, or null
+  const turnConfirmedRef = useRef(false);
   // Pasted/dropped images staged in the composer: { key, url (data URL), name }.
   // They render inline (WYSIWYG), can be removed, and are written to temp files
   // on send so Claude gets them by path.
@@ -314,10 +397,22 @@ export default memo(function ChatView({
     cmdQuery != null
       ? (commandsRef.current ?? BUILTIN_COMMANDS)
           .filter((c) => c.name.toLowerCase().startsWith(cmdQuery.toLowerCase()))
-          // no terminal behind a headless pane — hide dialog-only commands
-          .filter((c) => !(mode === "stream" && c.tui))
+          // no terminal behind a headless pane — hide dialog-only commands,
+          // except the ones the chat view re-implements itself
+          .filter(
+            (c) =>
+              !(mode === "stream" && c.tui) ||
+              (CHAT_NATIVE.has(c.name) && (c.name !== "resume" || onResume)),
+          )
           .slice(0, 10)
       : [];
+
+  // Hint column: where does this command actually run/render?
+  const cmdHint = (c) => {
+    if (c.name === "model") return "model picker";
+    if (c.name === "resume" && onResume) return "session picker";
+    return c.tui ? "opens in Term" : c.source;
+  };
 
   const applyCommand = (cmd) => {
     const el = inputRef.current;
@@ -389,6 +484,13 @@ export default memo(function ChatView({
     const onTurn = listen("turn", (e) => {
       if (e.payload.id !== id) return;
       setTurnActive(!!e.payload.active);
+      if (e.payload.active) {
+        // the prompt was consumed — stand down the retry-Enter guard and
+        // stop any "sending" spinners still going
+        turnConfirmedRef.current = true;
+        clearSubmitGuard();
+        if (confirmPending(storeRef.current)) bump();
+      }
       // Turn over: whatever was queued has been consumed (or discarded), so
       // a later stop must not fire a stray Enter.
       if (!e.payload.active) queuedRef.current = false;
@@ -469,7 +571,24 @@ export default memo(function ChatView({
   }, [id, mode, invoke, listen]);
 
   useEffect(() => {
-    register?.({ focus: () => inputRef.current?.focus() });
+    register?.({
+      focus: () => inputRef.current?.focus(),
+      // OS file drops arrive through Tauri's native drag-drop (the webview
+      // never sees HTML5 file drops), so the pane pushes them in here.
+      addImage: (img) =>
+        setImages((imgs) => [
+          ...imgs,
+          { key: `img${imgKeyRef.current++}`, url: img.url, name: img.name || "image" },
+        ]),
+      insertText: (t) => {
+        const el = inputRef.current;
+        if (!el) return;
+        el.value = (el.value.trim() ? el.value.replace(/\s+$/, "") + " " : "") + t;
+        el.style.height = "";
+        el.style.height = Math.min(el.scrollHeight, 160) + "px";
+        el.focus();
+      },
+    });
     return () => register?.(null);
   }, [id]);
 
@@ -487,6 +606,60 @@ export default memo(function ChatView({
       bump();
     }
   }, [pendingAsks]);
+
+  const clearSubmitGuard = () => {
+    if (submitGuardRef.current) {
+      clearTimeout(submitGuardRef.current);
+      submitGuardRef.current = null;
+    }
+  };
+
+  // Re-send Enter until something confirms the message actually submitted:
+  // the UserPromptSubmit hook (turnConfirmedRef), or the transcript recording
+  // it (pending drained). Never armed for slash commands — a stray Enter
+  // inside an open TUI dialog would pick whatever row is highlighted.
+  const armSubmitGuard = () => {
+    clearSubmitGuard();
+    turnConfirmedRef.current = false;
+    let tries = 0;
+    const check = () => {
+      submitGuardRef.current = null;
+      if (turnConfirmedRef.current || storeRef.current.pending.length === 0) return;
+      if (tries >= 2) return;
+      tries += 1;
+      invoke("write_pane", { id, data: "\r" }).catch(() => {});
+      submitGuardRef.current = setTimeout(check, 2000);
+    };
+    submitGuardRef.current = setTimeout(check, 2000);
+  };
+  useEffect(() => clearSubmitGuard, [id]);
+
+  // Apply a model choice. Pty panes: send "/model <name>" — with an argument
+  // it applies directly, no dialog. Headless panes: the stream-json
+  // set_model control request, since slash commands never reach a TUI.
+  const selectModel = (m) => {
+    setModelMenuOpen(false);
+    setModel(m);
+    const store = storeRef.current;
+    if (mode === "stream") {
+      invoke("set_chat_model", { id, model: m })
+        .then(() => {
+          addNotice(store, `Model switched to ${m}`, null);
+          bump();
+        })
+        .catch((err) => {
+          addNotice(store, "Model switch failed", String(err));
+          bump();
+        });
+      return;
+    }
+    // pending echo first so the transcript's command chip confirms it
+    addLocalUser(store, `/model ${m}`);
+    if (workingRef.current) queuedRef.current = true;
+    onSend(`/model ${m}`);
+    atBottomRef.current = true;
+    bump();
+  };
 
   const submit = async () => {
     const el = inputRef.current;
@@ -518,10 +691,48 @@ export default memo(function ChatView({
     el.style.height = "";
     setCmdQuery(null);
     setImages([]);
-    // dialog commands (/resume, /usage, /model…) render in the terminal —
-    // flip to Term view so the dialog is actually visible
-    const tok = text.startsWith("/") ? text.slice(1).split(/\s+/)[0] : null;
-    const opensDialog = tok != null && TUI_COMMANDS.has(tok);
+
+    const parts = text.startsWith("/") ? text.slice(1).split(/\s+/) : null;
+    const tok = parts?.[0] ?? null;
+    const arg = parts && parts.length > 1 ? parts.slice(1).join(" ") : "";
+    const store = storeRef.current;
+
+    // Commands the chat handles natively, in either mode (skipped when
+    // images are staged — then it's a message that happens to start with /).
+    if (tok && imgs.length === 0) {
+      if (tok === "resume" && !arg && onResume) {
+        onResume();
+        return;
+      }
+      if (tok === "model") {
+        if (!arg) {
+          setModelMenuOpen(true);
+          return;
+        }
+        selectModel(arg);
+        return;
+      }
+      // No terminal behind a headless pane: a dialog command can't render
+      // anywhere. Say so instead of confusing the harness with it. (/model is
+      // exempt — handled above; bare /resume with a picker returned already.)
+      if (mode === "stream" && TUI_COMMANDS.has(tok) && tok !== "model") {
+        addNotice(
+          store,
+          `/${tok} needs a terminal`,
+          tok === "resume"
+            ? "A headless pane can't switch sessions mid-run. Use “Resume session…” from the New Agent menu to open one in a fresh pane."
+            : "This headless pane has no terminal to show the dialog in. Use a regular Claude pane (Term view) for it.",
+        );
+        bump();
+        return;
+      }
+    }
+
+    // dialog commands (/usage, /memory, bare /resume without a picker…)
+    // render in the terminal — flip to Term view so the dialog is visible.
+    // With an argument, /model and /resume apply directly: no flip.
+    const opensDialog =
+      tok != null && TUI_COMMANDS.has(tok) && !(arg && ARG_DIRECT.has(tok));
     // Wire text: image paths first (temp names never contain spaces, so no
     // quoting needed), then the user's message. Claude Code loads images
     // referenced by path.
@@ -529,7 +740,7 @@ export default memo(function ChatView({
       ? [...paths, text].filter(Boolean).join(" ")
       : text;
     if (!opensDialog) {
-      addLocalUser(storeRef.current, text, imgs.map((im) => ({ url: im.url })));
+      addLocalUser(store, text, imgs.map((im) => ({ url: im.url })));
     }
     // Sending into a live turn means the TUI queues this message — remember
     // that, so a later stop knows to push it through rather than drop it.
@@ -537,6 +748,8 @@ export default memo(function ChatView({
     setTurnActive(true); // don't wait on the hook to offer a stop button
     onSend(wire);
     if (opensDialog && mode === "transcript") onNeedsTerm?.();
+    // plain messages only — see armSubmitGuard on why commands are exempt
+    if (mode === "transcript" && !tok && !workingRef.current) armSubmitGuard();
     atBottomRef.current = true;
     bump();
   };
@@ -594,9 +807,38 @@ export default memo(function ChatView({
   };
 
   const store = storeRef.current;
+  // Model to show on the picker: the last explicit choice, else whatever the
+  // session reported it's actually on (init message / assistant replies).
+  const activeModel = model ?? pickerIdFor(store.model);
   const hiddenCount = Math.max(0, store.messages.length - tailCap);
   const visible = hiddenCount ? store.messages.slice(hiddenCount) : store.messages;
   const groups = groupMessages(visible);
+
+  // Live background work: sub-agents and background shells still running.
+  const activity = [...store.activity.values()].filter((a) => !a.done);
+  const runningAgents = activity.filter((a) => a.kind === "agent");
+  const runningShells = activity.filter((a) => a.kind === "shell");
+
+  // Jump to (and flash) the tool card an activity chip points at; page the
+  // tail cap out first if the card is behind "Show earlier".
+  const revealMsg = (key) => {
+    setActivityOpen(false);
+    const go = (attempt) => {
+      const el = listRef.current?.querySelector(`[data-msg-key="${key}"]`);
+      if (el) {
+        atBottomRef.current = false;
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        el.classList.add("chat-flash");
+        setTimeout(() => el.classList.remove("chat-flash"), 1600);
+        return;
+      }
+      if (attempt === 0) {
+        setTailCap(store.messages.length + PAGE);
+        setTimeout(() => go(1), 80);
+      }
+    };
+    go(0);
+  };
   // Turn-activity comes from the message flow itself — the app-level pane
   // status idles at "working" between events, so it can't gate the stop
   // button. Active: streaming draft, an unfinished tool, or the user just
@@ -619,6 +861,18 @@ export default memo(function ChatView({
   // nothing to show yet: the list becomes a centered welcome panel instead
   const empty = groups.length === 0;
   const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : "";
+
+  // Any click elsewhere closes the small composer popovers (their triggers
+  // stopPropagation so the toggle doesn't immediately undo itself).
+  useEffect(() => {
+    if (!modelMenuOpen && !activityOpen) return;
+    const close = () => {
+      setModelMenuOpen(false);
+      setActivityOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [modelMenuOpen, activityOpen]);
 
   return (
     // Esc also stops when focus has left the composer — clicking a question
@@ -682,13 +936,15 @@ export default memo(function ChatView({
             ) : g.type === "tools" ? (
               <div key={g.key} className="chat-tools">
                 {g.items.map((m) => (
-                  <ToolCard
-                    key={m.key}
-                    tool={m.tool}
-                    rev={m.rev}
-                    paneId={id}
-                    canAnswer={mode === "transcript"}
-                  />
+                  // anchor for the activity strip's "jump to card"
+                  <div key={m.key} data-msg-key={m.key}>
+                    <ToolCard
+                      tool={m.tool}
+                      rev={m.rev}
+                      paneId={id}
+                      canAnswer={mode === "transcript"}
+                    />
+                  </div>
                 ))}
               </div>
             ) : (
@@ -704,6 +960,56 @@ export default memo(function ChatView({
         </div>
       </div>
       <div className="chat-composer">
+        {activity.length > 0 && (
+          <div className="chat-activity">
+            <button
+              className="chat-activity-head"
+              onMouseDown={(ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                setActivityOpen((o) => !o);
+              }}
+            >
+              <span className="chat-activity-pulse" />
+              {[
+                runningAgents.length > 0 &&
+                  `${runningAgents.length} agent${runningAgents.length === 1 ? "" : "s"}`,
+                runningShells.length > 0 &&
+                  `${runningShells.length} shell${runningShells.length === 1 ? "" : "s"}`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}{" "}
+              running
+              <CaretUp size={9} weight="bold" className={activityOpen ? "flip" : ""} />
+            </button>
+            {activityOpen && (
+              <div
+                className="chat-activity-list"
+                onMouseDown={(ev) => ev.stopPropagation()}
+              >
+                {activity.map((a, i) => (
+                  <button
+                    key={`${a.msgKey}-${i}`}
+                    className="chat-activity-item"
+                    title="Jump to its card in the conversation"
+                    onClick={() => revealMsg(a.msgKey)}
+                  >
+                    {a.kind === "agent" ? (
+                      <Robot size={12} />
+                    ) : (
+                      <Terminal size={12} />
+                    )}
+                    <span className="chat-activity-label">{a.label}</span>
+                    {a.detail && a.detail !== a.label && (
+                      <span className="chat-activity-detail">{a.detail}</span>
+                    )}
+                    <CircleNotch size={11} className="chat-activity-spin" />
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <div
           className={`chat-composer-card${dragOver ? " drag-over" : ""}`}
           onDrop={onDrop}
@@ -733,9 +1039,7 @@ export default memo(function ChatView({
                 >
                   <span className="chat-cmd-name">/{c.name}</span>
                   {c.desc && <span className="chat-cmd-desc">{c.desc}</span>}
-                  <span className="chat-cmd-src">
-                    {c.tui ? "opens in Term" : c.source}
-                  </span>
+                  <span className="chat-cmd-src">{cmdHint(c)}</span>
                 </button>
               ))}
             </div>
@@ -865,12 +1169,52 @@ export default memo(function ChatView({
                     : "listening — esc to discard"
                   : working
                     ? touch
-                      ? "working — stop to interrupt"
+                      ? "working…" // the stop button is right there; naming it just wraps the bar
                       : "working — esc to stop"
                     : touch
                       ? "tap send"
                       : "enter to send"}
             </span>
+            <div className="chat-model-wrap">
+              {modelMenuOpen && (
+                <div
+                  className="chat-model-menu"
+                  onMouseDown={(ev) => ev.stopPropagation()}
+                >
+                  {MODELS.map((m) => (
+                    <button
+                      key={m.id}
+                      className={`chat-model-item${(activeModel ?? "default") === m.id ? " sel" : ""}`}
+                      // mousedown so the textarea never loses focus
+                      onMouseDown={(ev) => {
+                        ev.preventDefault();
+                        selectModel(m.id);
+                      }}
+                    >
+                      <span className="chat-model-name">{m.label}</span>
+                      <span className="chat-model-desc">{m.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <button
+                className="chat-model-btn"
+                title="Switch model (/model)"
+                aria-haspopup="menu"
+                aria-expanded={modelMenuOpen}
+                onMouseDown={(ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  setModelMenuOpen((o) => !o);
+                }}
+              >
+                <Cpu size={13} />
+                {MODELS.find((m) => m.id === activeModel)?.label ??
+                  activeModel ??
+                  "Model"}
+                <CaretUp size={8} weight="bold" />
+              </button>
+            </div>
             {allowImages && (
               <>
                 <input

@@ -5,7 +5,7 @@
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -34,6 +34,11 @@ pub struct Core {
     /// brand-new id (from /clear or a resume fork) has no transcript on disk
     /// until the first message is submitted.
     pub sessions: Mutex<HashMap<u32, Vec<String>>>,
+    /// Every session id ever bound to a pane, including panes that have since
+    /// exited. Session adoption consults this rather than the live panes: a
+    /// closed pane's transcript stays the newest file in its project, and a
+    /// pane opened right after must never inherit that conversation.
+    pub claimed: Mutex<HashSet<String>>,
     pub colors: Mutex<HashMap<u32, String>>,
     /// Per-pane timestamps of the last Stop hook and the last real user
     /// keystroke. If no input followed the last "done", a needs_input event
@@ -140,6 +145,7 @@ impl Core {
             next_id: AtomicU32::new(1),
             hook_port: AtomicU32::new(0),
             sessions: Mutex::new(HashMap::new()),
+            claimed: Mutex::new(HashSet::new()),
             colors: Mutex::new(HashMap::new()),
             last_done: Mutex::new(HashMap::new()),
             last_input: Mutex::new(HashMap::new()),
@@ -226,6 +232,26 @@ fn transcript_path(core: &Core, cwd: &str, sid: &str) -> PathBuf {
 /// A session is only resumable once Claude has written its transcript.
 fn session_exists(core: &Core, cwd: &str, sid: &str) -> bool {
     transcript_path(core, cwd, sid).exists()
+}
+
+/// Bind a session id to a pane: newest-first in the pane's history, plus a
+/// permanent entry in `claimed` so no later pane can adopt this transcript.
+/// Returns true when the pane's current session actually changed.
+fn bind_session(core: &Core, id: u32, sid: &str) -> bool {
+    let changed = {
+        let mut sessions = core.sessions.lock().unwrap();
+        let hist = sessions.entry(id).or_default();
+        if hist.first().map(String::as_str) == Some(sid) {
+            false
+        } else {
+            hist.retain(|s| s != sid);
+            hist.insert(0, sid.to_string());
+            hist.truncate(8);
+            true
+        }
+    };
+    core.claimed.lock().unwrap().insert(sid.to_string());
+    changed
 }
 
 /// Hook settings passed to `claude --settings`. Port + pane id are baked
@@ -525,7 +551,7 @@ pub fn create_pane(
     // seed the history with the resumed sid so persist_panes doesn't write
     // session_id: null in the window before the first hook event arrives
     if let Some(sid) = &resume {
-        core.sessions.lock().unwrap().insert(id, vec![sid.clone()]);
+        bind_session(core, id, sid);
     }
 
     let pty = native_pty_system();
@@ -827,22 +853,28 @@ pub fn unwatch_transcript(core: &Core, id: u32) {
 }
 
 /// Hook-independent fallback: when the hooks never deliver a session id
-/// (observed on Windows), adopt the project's newest transcript written
-/// since this pane spawned that no other pane has claimed.
+/// (observed on Windows), adopt the project's newest transcript created
+/// since this pane spawned that no pane has ever claimed.
 fn adopt_session(core: &Core, id: u32, cwd: &str, spawned: std::time::SystemTime) -> Option<String> {
+    // The hooks did deliver — this pane's own session id is known, its
+    // transcript just hasn't been written yet (Claude creates the file on the
+    // first prompt, not at startup). Waiting is correct: guessing here is what
+    // used to hand a brand-new pane the conversation from the pane it
+    // replaced, so the chat read as resumed while the terminal was fresh.
+    if core
+        .sessions
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|h| !h.is_empty())
+    {
+        return None;
+    }
     let dir = core
         .home_dir
         .join(".claude")
         .join("projects")
         .join(cwd_slug(cwd));
-    let claimed: std::collections::HashSet<String> = core
-        .sessions
-        .lock()
-        .unwrap()
-        .values()
-        .flatten()
-        .cloned()
-        .collect();
     let cutoff = spawned
         .checked_sub(std::time::Duration::from_secs(5))
         .unwrap_or(spawned);
@@ -855,27 +887,27 @@ fn adopt_session(core: &Core, id: u32, cwd: &str, spawned: std::time::SystemTime
         let Some(sid) = p.file_stem().and_then(|x| x.to_str()).map(String::from) else {
             continue;
         };
-        if claimed.contains(&sid) {
+        // `claimed` outlives the panes themselves: a pane that exited seconds
+        // ago left the newest transcript in the project behind it.
+        if core.claimed.lock().unwrap().contains(&sid) {
             continue;
         }
-        let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
+        let Ok(md) = e.metadata() else { continue };
+        // Birth time, not mtime: a transcript that already existed when this
+        // pane spawned belongs to an earlier session however recently it was
+        // appended to. Filesystems without a birth time fall back to mtime.
+        let Ok(born) = md.created().or_else(|_| md.modified()) else {
             continue;
         };
-        if mtime < cutoff {
+        if born < cutoff {
             continue;
         }
-        if best.as_ref().is_none_or(|(bm, _)| mtime > *bm) {
-            best = Some((mtime, sid));
+        if best.as_ref().is_none_or(|(bb, _)| born > *bb) {
+            best = Some((born, sid));
         }
     }
     let (_, sid) = best?;
-    {
-        let mut sessions = core.sessions.lock().unwrap();
-        let hist = sessions.entry(id).or_default();
-        hist.retain(|s| s != &sid);
-        hist.insert(0, sid.clone());
-        hist.truncate(8);
-    }
+    bind_session(core, id, &sid);
     persist_panes(core);
     Some(sid)
 }
@@ -984,7 +1016,7 @@ pub fn create_chat_pane(
     });
     if let Some(sid) = &resume {
         line.push_str(&format!(" --resume {sid}"));
-        core.sessions.lock().unwrap().insert(id, vec![sid.clone()]);
+        bind_session(core, id, sid);
     }
 
     let shell = resolve_shell(shell_pref);
@@ -1023,6 +1055,7 @@ pub fn create_chat_pane(
     let out_core = core.clone();
     let out_buffer = buffer.clone();
     let out_child = child.clone();
+    let out_cwd = cwd.clone();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -1033,25 +1066,22 @@ pub fn create_chat_pane(
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 is_partial = v["type"] == "stream_event";
                 if let Some(sid) = v["session_id"].as_str() {
-                    let changed = {
-                        let mut sessions = out_core.sessions.lock().unwrap();
-                        let hist = sessions.entry(id).or_default();
-                        if hist.first().map(String::as_str) != Some(sid) {
-                            hist.retain(|s| s != sid);
-                            hist.insert(0, sid.to_string());
-                            hist.truncate(8);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if changed {
+                    if bind_session(&out_core, id, sid) {
                         persist_panes(&out_core);
                     }
                 }
                 if v["type"] == "result" {
                     out_core.last_done.lock().unwrap().insert(id, Instant::now());
-                    out_core.broadcast(&json!({ "ev": "agent-event", "id": id, "kind": "done" }));
+                    let sid = out_core
+                        .sessions
+                        .lock()
+                        .unwrap()
+                        .get(&id)
+                        .and_then(|h| h.first().cloned());
+                    out_core.broadcast(&json!({
+                        "ev": "agent-event", "id": id, "kind": "done",
+                        "cwd": out_cwd, "sid": sid,
+                    }));
                 }
             }
             if !is_partial {
@@ -1150,6 +1180,25 @@ pub fn interrupt_pane(core: &Arc<Core>, id: u32, resubmit: bool) {
     }
 }
 
+/// Switch a headless chat pane's model mid-session via the stream-json
+/// control channel — the same `set_model` request the Agent SDK sends. Pty
+/// panes don't need this: the composer sends `/model <name>` as a message.
+pub fn set_chat_model(core: &Core, id: u32, model: &str) -> Result<(), String> {
+    static REQ: AtomicU32 = AtomicU32::new(1);
+    let mut chat = core.chat_panes.lock().unwrap();
+    let pane = chat.get_mut(&id).ok_or("no such pane")?;
+    let msg = json!({
+        "type": "control_request",
+        "request_id": format!("set-model-{}", REQ.fetch_add(1, Ordering::SeqCst)),
+        "request": { "subtype": "set_model", "model": model }
+    });
+    pane.stdin
+        .write_all(msg.to_string().as_bytes())
+        .and_then(|_| pane.stdin.write_all(b"\n"))
+        .and_then(|_| pane.stdin.flush())
+        .map_err(|e| e.to_string())
+}
+
 /// Composer text → a stream-json user message on the harness's stdin.
 fn write_chat_pane(core: &Core, id: u32, text: &str) -> Result<(), String> {
     let mut chat = core.chat_panes.lock().unwrap();
@@ -1203,13 +1252,7 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                         .ok()
                         .and_then(|v| v["session_id"].as_str().map(String::from))
                     {
-                        {
-                            let mut sessions = core.sessions.lock().unwrap();
-                            let hist = sessions.entry(id).or_default();
-                            hist.retain(|s| s != &sid);
-                            hist.insert(0, sid);
-                            hist.truncate(8);
-                        }
+                        bind_session(&core, id, &sid);
                         persist_panes(&core);
                     }
                     // PreToolUse(AskUserQuestion): forward the questions to the
@@ -1268,7 +1311,22 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                         }
                     };
                     if !idle && !stale && (kind == "done" || kind == "needs_input") {
-                        core.broadcast(&json!({ "ev": "agent-event", "id": id, "kind": kind }));
+                        // carry cwd + session so clients can pull "what did it
+                        // say" (inbox snippets) without a broker round trip
+                        let cwd = core
+                            .panes
+                            .lock()
+                            .unwrap()
+                            .get(&id)
+                            .map(|p| p.cwd.clone())
+                            .or_else(|| {
+                                core.chat_panes.lock().unwrap().get(&id).map(|p| p.cwd.clone())
+                            });
+                        let sid = cwd.as_deref().and_then(|c| newest_session(&core, id, c));
+                        core.broadcast(&json!({
+                            "ev": "agent-event", "id": id, "kind": kind,
+                            "cwd": cwd, "sid": sid,
+                        }));
                     }
                 }
             }
@@ -1348,6 +1406,17 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
                 req["resubmit"].as_bool().unwrap_or(false),
             );
             None
+        }
+        Some("set-model") => {
+            let res = set_chat_model(
+                core,
+                req["id"].as_u64().unwrap_or(0) as u32,
+                req["model"].as_str().unwrap_or_default(),
+            );
+            Some(match res {
+                Ok(()) => json!({ "result": null }),
+                Err(e) => json!({ "error": e }),
+            })
         }
         Some("list") => Some(json!({ "result": list_panes(core) })),
         Some("saved") => Some(json!({ "result": saved_panes(core) })),

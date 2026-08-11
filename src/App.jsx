@@ -37,7 +37,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
-import { Bell, CaretDown, GearSix, Play, Plus, FileText, X } from "@phosphor-icons/react";
+import { Bell, CaretDown, GearSix, Play, Plus, FileText, Tray, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
 import {
   DropdownMenu,
@@ -126,6 +126,10 @@ export default function App() {
   const [cmdMenuOpen, setCmdMenuOpen] = useState(false);
   const [notifs, setNotifs] = useState([]); // {key, paneId, kind, label, project, projectPath, ts, read}
   const [notifOpen, setNotifOpen] = useState(false);
+  // Inbox: messaging-app-style list of finished chats, one entry per pane
+  // (latest turn wins), with the agent's closing words as the snippet.
+  // Persisted so finished work survives an app restart.
+  const [inbox, setInbox] = useState(() => loadJSON("agentbench.inbox", []));
   const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
   const [sessionsOpen, setSessionsOpen] = useState(false); // resume-session picker
   const renameInputRef = useRef(null);
@@ -522,7 +526,7 @@ export default function App() {
     });
 
     const unEvent = listen("agent-event", (e) => {
-      const { id, kind } = e.payload;
+      const { id, kind, cwd, sid } = e.payload;
       const status = kind === "done" ? "done" : "input";
       setStatuses((s) => (id in s ? { ...s, [id]: status } : s));
       const pane = panesRef.current.find((p) => p.id === id);
@@ -542,6 +546,37 @@ export default function App() {
           ...list,
         ].slice(0, 30),
       );
+      // Inbox entry: one per pane, newest turn replaces the old one.
+      const entry = {
+        key: `${id}-${Date.now()}`,
+        paneId: id,
+        kind,
+        label,
+        project: pane ? baseName(pane.projectPath) : "",
+        projectPath: pane?.projectPath,
+        ts: Date.now(),
+        read: false,
+        snippet: null,
+        sid: sid ?? null,
+      };
+      setInbox((list) => [entry, ...list.filter((n) => n.paneId !== id)].slice(0, 50));
+      // "What did it say" — the agent's closing words, read from the
+      // transcript once it has flushed. Brokers that predate the cwd/sid
+      // fields just keep the generic snippet.
+      if (kind === "done" && cwd && sid) {
+        setTimeout(() => {
+          invoke("session_tail", { project: cwd, sid })
+            .then((text) => {
+              if (!text) return;
+              setInbox((list) =>
+                list.map((n) =>
+                  n.paneId === id && n.sid === sid ? { ...n, snippet: text } : n,
+                ),
+              );
+            })
+            .catch(() => {});
+        }, 400);
+      }
       const cfg = settingsRef.current;
       if (cfg.sound) {
         ping.volume = cfg.volume ?? 0.8;
@@ -907,6 +942,35 @@ export default function App() {
     }
   };
 
+  // New agent in a project on a linked bench — the same wire call the phone
+  // makes, so the remote broker gets an identical harness spec. No local
+  // state to update: the pane arrives through the machine's pane-list push.
+  const spawnRemoteAgent = (m, cwd, harnessId) => {
+    const harness = getHarness(
+      settingsRef.current,
+      harnessId ?? settingsRef.current.defaultHarness,
+    );
+    return m.transport
+      ?.invoke("create_pane", {
+        cwd,
+        cols: 100,
+        rows: 30,
+        resume: null,
+        // theme only means something to Claude's settings file
+        theme: harness.claude
+          ? getTheme(settingsRef.current.theme).claudeTheme ?? null
+          : null,
+        harness: {
+          id: harness.id,
+          command: harness.command,
+          resume: harness.resume ?? null,
+          claude: !!harness.claude,
+          interactive: !!harness.interactive,
+        },
+      })
+      .catch((err) => console.error("remote spawn failed", err));
+  };
+
   // Focusing a terminal acknowledges its pending notifications.
   const markNotifsRead = (id) => {
     setNotifs((list) =>
@@ -914,6 +978,32 @@ export default function App() {
         ? list.map((n) => (n.paneId === id && !n.read ? { ...n, read: true } : n))
         : list,
     );
+    setInbox((list) =>
+      list.some((n) => n.paneId === id && !n.read)
+        ? list.map((n) => (n.paneId === id && !n.read ? { ...n, read: true } : n))
+        : list,
+    );
+  };
+
+  useEffect(() => {
+    localStorage.setItem("agentbench.inbox", JSON.stringify(inbox));
+  }, [inbox]);
+
+  const dismissInbox = (key) => setInbox((list) => list.filter((n) => n.key !== key));
+
+  const openInboxItem = (n) => {
+    setInbox((list) =>
+      list.map((x) => (x.key === n.key ? { ...x, read: true } : x)),
+    );
+    const pane = panesRef.current.find((p) => p.id === n.paneId);
+    if (!pane) return; // agent closed since — the entry stays until cleared
+    setRemoteSel(null);
+    if (pane.projectPath !== activePathRef.current) {
+      setActivePath(pane.projectPath);
+      setTimeout(() => focusAgent(pane), 50);
+    } else {
+      focusAgent(pane);
+    }
   };
 
   // User touched the pane: acknowledge the done/input glow.
@@ -1446,6 +1536,74 @@ export default function App() {
 
       <div className="body">
         <aside className="sidebar">
+          {/* Inbox — finished chats surface here like messages, newest first;
+              clear them once acted on. Snippets are the agent's closing words. */}
+          <div className="inbox">
+            <div className="sidebar-head inbox-head">
+              <Tray size={12} weight="bold" />
+              <span>Inbox</span>
+              {(() => {
+                const unread = inbox.filter((n) => !n.read).length;
+                return unread > 0 ? (
+                  <span className="inbox-badge">{unread > 9 ? "9+" : unread}</span>
+                ) : null;
+              })()}
+              {inbox.length > 0 && (
+                <button
+                  className="inbox-clear"
+                  title="Clear the inbox"
+                  onClick={() => setInbox([])}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {inbox.length > 0 && (
+              <div className="inbox-list">
+                {inbox.map((n) => {
+                  const alive = panes.some((p) => p.id === n.paneId);
+                  return (
+                    <div
+                      key={n.key}
+                      className={`inbox-item${n.read ? "" : " unread"}${alive ? "" : " stale"}`}
+                      title={alive ? "Go to agent" : "Agent closed"}
+                      onClick={() => openInboxItem(n)}
+                    >
+                      <span
+                        className={`inbox-dot ${n.kind === "done" ? "done" : "input"}`}
+                      />
+                      <span className="inbox-body">
+                        <span className="inbox-title">
+                          <span className="inbox-name">{n.label}</span>
+                          <span className="inbox-time">{timeAgo(n.ts)}</span>
+                        </span>
+                        <span className="inbox-snippet">
+                          {n.snippet ??
+                            (n.kind === "done"
+                              ? "Finished its turn."
+                              : "Waiting for your input.")}
+                        </span>
+                        {n.project && (
+                          <span className="inbox-proj">{n.project}</span>
+                        )}
+                      </span>
+                      <button
+                        className="inbox-x"
+                        title="Clear from inbox"
+                        aria-label="Clear from inbox"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          dismissInbox(n.key);
+                        }}
+                      >
+                        <X size={10} weight="bold" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
           <div className="sidebar-head">Projects</div>
           {/* one scroll container for local projects AND bench sections, so
               linked machines sit right under the local list instead of being
@@ -1665,6 +1823,7 @@ export default function App() {
                     command={p.command}
                     onHide={hideRun}
                     onRestart={() => restartRun(p)}
+                    onResumeRequest={() => setSessionsOpen(true)}
                     name={titles[p.id] || p.label}
                     cwd={p.projectPath}
                     status={statuses[p.id] || "working"}
@@ -1712,18 +1871,63 @@ export default function App() {
                       machine={m}
                       project={{ cwd: remoteSel.cwd, name: projName }}
                     />
-                    <button
-                      className="btn-sm"
-                      title={`Start a headless Claude chat in ${projName} on ${label}`}
-                      disabled={!m.connected}
-                      onClick={() =>
-                        m.transport
-                          ?.invoke("create_chat_pane", { cwd: remoteSel.cwd })
-                          .catch((err) => console.error("remote spawn failed", err))
-                      }
-                    >
-                      <Plus size={12} weight="bold" /> Agent
-                    </button>
+                    {/* same split button as the local header; the missing-
+                        binary badge is skipped because we can only probe the
+                        local PATH, not {label}'s */}
+                    <div className="btn-new-split">
+                      <button
+                        className="btn-new"
+                        disabled={!m.connected}
+                        title={`Start a new agent in ${projName} on ${label}`}
+                        onClick={() => spawnRemoteAgent(m, remoteSel.cwd)}
+                      >
+                        <Plus size={13} weight="bold" /> New{" "}
+                        {getHarness(settings, settings.defaultHarness).name}
+                      </button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            className="btn-new btn-new-caret"
+                            disabled={!m.connected}
+                            title="Spawn a different agent"
+                          >
+                            <CaretDown size={11} weight="bold" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="min-w-[190px]">
+                          {getHarnesses(settings).map((h) => (
+                            <DropdownMenuItem
+                              key={h.id}
+                              onSelect={() =>
+                                spawnRemoteAgent(m, remoteSel.cwd, h.id)
+                              }
+                            >
+                              {h.name}
+                              {h.id === (settings.defaultHarness ?? "claude") && (
+                                <span className="ml-auto text-xs opacity-50">
+                                  default
+                                </span>
+                              )}
+                            </DropdownMenuItem>
+                          ))}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              m.transport
+                                ?.invoke("create_chat_pane", { cwd: remoteSel.cwd })
+                                .catch((err) =>
+                                  console.error("remote spawn failed", err),
+                                )
+                            }
+                          >
+                            Claude (Chat)
+                            <span className="ml-auto text-xs opacity-50">
+                              headless
+                            </span>
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
                   </div>
                   <main
                     className="grid remote-grid"
@@ -1753,13 +1957,7 @@ export default function App() {
                         <button
                           className="btn-new big"
                           disabled={!m.connected}
-                          onClick={() =>
-                            m.transport
-                              ?.invoke("create_chat_pane", { cwd: remoteSel.cwd })
-                              .catch((err) =>
-                                console.error("remote spawn failed", err),
-                              )
-                          }
+                          onClick={() => spawnRemoteAgent(m, remoteSel.cwd)}
                         >
                           <Plus size={15} weight="bold" /> New Agent on {label}
                         </button>

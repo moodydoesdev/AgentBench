@@ -290,6 +290,58 @@ fn list_sessions(project: String) -> Vec<Value> {
     fsdata::list_sessions(&project)
 }
 
+/// Full-text search over a project's session transcripts (resume picker's
+/// ripgrep box): case-insensitive substring over user + assistant text.
+#[tauri::command]
+async fn search_sessions(project: String, query: String) -> Vec<Value> {
+    fsdata::search_sessions(&project, &query)
+}
+
+/// The agent's closing words in a session — inbox snippet material.
+#[tauri::command]
+fn session_tail(project: String, sid: String) -> Option<String> {
+    fsdata::last_assistant_text(&project, &sid)
+}
+
+/// Switch a headless chat pane's model mid-session (stream-json set_model).
+#[tauri::command]
+fn set_chat_model(client: State<'_, Arc<BrokerClient>>, id: u32, model: String) -> Result<(), String> {
+    client
+        .request(json!({ "op": "set-model", "id": id, "model": model }))
+        .map(|_| ())
+}
+
+/// An image file as a data: URL, so an OS-dropped file can be staged in the
+/// chat composer exactly like a pasted one (preview + temp-file on send).
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    use base64::Engine;
+    const CAP: u64 = 32 * 1024 * 1024;
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > CAP {
+        return Err("image is too large to stage (32MB cap)".into());
+    }
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => return Err("not a supported image type".into()),
+    };
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 /// Raw file bytes as base64 — used by the auto-theme wallpaper sampler,
 /// which needs canvas-safe pixel access (asset:// images can taint canvas).
 #[tauri::command]
@@ -957,6 +1009,10 @@ pub fn run() {
             open_preview_window,
             list_slash_commands,
             list_sessions,
+            search_sessions,
+            session_tail,
+            set_chat_model,
+            read_image_data_url,
             read_file_base64,
             save_pasted_image,
             sync_plan_skill,

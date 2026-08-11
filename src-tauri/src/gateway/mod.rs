@@ -11,6 +11,7 @@ pub mod links;
 pub mod net;
 pub mod preview;
 pub mod push;
+pub mod rewrite;
 pub mod tokens;
 
 use serde_json::{json, Value};
@@ -49,6 +50,7 @@ const ALLOWED_OPS: &[&str] = &[
     "create",
     "create-chat",
     "kill",
+    "set-model",
 ];
 
 /// Broker ops that produce a response line. The rest are fire-and-forget —
@@ -63,12 +65,14 @@ const REQUEST_OPS: &[&str] = &[
     "saved",
     "ping",
     "shutdown",
+    "set-model",
 ];
 
 /// Reads the phone can make that bypass the broker's op vocabulary: plain
 /// filesystem lookups, plus a couple of helpers the broker has no op for.
 const FS_READS: &[&str] = &[
     "list_sessions",
+    "search_sessions",
     "list_plans",
     "read_plan",
     "list_slash_commands",
@@ -674,6 +678,10 @@ impl Gateway {
         let project = args["project"].as_str().unwrap_or_default();
         match name {
             "list_sessions" => Ok(json!(fsdata::list_sessions(project))),
+            "search_sessions" => Ok(json!(fsdata::search_sessions(
+                project,
+                args["query"].as_str().unwrap_or_default(),
+            ))),
             "list_plans" => Ok(fsdata::list_plans(project)),
             "list_slash_commands" => Ok(json!(fsdata::list_slash_commands(project))),
             "read_plan" => fsdata::read_plan(args["path"].as_str().unwrap_or_default()),
@@ -692,17 +700,26 @@ impl Gateway {
             // Dev-server previews: start/stop answer with the connection
             // details the phone turns into a browser tab.
             "preview_start" => {
-                let port = args["port"].as_u64().unwrap_or(0) as u16;
-                let mut info = self
-                    .previews
-                    .start(args["cwd"].as_str().unwrap_or_default(), port)
-                    .await?;
+                let cwd = args["cwd"].as_str().unwrap_or_default();
+                // a site start carries the origin to rewrite; a plain start
+                // carries only the loopback port to splice
+                let mut info = if let Some(origin) = args["origin"].as_str() {
+                    let hint = args["upstreamPort"].as_u64().map(|p| p as u16);
+                    self.previews.start_site(cwd, origin, hint).await?
+                } else {
+                    let port = args["port"].as_u64().unwrap_or(0) as u16;
+                    self.previews.start(cwd, port).await?
+                };
                 info["hosts"] = preview::hosts_off_thread().await;
                 Ok(info)
             }
-            "preview_stop" => Ok(self
-                .previews
-                .stop(args["port"].as_u64().unwrap_or(0) as u16)),
+            "preview_stop" => {
+                let key = match args["origin"].as_str() {
+                    Some(o) => preview::Key::Site(o.trim().trim_end_matches('/').to_lowercase()),
+                    None => preview::Key::Port(args["port"].as_u64().unwrap_or(0) as u16),
+                };
+                Ok(self.previews.stop(&key))
+            }
             "preview_list" => Ok(self.previews.list().await),
             "preview_detect" => self.preview_detect(args["cwd"].as_str().unwrap_or_default()).await,
             // Titles are refined while a session runs, so they are refreshable
@@ -728,11 +745,18 @@ impl Gateway {
     /// preview sheet opens pre-populated. Vite, next and friends print their
     /// local URL when they boot; the scrollback is the closest thing to a
     /// registry of what is running where.
+    ///
+    /// Answers `{ ports, site }` — the site is a Laravel-style app addressed
+    /// by a `.test`/`.localhost` origin, needing the rewriting proxy rather
+    /// than the transparent splice. (Older shells expected a bare array and
+    /// read this shape as "nothing detected"; the manual field still works
+    /// there.)
     async fn preview_detect(&self, cwd: &str) -> Result<Value, String> {
         use base64::Engine;
         let list = self.broker.request(json!({ "op": "list" })).await?;
         let panes = list.as_array().cloned().unwrap_or_default();
         let mut found: Vec<(u16, u64)> = Vec::new(); // port, first pane that named it
+        let mut scraped_origins: Vec<String> = Vec::new();
         for pane in &panes {
             if pane["cwd"].as_str() != Some(cwd) {
                 continue;
@@ -765,18 +789,62 @@ impl Gateway {
                     found.push((port, id));
                 }
             }
+            for origin in preview::detect_site_origins(&text) {
+                if !scraped_origins.contains(&origin) {
+                    scraped_origins.push(origin);
+                }
+            }
         }
         let mut out = Vec::with_capacity(found.len());
+        let mut live_ports: Vec<u16> = Vec::new();
         for (port, pane_id) in found {
+            let live = preview::probe(port).await;
+            if live {
+                live_ports.push(port);
+            }
             out.push(json!({
                 "port": port,
                 "paneId": pane_id,
                 // dead mentions outnumber live servers in old scrollback, so
                 // each candidate is probed before the sheet shows it as real
-                "live": preview::probe(port).await,
+                "live": live,
             }));
         }
-        Ok(json!(out))
+
+        // The site candidate: .env's APP_URL is authoritative, scrollback the
+        // fallback. Its upstream is guessed the same way a user would — the
+        // one live port that isn't Vite's is the app server; failing that, a
+        // vhost (Herd/Valet nginx) on 443/80.
+        let origin = preview::read_env_app_url(cwd).or_else(|| scraped_origins.into_iter().next());
+        let site = match origin {
+            None => Value::Null,
+            Some(origin) => {
+                let vite_port = preview::read_hot(cwd).map(|(_, p)| p);
+                let apps: Vec<u16> = live_ports
+                    .iter()
+                    .copied()
+                    .filter(|p| Some(*p) != vite_port)
+                    .collect();
+                let upstream_port = (apps.len() == 1).then(|| apps[0]);
+                let vhost = if upstream_port.is_some() {
+                    Value::Null
+                } else if preview::probe(443).await {
+                    json!("https")
+                } else if preview::probe(80).await {
+                    json!("http")
+                } else {
+                    Value::Null
+                };
+                json!({
+                    "origin": origin,
+                    "upstreamPort": upstream_port,
+                    "vhost": vhost,
+                    "vitePort": vite_port,
+                    "live": upstream_port.is_some() || !vhost.is_null(),
+                })
+            }
+        };
+        Ok(json!({ "ports": out, "site": site }))
     }
 
     /// Forward one broker op, enforcing the phase allowlist. `answers` marks a

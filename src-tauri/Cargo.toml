@@ -36,6 +36,10 @@ base64 = "0.22"
 dirs = "6"
 # mobile gateway (agentbench-gateway binary only)
 axum = { version = "0.8", features = ["ws"] }
+# site-preview websocket splice: hyper's server-side upgrade + the tokio IO
+# adapter. Both already in axum's tree — direct deps only for the upgrade API.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 futures-util = "0.3"
@@ -45,7 +49,7 @@ qrcodegen = "1.8"
 # web-push clients pull OpenSSL, which does not build here.
 web-push-native = "0.5"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 base64ct = { version = "1", features = ["alloc"] }
 http = "1"
 

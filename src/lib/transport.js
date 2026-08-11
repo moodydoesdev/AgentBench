@@ -29,6 +29,7 @@ const OP_FOR = {
   watch_transcript: (a) => ({ op: "watch", id: a.id }),
   unwatch_transcript: (a) => ({ op: "unwatch", id: a.id }),
   interrupt_pane: (a) => ({ op: "interrupt", id: a.id, resubmit: !!a.resubmit }),
+  set_chat_model: (a) => ({ op: "set-model", id: a.id, model: a.model }),
   resize_pane: (a) => ({ op: "resize", id: a.id, cols: a.cols, rows: a.rows }),
   list_panes: () => ({ op: "list" }),
   saved_panes: () => ({ op: "saved" }),
@@ -37,6 +38,8 @@ const OP_FOR = {
 // Requests the gateway answers itself, without the broker's op vocabulary.
 const FS_FOR = {
   list_sessions: (a) => ({ fs: "list_sessions", project: a.project }),
+  // Ripgrep-style content search across a project's session transcripts.
+  search_sessions: (a) => ({ fs: "search_sessions", project: a.project, query: a.query }),
   list_plans: (a) => ({ fs: "list_plans", project: a.project }),
   list_slash_commands: (a) => ({ fs: "list_slash_commands", project: a.project }),
   read_plan: (a) => ({ fs: "read_plan", path: a.path }),

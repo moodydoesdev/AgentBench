@@ -837,6 +837,7 @@ function NewAgentSheet({ project, machine, onClose, onStarted }) {
  */
 function PreviewSheet({ project, machine, onClose }) {
   const [detected, setDetected] = useState(null); // null = still looking
+  const [site, setSite] = useState(null); // Laravel-style .test site candidate
   const [active, setActive] = useState([]);
   const [hosts, setHosts] = useState([]);
   const [manual, setManual] = useState("");
@@ -846,7 +847,12 @@ function PreviewSheet({ project, machine, onClose }) {
   const refresh = () => {
     machine.transport
       .invoke("preview_detect", { cwd: project.cwd })
-      .then((d) => setDetected(Array.isArray(d) ? d : []))
+      .then((d) => {
+        // older gateways answer with a bare port array, current ones with
+        // { ports, site }
+        setDetected(Array.isArray(d) ? d : d?.ports ?? []);
+        setSite(Array.isArray(d) ? null : d?.site ?? null);
+      })
       .catch((err) => {
         setDetected([]);
         setError(String(err.message ?? err));
@@ -886,13 +892,13 @@ function PreviewSheet({ project, machine, onClose }) {
     window.open(`http://${h}:${p.publicPort}${path}?t=${p.secret}`, "_blank", "noopener");
   };
 
-  const start = async (port) => {
-    setBusy(port);
+  const start = async (args, busyKey) => {
+    setBusy(busyKey);
     setError(null);
     try {
       const res = await machine.transport.invoke("preview_start", {
         cwd: project.cwd,
-        port,
+        ...args,
       });
       openTab(res, res.hosts);
       refresh();
@@ -902,21 +908,44 @@ function PreviewSheet({ project, machine, onClose }) {
       setBusy(null);
     }
   };
+  const startPort = (port) => start({ port }, port);
+  const startSite = (upstreamPort) =>
+    start({ origin: site.origin, upstreamPort: upstreamPort ?? site.upstreamPort ?? null }, "site");
 
-  const stop = (port) =>
-    machine.transport.invoke("preview_stop", { port }).then(refresh).catch(() => {});
+  const stop = (p) =>
+    machine.transport
+      .invoke("preview_stop", p.kind === "site" ? { origin: p.origin } : { port: p.targetPort })
+      .then(refresh)
+      .catch(() => {});
 
   const paneName = (id) => {
     const p = machine.panes?.find((x) => String(x.id) === String(id));
     return p ? `${p.harness ?? "pane"} ${p.id}` : `pane ${id}`;
   };
 
+  // "http://dashboard.mgx.test" → "dashboard.mgx.test", for row labels
+  const originHost = (origin) => {
+    try {
+      return new URL(origin).host;
+    } catch {
+      return origin;
+    }
+  };
+
   const mine = active.filter((p) => p.cwd === project.cwd);
-  const activePorts = new Set(mine.map((p) => p.targetPort));
+  const activeSite = mine.find((p) => p.kind === "site");
+  // a site's upstream and companion ports are already spoken for — offering
+  // them again as plain port previews would only confuse
+  const activePorts = new Set(
+    mine.flatMap((p) => [p.targetPort, p.companionTarget]).filter(Boolean),
+  );
   const candidates = (detected ?? [])
     .filter((d) => !activePorts.has(d.port))
     // dead mentions in old scrollback sort under anything actually listening
     .sort((a, b) => (b.live === true) - (a.live === true));
+  // manual doubles as the site's upstream override while the site candidate
+  // has no server to point at
+  const manualStartsSite = site && !activeSite && !site.live;
 
   return (
     <div className="mob-sheet-backdrop" onClick={onClose}>
@@ -930,25 +959,53 @@ function PreviewSheet({ project, machine, onClose }) {
 
         {mine.length > 0 && <div className="mob-sheet-sub">Being previewed</div>}
         {mine.map((p) => (
-          <div key={p.targetPort} className="mob-sheet-item mob-preview-row">
+          <div
+            key={p.kind === "site" ? p.origin : p.targetPort}
+            className="mob-sheet-item mob-preview-row"
+          >
             <button className="mob-preview-open" onClick={() => openTab(p)}>
-              <span className="mob-mono mob-preview-port">:{p.targetPort}</span>
+              <span className="mob-mono mob-preview-port">
+                {p.kind === "site" ? originHost(p.origin) : `:${p.targetPort}`}
+              </span>
               <small>{p.live === false ? "server stopped — tap Stop" : "tap to open"}</small>
             </button>
-            <button className="mob-preview-stop" onClick={() => stop(p.targetPort)}>
+            <button className="mob-preview-stop" onClick={() => stop(p)}>
               Stop
             </button>
           </div>
         ))}
 
         {detected == null && <div className="mob-note">Looking for dev servers…</div>}
+        {site && !activeSite && (
+          <>
+            <div className="mob-sheet-sub">Site in this project</div>
+            <button
+              className="mob-sheet-item"
+              disabled={busy != null || !site.live}
+              onClick={() => startSite()}
+            >
+              <span className="mob-mono mob-preview-port">{originHost(site.origin)}</span>
+              {busy === "site" ? (
+                <small>starting…</small>
+              ) : (
+                <small>
+                  {site.upstreamPort
+                    ? `via :${site.upstreamPort}, URLs rewritten`
+                    : site.vhost
+                      ? `via ${site.vhost} vhost, URLs rewritten`
+                      : "app server not running — enter its port below"}
+                </small>
+              )}
+            </button>
+          </>
+        )}
         {candidates.length > 0 && <div className="mob-sheet-sub">Detected in this project</div>}
         {candidates.map((d) => (
           <button
             key={d.port}
             className="mob-sheet-item"
             disabled={busy != null || !d.live}
-            onClick={() => start(d.port)}
+            onClick={() => startPort(d.port)}
           >
             <span className="mob-mono mob-preview-port">:{d.port}</span>
             {busy === d.port ? (
@@ -958,7 +1015,7 @@ function PreviewSheet({ project, machine, onClose }) {
             )}
           </button>
         ))}
-        {detected != null && candidates.length === 0 && mine.length === 0 && (
+        {detected != null && candidates.length === 0 && mine.length === 0 && !site && (
           <div className="mob-note">
             No dev server spotted in this project's panes. Start one in a run
             pane, or enter its port below.
@@ -977,9 +1034,15 @@ function PreviewSheet({ project, machine, onClose }) {
           <button
             className="mob-primary"
             disabled={!manual || busy != null}
-            onClick={() => start(Number(manual))}
+            onClick={() =>
+              manualStartsSite ? startSite(Number(manual)) : startPort(Number(manual))
+            }
           >
-            {busy != null && String(busy) === manual ? "…" : "Start"}
+            {busy != null && String(busy) === manual
+              ? "…"
+              : manualStartsSite
+                ? `Start ${originHost(site.origin)}`
+                : "Start"}
           </button>
         </div>
 

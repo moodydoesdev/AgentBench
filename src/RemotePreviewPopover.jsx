@@ -16,18 +16,31 @@ import { Globe } from "@phosphor-icons/react";
  *
  * Desktop sibling of the mobile PreviewSheet, same wire calls.
  */
-// A gateway from an older install answers new fs reads with "not allowed" —
-// say what that actually means instead of parroting the wire error.
+// A gateway from an older install answers new fs reads with "not allowed",
+// and one that predates site previews reads a site start as a portless port
+// start ("no port given") — say what those actually mean instead of
+// parroting the wire error.
 function friendly(err, machineName) {
   const s = String(err?.message ?? err);
-  return /not allowed/i.test(s)
-    ? `${machineName} is running an older gateway — update AgentBench there and relaunch it (or toggle Mobile access off and on).`
-    : s;
+  if (/not allowed/i.test(s) || /no port given/i.test(s)) {
+    return `${machineName} is running an older gateway — update AgentBench there and relaunch it (or toggle Mobile access off and on).`;
+  }
+  return s;
+}
+
+// "http://dashboard.mgx.test" → "dashboard.mgx.test", for row labels.
+function originHost(origin) {
+  try {
+    return new URL(origin).host;
+  } catch {
+    return origin;
+  }
 }
 
 export default function RemotePreviewPopover({ machine, project }) {
   const [open, setOpen] = useState(false);
   const [detected, setDetected] = useState(null); // null = still looking
+  const [site, setSite] = useState(null); // Laravel-style .test site candidate
   const [active, setActive] = useState([]);
   const [hosts, setHosts] = useState([]);
   const [manual, setManual] = useState("");
@@ -37,7 +50,12 @@ export default function RemotePreviewPopover({ machine, project }) {
   const refresh = () => {
     machine.transport
       .invoke("preview_detect", { cwd: project.cwd })
-      .then((d) => setDetected(Array.isArray(d) ? d : []))
+      .then((d) => {
+        // older gateways answer with a bare port array, current ones with
+        // { ports, site }
+        setDetected(Array.isArray(d) ? d : d?.ports ?? []);
+        setSite(Array.isArray(d) ? null : d?.site ?? null);
+      })
       .catch((err) => {
         setDetected([]);
         setError(friendly(err, machine.machine ?? machine.name));
@@ -54,6 +72,7 @@ export default function RemotePreviewPopover({ machine, project }) {
   useEffect(() => {
     if (!open) return;
     setDetected(null);
+    setSite(null);
     setError(null);
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -90,19 +109,20 @@ export default function RemotePreviewPopover({ machine, project }) {
       openUrl(url).catch(() => {});
       return;
     }
+    const what = p.kind === "site" ? originHost(p.origin) : `:${p.targetPort}`;
     invoke("open_preview_window", {
       url,
-      title: `${project.name} :${p.targetPort} — ${machine.machine ?? machine.name}`,
+      title: `${project.name} ${what} — ${machine.machine ?? machine.name}`,
     }).catch((err) => setError(String(err)));
   };
 
-  const start = async (port) => {
-    setBusy(port);
+  const start = async (args, busyKey) => {
+    setBusy(busyKey);
     setError(null);
     try {
       const res = await machine.transport.invoke("preview_start", {
         cwd: project.cwd,
-        port,
+        ...args,
       });
       openPreview(res, res.hosts);
       refresh();
@@ -112,16 +132,30 @@ export default function RemotePreviewPopover({ machine, project }) {
       setBusy(null);
     }
   };
+  const startPort = (port) => start({ port }, port);
+  const startSite = (upstreamPort) =>
+    start({ origin: site.origin, upstreamPort: upstreamPort ?? site.upstreamPort ?? null }, "site");
 
-  const stop = (port) =>
-    machine.transport.invoke("preview_stop", { port }).then(refresh).catch(() => {});
+  const stop = (p) =>
+    machine.transport
+      .invoke("preview_stop", p.kind === "site" ? { origin: p.origin } : { port: p.targetPort })
+      .then(refresh)
+      .catch(() => {});
 
   const mine = active.filter((p) => p.cwd === project.cwd);
-  const activePorts = new Set(mine.map((p) => p.targetPort));
+  const activeSite = mine.find((p) => p.kind === "site");
+  // a site's upstream and companion ports are already spoken for — offering
+  // them again as plain port previews would only confuse
+  const activePorts = new Set(
+    mine.flatMap((p) => [p.targetPort, p.companionTarget]).filter(Boolean),
+  );
   const candidates = (detected ?? [])
     .filter((d) => !activePorts.has(d.port))
     // dead mentions in old scrollback sort under anything actually listening
     .sort((a, b) => (b.live === true) - (a.live === true));
+  // manual doubles as the site's upstream override while the site candidate
+  // has no server to point at
+  const manualStartsSite = site && !activeSite && !site.live;
 
   return (
     <Popover.Root open={open} onOpenChange={setOpen}>
@@ -142,9 +176,11 @@ export default function RemotePreviewPopover({ machine, project }) {
 
           {mine.length > 0 && <div className="preview-pop-sub">Being previewed</div>}
           {mine.map((p) => (
-            <div key={p.targetPort} className="preview-pop-row">
+            <div key={p.kind === "site" ? p.origin : p.targetPort} className="preview-pop-row">
               <button className="preview-pop-open" onClick={() => openPreview(p)}>
-                <span className="preview-pop-port">:{p.targetPort}</span>
+                <span className="preview-pop-port">
+                  {p.kind === "site" ? originHost(p.origin) : `:${p.targetPort}`}
+                </span>
                 <small>{p.live === false ? "server stopped" : "open window"}</small>
               </button>
               <button
@@ -154,13 +190,34 @@ export default function RemotePreviewPopover({ machine, project }) {
               >
                 browser
               </button>
-              <button className="btn-sm danger" onClick={() => stop(p.targetPort)}>
+              <button className="btn-sm danger" onClick={() => stop(p)}>
                 Stop
               </button>
             </div>
           ))}
 
           {detected == null && <div className="preview-pop-note">Looking for dev servers…</div>}
+          {site && !activeSite && (
+            <>
+              <div className="preview-pop-sub">Site in this project</div>
+              <button
+                className="preview-pop-row preview-pop-open"
+                disabled={busy != null || !site.live}
+                onClick={() => startSite()}
+              >
+                <span className="preview-pop-port">{originHost(site.origin)}</span>
+                <small>
+                  {busy === "site"
+                    ? "starting…"
+                    : site.upstreamPort
+                      ? `via :${site.upstreamPort}, URLs rewritten`
+                      : site.vhost
+                        ? `via ${site.vhost} vhost, URLs rewritten`
+                        : "app server not running — enter its port below"}
+                </small>
+              </button>
+            </>
+          )}
           {candidates.length > 0 && (
             <div className="preview-pop-sub">Detected in this project</div>
           )}
@@ -169,7 +226,7 @@ export default function RemotePreviewPopover({ machine, project }) {
               key={d.port}
               className="preview-pop-row preview-pop-open"
               disabled={busy != null || !d.live}
-              onClick={() => start(d.port)}
+              onClick={() => startPort(d.port)}
             >
               <span className="preview-pop-port">:{d.port}</span>
               <small>
@@ -181,7 +238,7 @@ export default function RemotePreviewPopover({ machine, project }) {
               </small>
             </button>
           ))}
-          {detected != null && candidates.length === 0 && mine.length === 0 && (
+          {detected != null && candidates.length === 0 && mine.length === 0 && !site && (
             <div className="preview-pop-note">
               No dev server spotted in this project's panes on{" "}
               {machine.machine ?? machine.name}. Start one there, or enter its
@@ -200,9 +257,11 @@ export default function RemotePreviewPopover({ machine, project }) {
             <button
               className="btn-sm"
               disabled={!manual || busy != null}
-              onClick={() => start(Number(manual))}
+              onClick={() =>
+                manualStartsSite ? startSite(Number(manual)) : startPort(Number(manual))
+              }
             >
-              Start
+              {manualStartsSite ? `Start ${originHost(site.origin)}` : "Start"}
             </button>
           </div>
 

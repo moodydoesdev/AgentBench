@@ -138,44 +138,114 @@ pub fn list_slash_commands(project: &str) -> Vec<Value> {
     out
 }
 
-/// first human-authored user line — skips harness plumbing (<tag>…, Caveat:)
-fn preview_of(path: &Path) -> (Option<String>, u64) {
-    let Ok(f) = std::fs::File::open(path) else {
-        return (None, 0);
+/// All text blocks of a transcript record's message, joined. Handles both the
+/// string and block-array content shapes.
+fn message_text(rec: &Value) -> String {
+    match &rec["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Harness plumbing dressed as a user message, not something a human typed.
+fn is_noise_user_text(t: &str) -> bool {
+    t.is_empty() || t.starts_with('<') || t.starts_with("Caveat:")
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let clipped: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
+struct SessionScan {
+    /// first human-authored user line — skips harness plumbing (<tag>…, Caveat:)
+    preview: Option<String>,
+    msgs: u64,
+    /// Claude's own ai-title records (the same short summary the terminal
+    /// title shows); refined as the session goes, so the last one wins.
+    title: Option<String>,
+    /// the agent's closing words — "what happened", not just "something did"
+    last_text: Option<String>,
+}
+
+fn scan_session(path: &Path) -> SessionScan {
+    let mut scan = SessionScan {
+        preview: None,
+        msgs: 0,
+        title: None,
+        last_text: None,
     };
-    let mut msgs = 0u64;
-    let mut preview = None;
+    let Ok(f) = std::fs::File::open(path) else {
+        return scan;
+    };
+    // Cheap contains() prefilters + parse-at-end keep this from JSON-parsing
+    // every record of a megabyte transcript: candidate lines are only carried
+    // as raw strings and parsed once the scan is over. A small tail of
+    // assistant candidates is kept because the substring match can hit
+    // non-assistant records (someone typing the word "assistant").
+    let mut title_line: Option<String> = None;
+    let mut assistant_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
-        msgs += 1;
-        if preview.is_some() {
+        scan.msgs += 1;
+        if line.contains("\"ai-title\"") {
+            title_line = Some(line);
             continue;
         }
-        let Ok(rec) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if rec["type"].as_str() != Some("user") || rec["isMeta"].as_bool() == Some(true) {
-            continue;
+        let is_candidate = line.contains("\"assistant\"");
+        if scan.preview.is_none() {
+            if let Ok(rec) = serde_json::from_str::<Value>(&line) {
+                if rec["type"].as_str() == Some("user")
+                    && rec["isMeta"].as_bool() != Some(true)
+                {
+                    let text = message_text(&rec);
+                    let t = text.trim_start();
+                    if !is_noise_user_text(t) {
+                        scan.preview = Some(t.chars().take(140).collect());
+                    }
+                }
+            }
         }
-        let text = match &rec["message"]["content"] {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .find_map(|b| {
-                    (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("").to_string())
-                })
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
-        let t = text.trim_start();
-        if t.is_empty() || t.starts_with('<') || t.starts_with("Caveat:") {
-            continue;
+        if is_candidate {
+            assistant_tail.push_back(line);
+            if assistant_tail.len() > 5 {
+                assistant_tail.pop_front();
+            }
         }
-        preview = Some(t.chars().take(140).collect::<String>());
     }
-    (preview, msgs)
+    if let Some(l) = title_line {
+        if let Ok(v) = serde_json::from_str::<Value>(&l) {
+            if let Some(t) = v["aiTitle"].as_str().filter(|t| !t.trim().is_empty()) {
+                scan.title = Some(t.trim().to_string());
+            }
+        }
+    }
+    for l in assistant_tail.iter().rev() {
+        let Ok(rec) = serde_json::from_str::<Value>(l) else {
+            continue;
+        };
+        if rec["type"].as_str() != Some("assistant") {
+            continue;
+        }
+        let text = message_text(&rec);
+        let t = text.trim();
+        if !t.is_empty() {
+            scan.last_text = Some(clip(t, 160));
+            break;
+        }
+    }
+    scan
 }
 
 /// Claude Code's project-dir slug: cwd with every non-alphanumeric char
@@ -466,25 +536,18 @@ pub fn last_assistant_text(cwd: &str, sid: &str) -> Option<String> {
     })
 }
 
-/// Resumable Claude sessions for a project: scan its transcript dir
-/// (~/.claude/projects/<slug>/*.jsonl) and return { sid, mtime, preview, msgs }
-/// newest-first, so the UI can offer "resume a previous session". The slug is
-/// Claude Code's own: every non-alphanumeric char in cwd replaced by '-'.
-pub fn list_sessions(project: &str) -> Vec<Value> {
-    let slug: String = project
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+/// A project's transcript dir (~/.claude/projects/<slug>) and its .jsonl
+/// session files, for the resume pickers.
+fn session_files(project: &str) -> Vec<(String, PathBuf, std::time::SystemTime)> {
     let dir = dirs::home_dir()
         .unwrap_or_default()
         .join(".claude")
         .join("projects")
-        .join(slug);
-
-    let mut out: Vec<(std::time::SystemTime, Value)> = Vec::new();
+        .join(cwd_slug(project));
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
+    let mut out = Vec::new();
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
@@ -493,22 +556,148 @@ pub fn list_sessions(project: &str) -> Vec<Value> {
         let Some(sid) = p.file_stem().and_then(|x| x.to_str()).map(String::from) else {
             continue;
         };
-        let meta = e.metadata().ok();
-        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
-        let mtime_ms = mtime
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let (preview, msgs) = preview_of(&p);
+        let mtime = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        out.push((sid, p, mtime));
+    }
+    out
+}
+
+fn mtime_to_ms(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Resumable Claude sessions for a project: scan its transcript dir and return
+/// { sid, mtime, preview, msgs, title, lastText } newest-first, so the UI can
+/// offer "resume a previous session" with enough context to tell them apart.
+/// The slug is Claude Code's own: every non-alphanumeric char in cwd → '-'.
+pub fn list_sessions(project: &str) -> Vec<Value> {
+    let mut out: Vec<(std::time::SystemTime, Value)> = Vec::new();
+    for (sid, path, mtime) in session_files(project) {
+        let scan = scan_session(&path);
         // an empty transcript (0 messages) can't be resumed to anything useful
-        if msgs == 0 {
+        if scan.msgs == 0 {
             continue;
         }
         out.push((
-            mtime.unwrap_or(std::time::UNIX_EPOCH),
-            json!({ "sid": sid, "mtime": mtime_ms, "preview": preview, "msgs": msgs }),
+            mtime,
+            json!({
+                "sid": sid,
+                "mtime": mtime_to_ms(mtime),
+                "preview": scan.preview,
+                "msgs": scan.msgs,
+                "title": scan.title,
+                "lastText": scan.last_text,
+            }),
         ));
     }
     out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
+/// A short window of the matched text with the hit roughly centered, ellipsized
+/// at both ends. `pos` may come from a lowercased copy, so it is snapped to
+/// the nearest char boundary rather than trusted.
+fn excerpt_around(text: &str, pos: usize, qlen: usize) -> String {
+    const PAD: usize = 70;
+    let mut start = pos.saturating_sub(PAD).min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (pos + qlen + PAD).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut s = text[start..end].replace(['\n', '\r'], " ");
+    if start > 0 {
+        s = format!("…{s}");
+    }
+    if end < text.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// Ripgrep-style content search across a project's session transcripts:
+/// case-insensitive substring over what was actually said (user + assistant
+/// text — not raw JSON), returning per-session match counts and one
+/// highlightable excerpt. Empty query behaves like `list_sessions`.
+pub fn search_sessions(project: &str, query: &str) -> Vec<Value> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return list_sessions(project);
+    }
+    let mut out: Vec<(std::time::SystemTime, Value)> = Vec::new();
+    for (sid, path, mtime) in session_files(project) {
+        let Ok(f) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut msgs = 0u64;
+        let mut matches = 0u64;
+        let mut title: Option<String> = None;
+        let mut excerpt: Option<(String, String)> = None; // (role, text)
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            msgs += 1;
+            if line.contains("\"ai-title\"") {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if let Some(t) = v["aiTitle"].as_str().filter(|t| !t.trim().is_empty()) {
+                        title = Some(t.trim().to_string());
+                    }
+                }
+                continue;
+            }
+            // cheap prefilter on the raw JSON; the real check runs on the
+            // extracted text so structure keys can't fake a hit
+            if !line.to_lowercase().contains(&q) {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let role = match rec["type"].as_str() {
+                Some("user") if rec["isMeta"].as_bool() != Some(true) => "user",
+                Some("assistant") => "assistant",
+                _ => continue,
+            };
+            let text = message_text(&rec);
+            let t = text.trim();
+            if role == "user" && is_noise_user_text(t.trim_start()) {
+                continue;
+            }
+            let Some(pos) = t.to_lowercase().find(&q) else {
+                continue;
+            };
+            matches += 1;
+            if excerpt.is_none() {
+                excerpt = Some((role.to_string(), excerpt_around(t, pos, q.len())));
+            }
+        }
+        if matches == 0 {
+            continue;
+        }
+        let (role, text) = excerpt.unwrap_or_default();
+        out.push((
+            mtime,
+            json!({
+                "sid": sid,
+                "mtime": mtime_to_ms(mtime),
+                "msgs": msgs,
+                "matches": matches,
+                "title": title,
+                "excerpt": text,
+                "role": role,
+            }),
+        ));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.truncate(60);
     out.into_iter().map(|(_, v)| v).collect()
 }
