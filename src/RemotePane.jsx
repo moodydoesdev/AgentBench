@@ -6,6 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { X, Stop } from "@phosphor-icons/react";
 import ChatView from "./chat/ChatView";
 import { TransportProvider } from "./lib/TransportContext";
+import { sendToPane } from "./lib/paneSend";
 
 /**
  * A pane that lives on a linked bench, rendered in this machine's grid.
@@ -36,17 +37,6 @@ function decodeBase64(b64) {
   } catch {
     return new Uint8Array();
   }
-}
-
-/** Same paste-then-submit dance the phone does for a remote pty composer. */
-function sendToPty(transport, id, text) {
-  transport
-    .invoke("write_pane", { id, data: `\x1b[200~${text}\x1b[201~` })
-    .catch(() => {});
-  const submit = () =>
-    transport.invoke("write_pane", { id, data: "\r" }).catch(() => {});
-  setTimeout(submit, 450);
-  setTimeout(submit, 1300);
 }
 
 /**
@@ -177,12 +167,14 @@ function RemoteChat({ machine, pane, status }) {
       allowImages
       placeholder={`Message Claude on ${machine.machine ?? machine.name}…`}
       pendingAsks={(machine.asks ?? []).filter((a) => a.id === pane.id)}
+      // The same held/acked/queued send path the phone uses — a rejection
+      // propagates into ChatView, which keeps the echo and offers a retry.
       onSend={(text) =>
-        headless
-          ? machine.transport
-              .invoke("write_pane", { id: pane.id, data: text })
-              .catch(() => {})
-          : sendToPty(machine.transport, pane.id, text)
+        sendToPane(
+          machine.transport,
+          { paneId: pane.id, kind: pane.kind },
+          text,
+        )
       }
       onStop={(resubmit) =>
         machine.transport
@@ -211,7 +203,7 @@ export default function RemotePane({ machine, pane, status, termTheme, defaultVi
       <section className={`pane pane-remote status-${status}`}>
         <header className="pane-head">
           <span className={`dot ${status}`} />
-          <span className="pane-title">{name}</span>
+          <span className="pane-title" title={name}>{name}</span>
           <span className="pane-machine" title={`Running on ${machine.machine ?? machine.name}`}>
             {machine.machine ?? machine.name}
           </span>

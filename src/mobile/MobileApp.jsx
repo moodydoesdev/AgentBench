@@ -23,6 +23,7 @@ import UsageView from "./UsageView";
 const PlanView = lazy(() => import("./PlanView"));
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
+import { sendToPane } from "../lib/paneSend";
 import { BUILTIN_HARNESSES } from "../settings";
 import { THEMES, getTheme } from "../themes";
 import { applyTheme, loadThemeId, saveThemeId } from "./theme";
@@ -1427,7 +1428,11 @@ function ChatScreen({ machine, pane, closing, onBack }) {
             <PlanView
               transport={machine.transport}
               cwd={pane.cwd}
-              onSend={(text) => sendToPane(machine.transport, pane, text)}
+              // the plan pane has no message list to park a failed send in;
+              // swallow like before rather than reject unhandled
+              onSend={(text) =>
+                sendToPane(machine.transport, pane, text).catch(() => {})
+              }
             />
           </Suspense>
         </div>
@@ -1439,25 +1444,6 @@ function ChatScreen({ machine, pane, closing, onBack }) {
       )}
     </div>
   );
-}
-
-/**
- * Composer text into a pane. A pty pane needs the same bracketed paste plus
- * delayed Enter the desktop uses — the TUI coalesces an Enter that arrives in
- * the same chunk as the paste into a newline instead of a submit.
- */
-function sendToPane(transport, pane, text) {
-  if (pane.kind === "chat") {
-    transport.invoke("write_pane", { id: pane.paneId, data: text }).catch(() => {});
-    return;
-  }
-  transport
-    .invoke("write_pane", { id: pane.paneId, data: `\x1b[200~${text}\x1b[201~` })
-    .catch(() => {});
-  const submit = () =>
-    transport.invoke("write_pane", { id: pane.paneId, data: "\r" }).catch(() => {});
-  setTimeout(submit, 450);
-  setTimeout(submit, 1300);
 }
 
 const ACTIVITY_LABEL = {

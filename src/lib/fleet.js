@@ -10,6 +10,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { wsTransport } from "./transport";
+import { trackReadiness } from "./paneSend";
 
 const STORE_KEY = "agentbench.gateways";
 
@@ -110,6 +111,9 @@ export function useFleet(gateways) {
         },
       });
       live.set(url, t);
+      // From connection start, not first send: pane-ready fires exactly once
+      // per pane, and a lazily-created tracker would have missed it.
+      trackReadiness(t);
 
       // Live status: fold events into the same shape the hello snapshot gave
       // us, so a screen never has to care whether a fact arrived in the

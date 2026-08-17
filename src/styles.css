@@ -1220,6 +1220,12 @@ body {
 .pane-title {
   font-weight: 600;
   white-space: nowrap;
+  /* AI session titles can be sentence-long; the title must yield
+     (ellipsized) rather than push the toggle/close buttons off the pane */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .pane-status {
@@ -1229,6 +1235,7 @@ body {
   border-radius: 4px;
   padding: 1px 6px;
   white-space: nowrap;
+  flex: none;
 }
 
 .pane-cwd {
@@ -2296,6 +2303,23 @@ body.bg-image .pane-term.wterm-host .wterm {
 
 /* optimistic echo, not yet confirmed by the transcript */
 .chat-user.pending { opacity: 0.6; }
+
+/* the send provably failed — keep the message visible and offer a resend
+   instead of letting it silently vanish */
+.chat-user.failed { border-color: rgba(var(--red), 0.5); }
+
+.chat-user-retry {
+  display: block;
+  margin-top: 6px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: rgb(var(--red));
+  font: 11px var(--font-ui);
+  cursor: pointer;
+  text-align: right;
+}
+.chat-user-retry:hover { text-decoration: underline; }
 
 /* slash command as a centered event row — not a user bubble, since the
    harness runs some (auto-compact) on its own */

@@ -7,7 +7,10 @@
 // toolActivity.ts (github.com/pingdotgg/t3code, MIT).
 
 // message: { key, role: "user"|"assistant", kind: "text"|"thinking"|"tool"|
-//            "error"|"draft", text?, tool?, sidechain?: bool }
+//            "error"|"draft", text?, tool?, sidechain?: bool,
+//            agentId?, agent?,       // sidechain only: owning Task id + label
+//            local?: bool,           // optimistic echo, unconfirmed ("sending")
+//            failed?: bool, wire? }  // send rejected; wire = text to resend
 // tool:    { id, name, input, result?, isError?, done }
 
 export function createChatStore() {
@@ -51,8 +54,44 @@ function confirmLocalUser(store, text) {
   if (i === -1) return false;
   const [msg] = store.pending.splice(i, 1);
   msg.local = false;
+  msg.failed = false; // a marked-failed send that landed after all
   msg.rev = ++store.rev;
   return true;
+}
+
+/** The send path reported this echo definitely did not arrive. It stays in
+ *  the thread (and in `pending`, so a late/retried record still confirms it)
+ *  but stops spinning and grows a retry affordance. */
+export function markSendFailed(store, msg) {
+  if (!msg) return;
+  msg.local = false;
+  msg.failed = true;
+  msg.rev = ++store.rev;
+}
+
+/** User tapped retry on a failed echo: back to "sending". */
+export function retrySend(store, msg) {
+  msg.failed = false;
+  msg.local = true;
+  if (!store.pending.includes(msg)) store.pending.push(msg);
+  msg.rev = ++store.rev;
+}
+
+/** Session adoption resets the store; the optimistic echoes must survive it —
+ *  the very first message a user sends is what creates the session whose
+ *  adoption fires the reset, and it used to take the echo down with it.
+ *
+ *  The SAME objects move across (re-keyed into the new store's sequence, so
+ *  keys stay unique): an in-flight send holds a reference to its echo, and a
+ *  clone would leave its later failure mark on an orphan while the visible
+ *  copy spins forever. */
+export function carryPending(from, to) {
+  for (const p of from.pending) {
+    p.key = `m${to.nextKey++}`;
+    p.rev = ++to.rev;
+    to.messages.push(p);
+    to.pending.push(p);
+  }
 }
 
 /** Stop showing the "sending" spinner on every pending echo without dropping
@@ -175,13 +214,17 @@ function commandChip(text) {
 // compact and friends, which the harness runs on its own) stay event rows.
 function pushCommandChip(store, chip, sidechain) {
   const first = chip.trim().split(/\s+/)[0];
-  const i = store.pending.findIndex(
-    (p) => p.text.trim() === chip.trim() || p.text.trim().split(/\s+/)[0] === first,
-  );
+  // sub-agent command records must not confirm the user's pending echo
+  const i = sidechain
+    ? -1
+    : store.pending.findIndex(
+        (p) => p.text.trim() === chip.trim() || p.text.trim().split(/\s+/)[0] === first,
+      );
   if (i !== -1) {
     const [msg] = store.pending.splice(i, 1);
     msg.text = chip; // canonical "/name args", not the raw keystrokes
     msg.local = false;
+    msg.failed = false;
     msg.rev = ++store.rev;
     return;
   }
@@ -209,6 +252,8 @@ export function applyRecord(store, rec) {
       push(store, { role: "assistant", kind: "error", text: rec.text ?? "" });
       return true;
     case "result":
+      // a sub-agent finishing must not tear down the main agent's draft
+      if (rec.parent_tool_use_id) return false;
       // turn finished — drop any leftover draft (final assistant already landed)
       if (store.draft) {
         store.draft = null;
@@ -216,8 +261,12 @@ export function applyRecord(store, rec) {
       }
       return false;
     case "system":
-      // stream-json's init announces the session's model before any reply
-      if (rec.subtype === "init") return noteModel(store, rec.model);
+      // stream-json's init announces the session's model before any reply —
+      // but a sub-agent's init (parent_tool_use_id set) reports the
+      // sub-agent's model, and adopting it relabeled the whole pane
+      if (rec.subtype === "init" && !rec.parent_tool_use_id) {
+        return noteModel(store, rec.model);
+      }
       return false;
     default:
       // mode, file-history-snapshot, attachment, progress, summary…
@@ -237,15 +286,33 @@ function noteModel(store, model) {
   return true;
 }
 
+// Sub-agent identity of a record. Transcript JSONL marks sidechains with
+// isSidechain; `claude -p` stream-json instead stamps every sub-agent message
+// with parent_tool_use_id (the spawning Task call). Ignoring the latter made
+// stream panes render sub-agent turns as the main agent — indistinguishable
+// bubbles, and the composer's model chip relabeled itself with the
+// sub-agent's model — which is how "I'm suddenly talking to a sub-agent"
+// happened on the phone (headless panes are its default).
+function sidechainOf(store, rec) {
+  const agentId = rec.parent_tool_use_id ?? null;
+  if (!agentId && !rec.isSidechain) return { sidechain: false };
+  return {
+    sidechain: true,
+    agentId: agentId ?? undefined,
+    // the Task activity entry already carries a human label ("Explore …")
+    agent: agentId ? store.activity.get(agentId)?.label : undefined,
+  };
+}
+
 function applyAssistant(store, rec) {
   const blocks = rec.message?.content;
   if (!Array.isArray(blocks)) return false;
-  const sidechain = !!rec.isSidechain;
+  const { sidechain, agentId, agent } = sidechainOf(store, rec);
   // assistant output proves the prompt was consumed — stop any send spinner
   let changed = confirmPending(store);
   if (!sidechain) changed = noteModel(store, rec.message?.model) || changed;
   // a complete assistant message supersedes the streaming draft
-  if (store.draft) {
+  if (!sidechain && store.draft) {
     store.messages = store.messages.filter((m) => m !== store.draft);
     store.draft = null;
     changed = true;
@@ -253,7 +320,14 @@ function applyAssistant(store, rec) {
   for (const b of blocks) {
     if (b.type === "text") {
       if (b.text?.trim()) {
-        push(store, { role: "assistant", kind: "text", text: b.text, sidechain });
+        push(store, {
+          role: "assistant",
+          kind: "text",
+          text: b.text,
+          sidechain,
+          agentId,
+          agent,
+        });
         changed = true;
       }
     } else if (b.type === "thinking" || b.type === "redacted_thinking") {
@@ -262,6 +336,8 @@ function applyAssistant(store, rec) {
         kind: "thinking",
         text: b.thinking ?? "",
         sidechain,
+        agentId,
+        agent,
       });
       changed = true;
     } else if (b.type === "tool_use") {
@@ -272,7 +348,14 @@ function applyAssistant(store, rec) {
       if (!(b.name === "AskUserQuestion" && adoptSyntheticAsk(store, b))) {
         const tool = { id: b.id, name: b.name, input: b.input, done: false };
         store.tools.set(b.id, tool);
-        const msg = push(store, { role: "assistant", kind: "tool", tool, sidechain });
+        const msg = push(store, {
+          role: "assistant",
+          kind: "tool",
+          tool,
+          sidechain,
+          agentId,
+          agent,
+        });
         store.toolMsg.set(b.id, msg);
         if (!sidechain) trackToolStart(store, tool, msg);
       }
@@ -366,7 +449,7 @@ function completeNotifiedTasks(store, text) {
 function applyUser(store, rec) {
   if (rec.isMeta) return false;
   const content = rec.message?.content;
-  const sidechain = !!rec.isSidechain;
+  const { sidechain, agentId, agent } = sidechainOf(store, rec);
 
   // A user record with top-level image block(s) is a pasted/attached-image
   // turn — tool-result images are nested inside a tool_result block, not
@@ -385,15 +468,17 @@ function applyUser(store, rec) {
         .map((b) => b.text)
         .join("\n"),
     );
-    const i = store.pending.findIndex((p) => p.images?.length);
+    // a sub-agent's records must never confirm (and eat) a pending echo
+    const i = sidechain ? -1 : store.pending.findIndex((p) => p.images?.length);
     if (i !== -1) {
       const [msg] = store.pending.splice(i, 1);
       if (images.length) msg.images = images;
       if (text) msg.text = text;
       msg.local = false;
+      msg.failed = false; // a marked-failed send that landed after all
       msg.rev = ++store.rev;
     } else {
-      push(store, { role: "user", kind: "text", text, images, sidechain });
+      push(store, { role: "user", kind: "text", text, images, sidechain, agentId, agent });
     }
     return true;
   }
@@ -417,14 +502,16 @@ function applyUser(store, rec) {
         const chip = commandChip(b.text);
         if (notice) {
           completeNotifiedTasks(store, b.text);
-          push(store, { role: "system", kind: "notice", notice, sidechain });
+          push(store, { role: "system", kind: "notice", notice, sidechain, agentId, agent });
           changed = true;
         } else if (chip) {
           pushCommandChip(store, chip, sidechain);
           changed = true;
         } else if (!isNoiseUserText(b.text)) {
-          if (!confirmLocalUser(store, b.text)) {
-            push(store, { role: "user", kind: "text", text: b.text, sidechain });
+          // a sub-agent's "user" text is its spawn prompt, not something the
+          // person typed — it must never confirm (and eat) a pending echo
+          if (sidechain || !confirmLocalUser(store, b.text)) {
+            push(store, { role: "user", kind: "text", text: b.text, sidechain, agentId, agent });
           }
           changed = true;
         }
@@ -435,14 +522,14 @@ function applyUser(store, rec) {
     const chip = commandChip(content);
     if (notice) {
       completeNotifiedTasks(store, content);
-      push(store, { role: "system", kind: "notice", notice, sidechain });
+      push(store, { role: "system", kind: "notice", notice, sidechain, agentId, agent });
       changed = true;
     } else if (chip) {
       pushCommandChip(store, chip, sidechain);
       changed = true;
     } else if (!isNoiseUserText(content)) {
-      if (!confirmLocalUser(store, content)) {
-        push(store, { role: "user", kind: "text", text: content, sidechain });
+      if (sidechain || !confirmLocalUser(store, content)) {
+        push(store, { role: "user", kind: "text", text: content, sidechain, agentId, agent });
       }
       changed = true;
     }
@@ -453,6 +540,10 @@ function applyUser(store, rec) {
 function applyStreamEvent(store, rec) {
   const ev = rec.event;
   if (!ev) return false;
+  // Sub-agent token deltas must not stream into the main agent's draft —
+  // that was the most literal form of "suddenly talking to a sub-agent".
+  // Their complete records render (folded) when they land.
+  if (rec.parent_tool_use_id) return false;
   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
     if (!store.draft) {
       confirmPending(store); // a reply started — the send definitely landed

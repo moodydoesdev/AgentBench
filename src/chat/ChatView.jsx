@@ -23,9 +23,13 @@ import {
   addLocalUser,
   addNotice,
   confirmPending,
+  carryPending,
+  markSendFailed,
+  retrySend,
 } from "./records";
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
+import { isAmbiguousSendError } from "../lib/paneSend";
 
 // Older sessions can be thousands of messages; mount only the recent tail
 // and let "Show earlier" page backwards. content-visibility handles paint,
@@ -116,7 +120,7 @@ function pickerIdFor(full) {
 // Rows re-render only when their message's rev changes — messages mutate in
 // place (tool results, draft tokens), so identity alone isn't enough.
 const Row = memo(
-  function Row({ msg }) {
+  function Row({ msg, onRetry }) {
     if (msg.kind === "tool") return <ToolCard tool={msg.tool} rev={msg.rev} />;
     if (msg.kind === "thinking") return <ThinkingRow msg={msg} />;
     if (msg.kind === "error") return <pre className="chat-error">{msg.text}</pre>;
@@ -147,7 +151,7 @@ const Row = memo(
       );
     if (msg.role === "user")
       return (
-        <div className={`chat-user${msg.local ? " pending" : ""}`}>
+        <div className={`chat-user${msg.local ? " pending" : ""}${msg.failed ? " failed" : ""}`}>
           {msg.images?.length > 0 && (
             <div className="chat-user-images">
               {msg.images.map((im, i) => (
@@ -157,6 +161,14 @@ const Row = memo(
           )}
           {msg.text}
           {msg.local && <span className="chat-user-spin" aria-label="sending" />}
+          {msg.failed && (
+            // "may not have sent": the reply was lost, not necessarily the
+            // message — a resend could double-deliver, so don't overclaim
+            <button className="chat-user-retry" onClick={() => onRetry?.(msg)}>
+              {msg.ambiguous ? "may not have sent" : "didn't send"}
+              {msg.sendError ? ` — ${msg.sendError}` : ""} · tap to resend
+            </button>
+          )}
         </div>
       );
     if (msg.kind === "draft") {
@@ -207,11 +219,15 @@ function ThinkingRow({ msg }) {
 
 function SidechainGroup({ items }) {
   const [open, setOpen] = useState(false);
+  // stream-mode sidechains carry the spawning Task's label ("Explore …");
+  // name the fold so it's obvious whose work this was, not the main agent's
+  const label = items.find((m) => m.agent)?.agent;
   return (
     <div className="chat-sidechain">
       <button className="chat-sidechain-head" onClick={() => setOpen((o) => !o)}>
         <Robot size={11} />
-        worked in background · {items.length} step{items.length === 1 ? "" : "s"}
+        {label ? `${label} · ` : ""}worked in background · {items.length} step
+        {items.length === 1 ? "" : "s"}
       </button>
       {open && items.map((m) => <Row key={m.key} msg={m} rev={m.rev} />)}
     </div>
@@ -219,14 +235,31 @@ function SidechainGroup({ items }) {
 }
 
 // user/text stand alone; consecutive tool calls stack into one activity
-// block; sidechain runs fold behind a single row.
+// block; sidechain runs fold behind a single row — one per sub-agent, so
+// two parallel agents' interleaved steps don't blend into one pile.
 function groupMessages(messages) {
   const out = [];
   for (const m of messages) {
     const last = out[out.length - 1];
     if (m.sidechain) {
-      if (last?.type === "sidechain") last.items.push(m);
-      else out.push({ type: "sidechain", key: `g-${m.key}`, items: [m] });
+      // Merge into the most recent fold for this same agent, looking back
+      // through any trailing sidechain folds: parallel agents interleave
+      // freely, and strict adjacency would shred each into 1-step groups.
+      let fold = null;
+      for (let i = out.length - 1; i >= 0 && out[i].type === "sidechain"; i--) {
+        if (out[i].agentId === m.agentId) {
+          fold = out[i];
+          break;
+        }
+      }
+      if (fold) fold.items.push(m);
+      else
+        out.push({
+          type: "sidechain",
+          key: `g-${m.key}`,
+          agentId: m.agentId,
+          items: [m],
+        });
     } else if (m.kind === "tool") {
       if (last?.type === "tools") last.items.push(m);
       else out.push({ type: "tools", key: `t-${m.key}`, items: [m] });
@@ -531,7 +564,12 @@ export default memo(function ChatView({
         }),
         listen("transcript-reset", (e) => {
           if (e.payload.id !== id) return;
+          const prev = storeRef.current;
           storeRef.current = createChatStore();
+          // The reset that follows a brand-new session's adoption used to
+          // wipe the optimistic echo of the very message that created the
+          // session — the sent text vanished from the UI with no trace.
+          carryPending(prev, storeRef.current);
           bump();
         }),
         // PreToolUse(AskUserQuestion) fires the moment a question is posed —
@@ -607,6 +645,34 @@ export default memo(function ChatView({
     }
   }, [pendingAsks]);
 
+  // Deliver one wire message, keeping its echo honest. onSend may return a
+  // promise (the phone's queued/acked send path); a rejection means the
+  // message definitely did not arrive — flip the echo to a retry affordance
+  // instead of letting it spin (or worse, look sent). The desktop's onSend
+  // returns undefined, which resolves and changes nothing.
+  const sendWire = (wire, echo) => {
+    Promise.resolve()
+      .then(() => onSend(wire))
+      .catch((err) => {
+        if (echo) {
+          echo.sendError = String(err?.message ?? err);
+          echo.ambiguous = isAmbiguousSendError(err);
+          markSendFailed(storeRef.current, echo);
+        }
+        bump();
+      });
+  };
+  // Stable identity so the memoized Row (which only re-renders on msg/rev)
+  // never holds a stale closure.
+  const retryFnRef = useRef(null);
+  retryFnRef.current = (msg) => {
+    retrySend(storeRef.current, msg);
+    if (workingRef.current) queuedRef.current = true;
+    sendWire(msg.wire ?? msg.text, msg);
+    bump();
+  };
+  const handleRetry = useRef((msg) => retryFnRef.current?.(msg)).current;
+
   const clearSubmitGuard = () => {
     if (submitGuardRef.current) {
       clearTimeout(submitGuardRef.current);
@@ -654,9 +720,10 @@ export default memo(function ChatView({
       return;
     }
     // pending echo first so the transcript's command chip confirms it
-    addLocalUser(store, `/model ${m}`);
+    const echo = addLocalUser(store, `/model ${m}`);
+    echo.wire = `/model ${m}`;
     if (workingRef.current) queuedRef.current = true;
-    onSend(`/model ${m}`);
+    sendWire(echo.wire, echo);
     atBottomRef.current = true;
     bump();
   };
@@ -739,14 +806,16 @@ export default memo(function ChatView({
     const wire = paths.length
       ? [...paths, text].filter(Boolean).join(" ")
       : text;
+    let echo = null;
     if (!opensDialog) {
-      addLocalUser(store, text, imgs.map((im) => ({ url: im.url })));
+      echo = addLocalUser(store, text, imgs.map((im) => ({ url: im.url })));
+      echo.wire = wire; // what a retry must resend (paths included)
     }
     // Sending into a live turn means the TUI queues this message — remember
     // that, so a later stop knows to push it through rather than drop it.
     if (workingRef.current) queuedRef.current = true;
     setTurnActive(true); // don't wait on the hook to offer a stop button
-    onSend(wire);
+    sendWire(wire, echo);
     if (opensDialog && mode === "transcript") onNeedsTerm?.();
     // plain messages only — see armSubmitGuard on why commands are exempt
     if (mode === "transcript" && !tok && !workingRef.current) armSubmitGuard();
@@ -948,7 +1017,7 @@ export default memo(function ChatView({
                 ))}
               </div>
             ) : (
-              <Row key={g.key} msg={g.msg} rev={g.msg.rev} />
+              <Row key={g.key} msg={g.msg} rev={g.msg.rev} onRetry={handleRetry} />
             ),
           )}
           {working && last?.kind !== "draft" && (

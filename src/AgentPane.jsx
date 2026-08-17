@@ -838,7 +838,7 @@ export default memo(function AgentPane({
           }
           title={AGENT_COLORS[agentColor] ? `/color ${agentColor}` : undefined}
         />
-        <span className="pane-title">
+        <span className="pane-title" title={name}>
           {isRun && <Play size={10} weight="fill" className="pane-run-glyph" />}
           {name}
         </span>

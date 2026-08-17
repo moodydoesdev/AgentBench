@@ -53,6 +53,12 @@ pub struct Core {
     pub watched: Mutex<HashMap<u32, Watch>>,
     /// Headless Claude panes: stream-json over pipes, no pty.
     pub chat_panes: Mutex<HashMap<u32, ChatPane>>,
+    /// Pty panes whose harness is confirmed to be reading input. A pane id
+    /// exists the instant openpty+spawn succeed, long before Claude's TUI is
+    /// consuming keystrokes — anything written into that gap is eaten by the
+    /// launching shell or the TUI's terminal-mode setup. Clients that type
+    /// (the phone's composer) hold their sends until the pane appears here.
+    pub ready: Mutex<HashSet<u32>>,
     pub config_dir: PathBuf,
     pub home_dir: PathBuf,
 }
@@ -153,6 +159,7 @@ impl Core {
             subscribers: Mutex::new(Vec::new()),
             watched: Mutex::new(HashMap::new()),
             chat_panes: Mutex::new(HashMap::new()),
+            ready: Mutex::new(HashSet::new()),
             config_dir,
             home_dir: dirs::home_dir().expect("no home dir"),
         });
@@ -582,11 +589,35 @@ pub fn create_pane(
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
+    // Boot-grace backstop: every pty harness (Claude or not — codex, gemini,
+    // opencode all have the same TUI boot gap) becomes ready when the paste
+    // sniff below fires, and unconditionally after this grace period, so a
+    // harness whose enable sequence never surfaces (or that has none) can
+    // hold client sends once per pane, briefly — never forever.
+    {
+        let timer_core = core.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            if timer_core.panes.lock().unwrap().contains_key(&id) {
+                mark_pane_ready(&timer_core, id);
+            }
+        });
+    }
+
     // pty output -> subscribers (base64 so split UTF-8 survives the trip)
     let out_core = core.clone();
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let out_buffer = buffer.clone();
     std::thread::spawn(move || {
+        // Claude's TUI enables bracketed paste (ESC [ ? 2004 h) when its input
+        // box comes up — the earliest observable "typing now lands" moment,
+        // and the exact mode the composer's paste-sends depend on. The shells
+        // panes launch through run non-interactively (no readline/PSReadLine),
+        // so nothing else on this pty emits it first. Scan until seen, keeping
+        // a pattern-sized tail so a sequence split across reads still matches.
+        const READY_SEQ: &[u8] = b"\x1b[?2004h";
+        let mut ready_seen = false;
+        let mut ready_tail: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
@@ -598,6 +629,27 @@ pub fn create_pane(
                         if b.len() > SCROLLBACK_CAP {
                             let excess = b.len() - SCROLLBACK_CAP;
                             b.drain(..excess);
+                        }
+                    }
+                    if !ready_seen {
+                        // another signal (hook, grace timer) may have beaten
+                        // the sniff — stop scanning once anything marked it
+                        if out_core.ready.lock().unwrap().contains(&id) {
+                            ready_seen = true;
+                            ready_tail = Vec::new();
+                        } else {
+                            ready_tail.extend_from_slice(&buf[..n]);
+                            if ready_tail
+                                .windows(READY_SEQ.len())
+                                .any(|w| w == READY_SEQ)
+                            {
+                                ready_seen = true;
+                                ready_tail = Vec::new();
+                                mark_pane_ready(&out_core, id);
+                            } else if ready_tail.len() > READY_SEQ.len() - 1 {
+                                let cut = ready_tail.len() - (READY_SEQ.len() - 1);
+                                ready_tail.drain(..cut);
+                            }
                         }
                     }
                     let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -615,6 +667,7 @@ pub fn create_pane(
         exit_core.sessions.lock().unwrap().remove(&id);
         exit_core.colors.lock().unwrap().remove(&id);
         exit_core.watched.lock().unwrap().remove(&id);
+        exit_core.ready.lock().unwrap().remove(&id);
         persist_panes(&exit_core);
         exit_core.broadcast(&json!({ "ev": "pane-exit", "id": id, "code": code }));
     });
@@ -635,6 +688,16 @@ pub fn create_pane(
     Ok(id)
 }
 
+/// First proof that a pane's harness is actually consuming input — from the
+/// bracketed-paste sniff or any Claude hook event, whichever lands first.
+/// Broadcast once, so waiting clients can release their held sends.
+fn mark_pane_ready(core: &Core, id: u32) {
+    let inserted = core.ready.lock().unwrap().insert(id);
+    if inserted {
+        core.broadcast(&json!({ "ev": "pane-ready", "id": id }));
+    }
+}
+
 pub fn write_pane(core: &Core, id: u32, data: &str) -> Result<(), String> {
     // Focus in/out reports (sent when the user merely clicks into the pane)
     // are not real input; don't let them re-arm the needs_input badge.
@@ -647,6 +710,7 @@ pub fn write_pane(core: &Core, id: u32, data: &str) -> Result<(), String> {
             return pane
                 .writer
                 .write_all(data.as_bytes())
+                .and_then(|_| pane.writer.flush())
                 .map_err(|e| e.to_string());
         }
     }
@@ -696,6 +760,7 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
     let chat_panes = core.chat_panes.lock().unwrap();
     let colors = core.colors.lock().unwrap();
     let sessions = core.sessions.lock().unwrap();
+    let ready = core.ready.lock().unwrap();
     let mut out: Vec<_> = panes
         .iter()
         .map(|(id, p)| {
@@ -709,6 +774,9 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
                 // (the mobile app) use it to name a pane from its transcript
                 // instead of showing "claude 17".
                 "session": sessions.get(id).and_then(|h| h.first()),
+                // false while the harness is still booting — writes sent now
+                // would be eaten before Claude ever reads them
+                "ready": ready.contains(id),
                 "buffer": base64::engine::general_purpose::STANDARD.encode(&buf[..]),
             })
         })
@@ -719,6 +787,9 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
                 "cwd": p.cwd,
                 "harness": "claude-chat",
                 "kind": "chat",
+                // early input queues in `claude -p`'s stdin, so a chat pane
+                // can take a message from the moment it exists
+                "ready": true,
                 "lines": buf.iter().collect::<Vec<_>>(),
             })
         }))
@@ -1230,6 +1301,16 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
             let parts: Vec<&str> = url.trim_matches('/').split('/').collect();
             if parts.len() == 3 && parts[0] == "event" {
                 if let (Ok(id), kind) = (parts[1].parse::<u32>(), parts[2]) {
+                    // Belt-and-braces ready signal for panes whose
+                    // bracketed-paste enable never made it through the pty
+                    // (ConPTY has eaten stranger things). NOT SessionStart:
+                    // it fires during Claude's boot, potentially before the
+                    // input box exists — releasing held sends on it would
+                    // reopen the exact gap the ready gate closes. Every other
+                    // hook implies a turn is flowing, i.e. input works.
+                    if kind != "session" && core.panes.lock().unwrap().contains_key(&id) {
+                        mark_pane_ready(&core, id);
+                    }
                     // agent published (or updated) a visual plan: forward the
                     // file path to the frontend so it opens a plan pane
                     if kind == "plan" {
@@ -1356,12 +1437,26 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
             })
         }
         Some("write") => {
-            let _ = write_pane(
+            let res = write_pane(
                 core,
                 req["id"].as_u64().unwrap_or(0) as u32,
                 req["data"].as_str().unwrap_or_default(),
             );
-            None
+            // Fire-and-forget by default: the desktop's client correlates
+            // replies to requests by FIFO order and never enqueues a waiter
+            // for writes, so an unsolicited reply would answer the wrong
+            // request. `ack: true` (the gateway, on behalf of phones) opts in
+            // to hearing the real outcome — without it a write into a dead or
+            // never-created pane resolves as a success and the message just
+            // silently evaporates.
+            if req["ack"].as_bool() == Some(true) {
+                Some(match res {
+                    Ok(()) => json!({ "result": null }),
+                    Err(e) => json!({ "error": e }),
+                })
+            } else {
+                None
+            }
         }
         Some("resize") => {
             let _ = resize_pane(

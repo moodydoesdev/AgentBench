@@ -56,6 +56,12 @@ const ALLOWED_OPS: &[&str] = &[
 /// Broker ops that produce a response line. The rest are fire-and-forget —
 /// mirroring `handle_request`, which returns None for them. Waiting on a reply
 /// that is never coming would stall the whole request queue.
+///
+/// `write` is special-cased in `broker_op`: against a broker that declares the
+/// "write-ack" cap it is forwarded with `ack: true` and treated as a request —
+/// a phone's composer is the only view of the pane, so a failed write (pane
+/// gone, harness dead) must come back as an error the app can show, not
+/// dissolve into a fire-and-forget success.
 const REQUEST_OPS: &[&str] = &[
     "create",
     "create-chat",
@@ -110,6 +116,11 @@ pub struct BrokerLink {
     pending: Mutex<VecDeque<oneshot::Sender<Value>>>,
     events: broadcast::Sender<Value>,
     connected: AtomicBool,
+    /// Whether the connected broker answers `write` ops carrying `ack: true`
+    /// (its broker.json declares the "write-ack" cap). The daemon outlives
+    /// app updates, so an older broker is normal — asking it to ack would
+    /// leave the request waiting on a reply that never comes.
+    acks_writes: AtomicBool,
 }
 
 impl BrokerLink {
@@ -120,7 +131,12 @@ impl BrokerLink {
             pending: Mutex::new(VecDeque::new()),
             events,
             connected: AtomicBool::new(false),
+            acks_writes: AtomicBool::new(false),
         })
+    }
+
+    pub fn acks_writes(&self) -> bool {
+        self.acks_writes.load(Ordering::SeqCst)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
@@ -131,12 +147,17 @@ impl BrokerLink {
         self.connected.load(Ordering::SeqCst)
     }
 
-    /// Read the broker's advertised port. The broker writes this file on
-    /// startup; it is also how the desktop app finds it.
-    fn broker_port() -> Option<u16> {
+    /// Read the broker's advertisement (port + capability flags). The broker
+    /// writes this file on startup; it is also how the desktop app finds it.
+    fn broker_info() -> Option<(u16, bool)> {
         let text = std::fs::read_to_string(crate::broker::broker_file()).ok()?;
         let info: Value = serde_json::from_str(&text).ok()?;
-        info["port"].as_u64().map(|p| p as u16)
+        let port = info["port"].as_u64().map(|p| p as u16)?;
+        let write_ack = info["caps"]
+            .as_array()
+            .map(|caps| caps.iter().any(|c| c == "write-ack"))
+            .unwrap_or(false);
+        Some((port, write_ack))
     }
 
     /// Connect, then keep reconnecting forever. Each successful connect
@@ -174,9 +195,10 @@ impl BrokerLink {
     async fn connect_once(
         self: &Arc<Self>,
     ) -> Result<tokio::net::tcp::OwnedReadHalf, std::io::Error> {
-        let port = Self::broker_port().ok_or_else(|| {
+        let (port, write_ack) = Self::broker_info().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no broker.json — start AgentBench")
         })?;
+        self.acks_writes.store(write_ack, Ordering::SeqCst);
         let stream = TcpStream::connect(("127.0.0.1", port)).await?;
         stream.set_nodelay(true).ok();
         let (reader, writer) = stream.into_split();
@@ -622,6 +644,9 @@ impl Gateway {
                         "title": title,
                         // lets the phone ask for this session's stats
                         "session": p["session"],
+                        // false while the harness is still booting — the
+                        // composer holds sends until the pane-ready event
+                        "ready": p["ready"],
                     }));
                 }
                 Value::Array(out)
@@ -861,13 +886,20 @@ impl Gateway {
                 return Err("already being handled".into());
             }
         }
+        // Ask a capable broker to report the write's real outcome (an old
+        // broker would never answer, stalling the request FIFO for 15s; the
+        // desktop's own fire-and-forget writes are untouched either way).
+        let acked_write = op == "write" && self.broker.acks_writes();
         // strip gateway-only fields before the broker sees the request
         let mut fwd = req.clone();
         if let Some(obj) = fwd.as_object_mut() {
             obj.remove("answers");
             obj.remove("id_");
+            if acked_write {
+                obj.insert("ack".into(), json!(true));
+            }
         }
-        if REQUEST_OPS.contains(&op) {
+        if REQUEST_OPS.contains(&op) || acked_write {
             let result = self.broker.request(fwd).await?;
             if matches!(op, "create" | "create-chat") {
                 if let Some(id) = result.as_u64() {
