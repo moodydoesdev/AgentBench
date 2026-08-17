@@ -2,6 +2,8 @@
 //! Runs inside the standalone `agentbench-broker` process so agents survive
 //! app restarts; the Tauri backend is just a client.
 
+pub mod schedules;
+
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
@@ -53,6 +55,9 @@ pub struct Core {
     pub watched: Mutex<HashMap<u32, Watch>>,
     /// Headless Claude panes: stream-json over pipes, no pty.
     pub chat_panes: Mutex<HashMap<u32, ChatPane>>,
+    /// Scheduled prompts and their run history (see `schedules`).
+    pub schedules: Mutex<Vec<schedules::Schedule>>,
+    pub runs: Mutex<Vec<schedules::Run>>,
     /// Pty panes whose harness is confirmed to be reading input. A pane id
     /// exists the instant openpty+spawn succeed, long before Claude's TUI is
     /// consuming keystrokes — anything written into that gap is eaten by the
@@ -159,14 +164,36 @@ impl Core {
             subscribers: Mutex::new(Vec::new()),
             watched: Mutex::new(HashMap::new()),
             chat_panes: Mutex::new(HashMap::new()),
+            schedules: Mutex::new(Vec::new()),
+            runs: Mutex::new(Vec::new()),
             ready: Mutex::new(HashSet::new()),
             config_dir,
             home_dir: dirs::home_dir().expect("no home dir"),
         });
+        *core.schedules.lock().unwrap() = schedules::load_schedules(&core);
+        // A broker restart orphans any run that was mid-flight — its pane died
+        // with the old process, so a lingering "running" would block the
+        // schedule forever. And pane ids restart per broker run, so EVERY
+        // stored pane id is stale: left in place it would eventually point at
+        // whatever new pane inherits the number, and close_previous would
+        // kill an unrelated agent mid-turn.
+        *core.runs.lock().unwrap() = schedules::load_runs(&core)
+            .into_iter()
+            .map(|mut r| {
+                if r.status == "running" {
+                    r.status = "failed".into();
+                    r.error = Some("broker restarted mid-run".into());
+                    r.ended_at = Some(r.started_at);
+                }
+                r.pane_id = 0;
+                r
+            })
+            .collect();
         let port = start_hook_server(core.clone());
         core.hook_port.store(port as u32, Ordering::SeqCst);
         start_color_watcher(core.clone());
         start_transcript_watcher(core.clone());
+        schedules::start(core.clone());
         core
     }
 
@@ -1164,13 +1191,21 @@ pub fn create_chat_pane(
             }
             out_core.broadcast(&json!({ "ev": "stream-json", "id": id, "line": line }));
         }
-        // stdout closed — the process is going down; reap and clean up
+        // stdout closed — the process is going down; reap and clean up.
+        // sid rides along (captured before the sessions entry is dropped) so
+        // a scheduled run that dies without a result record stays reviewable.
         let code = out_child.lock().unwrap().wait().ok().and_then(|s| s.code()).map(|c| c as u32);
+        let sid = out_core
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|h| h.first().cloned());
         out_core.chat_panes.lock().unwrap().remove(&id);
         out_core.sessions.lock().unwrap().remove(&id);
         out_core.last_done.lock().unwrap().remove(&id);
         persist_panes(&out_core);
-        out_core.broadcast(&json!({ "ev": "pane-exit", "id": id, "code": code }));
+        out_core.broadcast(&json!({ "ev": "pane-exit", "id": id, "code": code, "sid": sid }));
     });
 
     // stderr: surface as synthetic records so failures show in the chat
@@ -1516,6 +1551,23 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
         Some("list") => Some(json!({ "result": list_panes(core) })),
         Some("saved") => Some(json!({ "result": saved_panes(core) })),
         Some("ping") => Some(json!({ "result": "pong" })),
+        Some("schedules") => Some(json!({ "result": schedules::state_json(core) })),
+        Some("schedule-save") => Some(match schedules::save_op(core, req) {
+            Ok(v) => json!({ "result": v }),
+            Err(e) => json!({ "error": e }),
+        }),
+        Some("schedule-delete") => {
+            Some(match schedules::delete_op(core, req["id"].as_str().unwrap_or_default()) {
+                Ok(()) => json!({ "result": null }),
+                Err(e) => json!({ "error": e }),
+            })
+        }
+        Some("schedule-run") => {
+            Some(match schedules::run_now_op(core, req["id"].as_str().unwrap_or_default()) {
+                Ok(v) => json!({ "result": v }),
+                Err(e) => json!({ "error": e }),
+            })
+        }
         Some("shutdown") => {
             // Kill all panes, remove the broker file, then exit.
             // Used before an in-place update so the old binary isn't locked.

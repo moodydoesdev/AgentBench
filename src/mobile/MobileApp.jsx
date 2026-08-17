@@ -2,11 +2,13 @@ import { Fragment, Suspense, lazy, useEffect, useMemo, useRef, useState } from "
 import {
   ArrowClockwise,
   Bell,
+  CalendarCheck,
   CaretLeft,
   Desktop,
   Gear,
   Globe,
   HandPalm,
+  Play,
   Plugs,
   Plus,
   SquaresFour,
@@ -24,6 +26,14 @@ const PlanView = lazy(() => import("./PlanView"));
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
 import { sendToPane } from "../lib/paneSend";
+import {
+  DAY_LABELS,
+  cadenceLabel,
+  fmtWhen,
+  fmtNext,
+  fmtDuration,
+  freshSchedule,
+} from "../lib/scheduleFormat";
 import { BUILTIN_HARNESSES } from "../settings";
 import { THEMES, getTheme } from "../themes";
 import { applyTheme, loadThemeId, saveThemeId } from "./theme";
@@ -1138,8 +1148,10 @@ function MachineSection({ machine, onOpen, onActions }) {
   const projects = groupPanes(machine);
   const [spawnIn, setSpawnIn] = useState(null);
   const [previewIn, setPreviewIn] = useState(null);
+  const [schedIn, setSchedIn] = useState(null);
   useBackLayer(spawnIn != null, () => setSpawnIn(null));
   useBackLayer(previewIn != null, () => setPreviewIn(null));
+  useBackLayer(schedIn != null, () => setSchedIn(null));
   const stale =
     machine.protocolVersion != null && machine.protocolVersion !== CLIENT_PROTOCOL;
   return (
@@ -1231,6 +1243,10 @@ function MachineSection({ machine, onOpen, onActions }) {
                 <Globe size={13} weight="bold" />
                 <span className="mob-agent-name">Preview</span>
               </button>
+              <button className="mob-agent mob-new" onClick={() => setSchedIn(proj)}>
+                <CalendarCheck size={13} weight="bold" />
+                <span className="mob-agent-name">Schedules</span>
+              </button>
             </div>
           </div>
         ))}
@@ -1252,7 +1268,306 @@ function MachineSection({ machine, onOpen, onActions }) {
           onClose={() => setPreviewIn(null)}
         />
       )}
+      {schedIn && (
+        <SchedulesSheet
+          project={schedIn}
+          machine={machine}
+          onClose={() => setSchedIn(null)}
+          onOpen={(pane) => {
+            setSchedIn(null);
+            onOpen(pane);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+/**
+ * Scheduled prompts for one project: list, pause/run-now, run history with
+ * review, and a minimal create form. The broker owns everything — this sheet
+ * renders its `schedules` op/broadcast and never caches.
+ */
+function SchedulesSheet({ project, machine, onClose, onOpen }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [form, setForm] = useState(null); // null = list view
+  const [expanded, setExpanded] = useState(null); // schedule id with runs shown
+
+  useEffect(() => {
+    let dead = false;
+    machine.transport
+      .invoke("schedules")
+      .then((d) => !dead && setData(d))
+      .catch((e) => !dead && setError(String(e?.message ?? e)));
+    const un = machine.transport.listen("schedules", ({ payload }) => setData(payload));
+    return () => {
+      dead = true;
+      un.then((f) => f());
+    };
+  }, []);
+
+  const schedules = (data?.schedules ?? []).filter((s) => s.cwd === project.cwd);
+  const runs = (data?.runs ?? []).slice().sort((a, b) => b.startedAt - a.startedAt);
+  const fail = (e) => {
+    const s = String(e?.message ?? e);
+    setError(
+      /unknown op/i.test(s)
+        ? "The workstation's broker predates schedules — restart it from desktop Settings (Workspace → Restart broker), then retry."
+        : s,
+    );
+  };
+
+  const save = (schedule) =>
+    machine.transport
+      .invoke("schedule_save", { schedule })
+      .then(() => setForm(null))
+      .catch(fail);
+
+  const openRun = async (run, schedule) => {
+    const base = {
+      url: machine.url,
+      cwd: schedule.cwd,
+      label: `${schedule.name} · run`,
+      kind: "chat",
+      chat: true,
+      machine: machine.machine ?? machine.name,
+    };
+    if ((machine.panes ?? []).some((p) => p.id === run.paneId)) {
+      onOpen({ ...base, paneId: run.paneId });
+      return;
+    }
+    if (!run.sessionId) return;
+    try {
+      // resuming a vanished transcript silently starts a FRESH session — the
+      // user would reply into a context-free chat labeled as the run
+      const sessions = await machine.transport
+        .invoke("list_sessions", { project: schedule.cwd })
+        .catch(() => null);
+      if (sessions && !sessions.some((s) => s.sid === run.sessionId)) {
+        setError("This run's transcript is no longer on disk, so it can't be reopened.");
+        return;
+      }
+      const id = await machine.transport.invoke("create_chat_pane", {
+        cwd: schedule.cwd,
+        resume: run.sessionId,
+      });
+      onOpen({ ...base, paneId: id });
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  return (
+    <div className="mob-sheet-backdrop" onClick={onClose}>
+      <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-head">
+          <strong>{form ? (form.id ? "Edit schedule" : "New schedule") : "Schedules"}</strong>
+          <small className="mob-mono">{project.cwd}</small>
+        </div>
+
+        {form ? (
+          <div className="mob-sched-form">
+            <input
+              className="mob-input"
+              placeholder="Name — e.g. Acme email triage"
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+            />
+            <textarea
+              className="mob-input mob-sched-prompt"
+              rows={5}
+              placeholder="The message each run sends. Say 'draft, don't send' for anything outward-facing."
+              value={form.prompt}
+              onChange={(e) => setForm({ ...form, prompt: e.target.value })}
+            />
+            <div className="mob-sched-row">
+              <select
+                className="mob-input"
+                value={form.cadence.kind}
+                onChange={(e) =>
+                  setForm({ ...form, cadence: { ...form.cadence, kind: e.target.value } })
+                }
+              >
+                <option value="daily">Daily</option>
+                <option value="weekdays">Weekdays</option>
+                <option value="weekly">Weekly</option>
+                <option value="interval">Every N hours</option>
+              </select>
+              {form.cadence.kind === "interval" ? (
+                <input
+                  className="mob-input mob-sched-time"
+                  type="number"
+                  min="1"
+                  value={Math.max(1, Math.round((form.cadence.everyMin ?? 60) / 60))}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      cadence: {
+                        ...form.cadence,
+                        everyMin: Math.max(1, Number(e.target.value) || 1) * 60,
+                      },
+                    })
+                  }
+                />
+              ) : (
+                <input
+                  className="mob-input mob-sched-time"
+                  type="time"
+                  value={form.cadence.time ?? "08:00"}
+                  onChange={(e) =>
+                    setForm({ ...form, cadence: { ...form.cadence, time: e.target.value } })
+                  }
+                />
+              )}
+            </div>
+            {form.cadence.kind === "weekly" && (
+              <div className="mob-sched-days">
+                {DAY_LABELS.map((label, i) => {
+                  const day = i + 1;
+                  const on = (form.cadence.days ?? []).includes(day);
+                  return (
+                    <button
+                      key={day}
+                      className={`mob-sched-day${on ? " on" : ""}`}
+                      onClick={() =>
+                        setForm({
+                          ...form,
+                          cadence: {
+                            ...form.cadence,
+                            days: on
+                              ? form.cadence.days.filter((d) => d !== day)
+                              : [...(form.cadence.days ?? []), day].sort(),
+                          },
+                        })
+                      }
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {error && <div className="mob-warn">{error}</div>}
+            <div className="mob-sched-row">
+              <button className="mob-sheet-cancel mob-sched-half" onClick={() => setForm(null)}>
+                Cancel
+              </button>
+              <button className="mob-primary mob-sched-half" onClick={() => save(form)}>
+                Save
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {data == null && !error && (
+              <div className="mob-note" style={{ margin: 10 }}>Loading…</div>
+            )}
+            {data != null && schedules.length === 0 && (
+              <div className="mob-note" style={{ margin: 10 }}>
+                No schedules for this project yet. A schedule runs a saved
+                prompt on a timer — each run is a normal chat you can open and
+                reply to.
+              </div>
+            )}
+            {schedules.map((s) => {
+              const mine = runs.filter((r) => r.scheduleId === s.id);
+              const last = mine[0];
+              const open = expanded === s.id;
+              return (
+                <div key={s.id} className="mob-sched">
+                  <button
+                    className="mob-sheet-item mob-sched-main"
+                    onClick={() => setExpanded(open ? null : s.id)}
+                  >
+                    <span className="mob-agent-name">
+                      <span className="mob-agent-title">{s.name}</span>
+                      <span className="mob-agent-id">
+                        {cadenceLabel(s)} ·{" "}
+                        {s.enabled ? `next ${fmtNext(s.nextAt)}` : "paused"}
+                        {last ? ` · last ${last.status}` : ""}
+                      </span>
+                    </span>
+                  </button>
+                  {open && (
+                    <div className="mob-sched-detail">
+                      <div className="mob-sched-row">
+                        <button
+                          className="mob-sched-act"
+                          onClick={() =>
+                            machine.transport.invoke("schedule_run", { id: s.id }).catch(fail)
+                          }
+                        >
+                          <Play size={12} weight="fill" /> Run now
+                        </button>
+                        <button
+                          className="mob-sched-act"
+                          onClick={() =>
+                            machine.transport
+                              .invoke("schedule_save", {
+                                schedule: { ...s, enabled: !s.enabled },
+                              })
+                              .catch(fail)
+                          }
+                        >
+                          {s.enabled ? "Pause" : "Resume"}
+                        </button>
+                        <button className="mob-sched-act" onClick={() => setForm({ ...s })}>
+                          Edit
+                        </button>
+                        <button
+                          className="mob-sched-act danger"
+                          onClick={() =>
+                            machine.transport.invoke("schedule_delete", { id: s.id }).catch(fail)
+                          }
+                        >
+                          Delete
+                        </button>
+                      </div>
+                      {mine.map((r) => (
+                        <button
+                          key={r.id}
+                          className="mob-sched-run"
+                          disabled={
+                            !(machine.panes ?? []).some((p) => p.id === r.paneId) &&
+                            !r.sessionId
+                          }
+                          onClick={() => openRun(r, s)}
+                        >
+                          <span className={`mob-sched-status ${r.status}`}>{r.status}</span>
+                          <span className="mob-sched-when">
+                            {fmtWhen(r.startedAt)} · {fmtDuration(r)}
+                            {r.error ? ` · ${r.error}` : ""}
+                          </span>
+                        </button>
+                      ))}
+                      {mine.length === 0 && (
+                        <div className="mob-note" style={{ margin: "4px 10px" }}>No runs yet.</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {error && <div className="mob-warn">{error}</div>}
+            <button
+              className="mob-sheet-item"
+              onClick={() => {
+                setError(null);
+                setForm(freshSchedule(project.cwd));
+              }}
+            >
+              <span>
+                <Plus size={13} weight="bold" /> New schedule
+              </span>
+            </button>
+            <button className="mob-sheet-cancel" onClick={onClose}>
+              Close
+            </button>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 

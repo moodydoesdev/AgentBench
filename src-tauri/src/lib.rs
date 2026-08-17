@@ -243,6 +243,28 @@ fn saved_panes(client: State<'_, Arc<BrokerClient>>) -> Result<Value, String> {
     client.request(json!({ "op": "saved" }))
 }
 
+/// Scheduled prompts live in the broker (they must fire with the app closed);
+/// these four commands are thin passthroughs to its ops.
+#[tauri::command]
+fn schedules(client: State<'_, Arc<BrokerClient>>) -> Result<Value, String> {
+    client.request(json!({ "op": "schedules" }))
+}
+
+#[tauri::command]
+fn schedule_save(client: State<'_, Arc<BrokerClient>>, schedule: Value) -> Result<Value, String> {
+    client.request(json!({ "op": "schedule-save", "schedule": schedule }))
+}
+
+#[tauri::command]
+fn schedule_delete(client: State<'_, Arc<BrokerClient>>, id: String) -> Result<(), String> {
+    client.request(json!({ "op": "schedule-delete", "id": id })).map(|_| ())
+}
+
+#[tauri::command]
+fn schedule_run(client: State<'_, Arc<BrokerClient>>, id: String) -> Result<Value, String> {
+    client.request(json!({ "op": "schedule-run", "id": id }))
+}
+
 /// Ask the broker to kill all panes and exit. Called before an in-place
 /// update so the old binary isn't locked (Windows) and the new broker
 /// binary starts cleanly on relaunch.
@@ -994,6 +1016,10 @@ pub fn run() {
             kill_pane,
             list_panes,
             saved_panes,
+            schedules,
+            schedule_save,
+            schedule_delete,
+            schedule_run,
             read_plan,
             list_plans,
             save_projects,

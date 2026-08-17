@@ -33,6 +33,11 @@ const OP_FOR = {
   resize_pane: (a) => ({ op: "resize", id: a.id, cols: a.cols, rows: a.rows }),
   list_panes: () => ({ op: "list" }),
   saved_panes: () => ({ op: "saved" }),
+  // scheduled prompts (broker-owned; phone gets full CRUD + run-now)
+  schedules: () => ({ op: "schedules" }),
+  schedule_save: (a) => ({ op: "schedule-save", schedule: a.schedule }),
+  schedule_delete: (a) => ({ op: "schedule-delete", id: a.id }),
+  schedule_run: (a) => ({ op: "schedule-run", id: a.id }),
 };
 
 // Requests the gateway answers itself, without the broker's op vocabulary.

@@ -22,7 +22,7 @@ fn main() {
             // Feature flags for clients newer than this broker: the daemon
             // survives app updates, so the gateway checks what this broker
             // can actually do rather than assuming its own vintage.
-            "caps": ["write-ack", "pane-ready"],
+            "caps": ["write-ack", "pane-ready", "schedules"],
         }))
         .unwrap(),
     )

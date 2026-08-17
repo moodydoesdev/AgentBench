@@ -51,6 +51,10 @@ const ALLOWED_OPS: &[&str] = &[
     "create-chat",
     "kill",
     "set-model",
+    "schedules",
+    "schedule-save",
+    "schedule-delete",
+    "schedule-run",
 ];
 
 /// Broker ops that produce a response line. The rest are fire-and-forget —
@@ -72,6 +76,10 @@ const REQUEST_OPS: &[&str] = &[
     "ping",
     "shutdown",
     "set-model",
+    "schedules",
+    "schedule-save",
+    "schedule-delete",
+    "schedule-run",
 ];
 
 /// Reads the phone can make that bypass the broker's op vocabulary: plain
@@ -420,6 +428,15 @@ impl Gateway {
                 match rx.recv().await {
                     Ok(ev) => {
                         tracker.snapshot.apply(&ev);
+                        // A scheduled run spawns its pane broker-side — no
+                        // gateway create op fires, so push a fresh pane list
+                        // ourselves or phones stay blind to it until reconnect.
+                        // Spawned: broadcast_panes round-trips the broker, and
+                        // stalling this loop would delay every other event.
+                        if ev["ev"] == "schedule-run" {
+                            let gw = tracker.clone();
+                            tokio::spawn(async move { gw.broadcast_panes().await });
+                        }
                         tracker.maybe_push(&ev).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,

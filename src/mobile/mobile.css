@@ -1265,3 +1265,99 @@ body {
   display: block;
   font-size: 11px;
 }
+
+/* ---- schedules sheet ---- */
+
+.mob-sched-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.mob-sched-prompt {
+  resize: vertical;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.mob-sched-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.mob-sched-row .mob-input { flex: 1; }
+.mob-sched-time { max-width: 120px; }
+.mob-sched-half { flex: 1; }
+
+.mob-sched-days {
+  display: flex;
+  gap: 4px;
+}
+.mob-sched-day {
+  flex: 1;
+  font: 600 11px var(--font-ui, inherit);
+  padding: 7px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+}
+.mob-sched-day.on {
+  color: var(--text);
+  background: var(--panel);
+  border-color: var(--text-dim);
+}
+
+.mob-sched-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 12px 8px;
+}
+
+.mob-sched-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+}
+.mob-sched-act.danger { color: rgb(var(--red)); }
+
+.mob-sched-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 4px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+}
+.mob-sched-run:disabled { opacity: 0.55; }
+
+.mob-sched-status {
+  flex: none;
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.mob-sched-status.done { color: rgb(var(--green)); border-color: rgba(var(--green), 0.4); }
+.mob-sched-status.failed { color: rgb(var(--red)); border-color: rgba(var(--red), 0.4); }
+.mob-sched-status.running { color: rgb(var(--amber)); border-color: rgba(var(--amber), 0.4); }
+
+.mob-sched-when {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

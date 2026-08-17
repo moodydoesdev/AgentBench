@@ -37,7 +37,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
-import { Bell, CaretDown, GearSix, Play, Plus, FileText, Tray, X } from "@phosphor-icons/react";
+import { Bell, CalendarCheck, CaretDown, GearSix, Play, Plus, FileText, Tray, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
 import {
   DropdownMenu,
@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import RunCommandsDialog from "./RunCommandsDialog";
 import SessionsDialog from "./SessionsDialog";
+import SchedulesDialog from "./SchedulesDialog";
 import notifyWav from "./assets/notify.wav";
 import Logo, { LogoMark } from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
@@ -132,6 +133,7 @@ export default function App() {
   const [inbox, setInbox] = useState(() => loadJSON("agentbench.inbox", []));
   const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
   const [sessionsOpen, setSessionsOpen] = useState(false); // resume-session picker
+  const [schedulesOpen, setSchedulesOpen] = useState(false); // scheduled prompts
   const renameInputRef = useRef(null);
 
   // Linked benches: other AgentBench installs this machine holds tokens for.
@@ -638,6 +640,22 @@ export default function App() {
       );
     });
 
+    // A scheduled run's pane is spawned broker-side — no create call went
+    // through this app, so adopt it into the grid (and its project into the
+    // sidebar) the moment the broker announces it.
+    const unSchedRun = listen("schedule-run", (e) => {
+      const { paneId, cwd, name } = e.payload;
+      setPanes((ps) =>
+        ps.some((p) => p.id === paneId)
+          ? ps
+          : [...ps, { id: paneId, projectPath: cwd, label: `${name} · run`, kind: "chat" }],
+      );
+      setStatuses((s) => ({ ...s, [paneId]: "working" }));
+      setProjects((ps) =>
+        ps.some((x) => x.path === cwd) ? ps : [...ps, { path: cwd, name: baseName(cwd) }],
+      );
+    });
+
     const unColor = listen("pane-color", (e) => {
       const { id, color } = e.payload;
       setPaneColors((c) => (c[id] === color ? c : { ...c, [id]: color }));
@@ -659,6 +677,7 @@ export default function App() {
       unEvent.then((f) => f());
       unPlan.then((f) => f());
       unExit.then((f) => f());
+      unSchedRun.then((f) => f());
       unColor.then((f) => f());
       unSettings.then((f) => f());
       unBenches.then((f) => f());
@@ -1078,6 +1097,41 @@ export default function App() {
     handle?.scrollIntoView?.();
   };
 
+  // Open a scheduled run: focus its pane while it still exists, otherwise
+  // resume the recorded session into a fresh headless pane — either way the
+  // run lands in the grid as a normal chat you can read and reply to.
+  const openScheduleRun = async (run, schedule) => {
+    setSchedulesOpen(false);
+    const live = panesRef.current.find((p) => p.id === run.paneId);
+    if (live) {
+      setRemoteSel(null);
+      if (live.projectPath !== activePathRef.current) {
+        setActivePath(live.projectPath);
+        setTimeout(() => focusAgent(live), 50);
+      } else {
+        focusAgent(live);
+      }
+      return;
+    }
+    const cwd = schedule?.cwd;
+    if (!run.sessionId || !cwd) return;
+    try {
+      const id = await invoke("create_chat_pane", {
+        cwd,
+        resume: run.sessionId,
+        shell: settingsRef.current.shell?.trim() || null,
+      });
+      const pane = { id, projectPath: cwd, label: `${schedule.name} · run`, kind: "chat" };
+      setPanes((p) => [...p, pane]);
+      setStatuses((s) => ({ ...s, [id]: "working" }));
+      setRemoteSel(null);
+      if (cwd !== activePathRef.current) setActivePath(cwd);
+      setTimeout(() => focusAgent(pane), 50);
+    } catch (err) {
+      console.error("failed to open scheduled run", err);
+    }
+  };
+
   const openNotification = (n) => {
     const pane = panesRef.current.find((p) => p.id === n.paneId);
     if (!pane) return; // agent closed since
@@ -1328,6 +1382,12 @@ export default function App() {
         action: () => setSettings((s) => ({ ...s, theme: id })),
       });
     }
+    cmds.push({
+      id: "schedules",
+      label: "Schedules…",
+      hint: "recurring prompts with reviewable runs",
+      action: () => setSchedulesOpen(true),
+    });
     return cmds;
   }, [cmdMenuOpen, activeProject, activePath, projects, activePanes, titles, projectPlans, showPlans, settings.theme, settings.defaultHarness, settings.customHarnesses]);
 
@@ -1356,6 +1416,13 @@ export default function App() {
               <FileText size={15} />
             </button>
           )}
+          <button
+            className="btn-icon"
+            title="Schedules — recurring prompts"
+            onClick={() => setSchedulesOpen(true)}
+          >
+            <CalendarCheck size={15} />
+          </button>
           <Popover.Root
             open={notifOpen}
             onOpenChange={(o) => {
@@ -2055,6 +2122,15 @@ export default function App() {
             updateProject(runDialog, { commands });
             setRunDialog(null);
           }}
+        />
+      )}
+
+      {schedulesOpen && (
+        <SchedulesDialog
+          projects={projects}
+          livePaneIds={panes.map((p) => p.id)}
+          onClose={() => setSchedulesOpen(false)}
+          onOpenRun={openScheduleRun}
         />
       )}
 
