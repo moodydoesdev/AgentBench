@@ -64,6 +64,11 @@ miss, and makes everything in between effortless.
 - **Pings you anywhere** — a soft chime plus a native OS notification when the
   app is in the background, and a notification bell with recent agent activity.
   Walk away, come back only when needed.
+- **Remote hosts over SSH** — point AgentBench at `user@host` and it installs
+  itself on that Linux box the way VS Code's Remote-SSH does: daemons into
+  `~/.agentbench`, started on loopback, reached through an SSH tunnel it opens
+  itself. No sudo, no systemd, no open ports, and no pairing code to copy. The
+  VM's projects join your sidebar and its agents and terminals run there.
 - **Projects sidebar** — group agents by repository, give each project its own
   accent color, and flip between projects instantly; every pane keeps running
   in the background.
@@ -101,6 +106,28 @@ miss, and makes everything in between effortless.
   <br>
   <sub>Pick a harness per pane — mix agents freely in one grid.</sub>
 </p>
+
+## Remote hosts
+
+Run agents on a Linux VM and drive them from the app on your laptop.
+
+**Settings → Remote hosts → `user@host` → Connect.**
+
+That one button SSHes in, works out the architecture, downloads the daemons,
+starts them bound to loopback, opens a tunnel, and pairs itself over the same
+SSH session. Nothing on the VM listens publicly, so there is no port to
+firewall, and no code for anyone to type.
+
+Missing agents are listed per host with an **Install** button each, so a bare
+VM gets `claude` (or any other harness) over SSH too.
+
+It needs Linux on x86_64 or aarch64, `curl` on the host, and key or agent SSH
+auth — AgentBench shells out to your own `ssh`, so `~/.ssh/config` aliases,
+`ProxyJump` and per-host keys all work, but a password prompt fails fast
+rather than hanging on a prompt you cannot see.
+
+Full details, and the manual install for a permanent multi-user setup, are in
+[docs/linux-vm.md](docs/linux-vm.md).
 
 ## Status at a glance
 
