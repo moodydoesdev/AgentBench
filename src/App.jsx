@@ -189,8 +189,59 @@ export default function App() {
   // Same storage and fleet hook as the phone shell — the sidebar below the
   // local projects is, in effect, the phone's fleet view grown up.
   const [benches, setBenches] = useState(loadGateways);
-  const { machines } = useFleet(benches);
+  // SSH remote hosts are owned by Rust, not localStorage: their address is a
+  // tunnel port that differs every launch, so the app asks for the live one
+  // rather than remembering a stale one. They join the same fleet as the
+  // manually paired benches, so everything downstream is unchanged.
+  const [sshBenches, setSshBenches] = useState([]);
+  const allBenches = useMemo(
+    () => [...benches, ...sshBenches],
+    [benches, sshBenches],
+  );
+  const { machines } = useFleet(allBenches);
   const [remoteSel, setRemoteSel] = useState(null); // { url, cwd } — selected remote project
+
+  // Ask Rust for the SSH hosts and their current tunnel addresses.
+  const refreshSshBenches = () =>
+    invoke("remote_list")
+      .then((list) =>
+        setSshBenches(
+          (Array.isArray(list) ? list : [])
+            .filter((h) => h.url && h.token)
+            .map((h) => ({
+              url: h.url,
+              token: h.token,
+              machine: h.machine,
+              name: h.machine || h.host,
+              kind: "ssh",
+            })),
+        ),
+      )
+      .catch(() => {});
+
+  // On launch, bring saved SSH hosts back up. Each one is a fresh tunnel and
+  // a fresh local port, so this has to happen before they can be in the
+  // fleet at all. Sequential on purpose: several ssh handshakes at once on a
+  // cold start is a lot of noise for no gain, and a host that is simply off
+  // should not hold up the others beyond its own timeout.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const saved = await invoke("remote_list").catch(() => []);
+      for (const h of Array.isArray(saved) ? saved : []) {
+        if (cancelled) return;
+        if (h.connected) continue;
+        // A host that is asleep or off just fails here; it stays saved and
+        // can be reconnected from Settings.
+        await invoke("remote_connect", { host: h.host }).catch(() => {});
+        if (!cancelled) await refreshSshBenches();
+      }
+      if (!cancelled) await refreshSshBenches();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // A bench unlinked in Settings while one of its projects is on screen must
   // not leave a dead selection behind.
@@ -796,6 +847,7 @@ export default function App() {
     // reload our copy so sockets open/close without an app restart.
     const unBenches = listen("benches-changed", () => {
       setBenches(loadGateways());
+      refreshSshBenches();
     });
 
     // Feed the background-tasks registry: full scheduler state now, then on

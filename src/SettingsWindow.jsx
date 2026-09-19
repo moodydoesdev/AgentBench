@@ -17,6 +17,7 @@ import {
 import { loadGateways, saveGateways } from "./lib/fleet";
 import { THEMES, themeVars } from "./themes";
 import {
+  BUILTIN_HARNESSES,
   PROBEABLE,
   SETTINGS_KEY,
   getHarnesses,
@@ -425,6 +426,197 @@ function MobileAccess() {
  * so its gateway pairs back (those reverse links arrive via `gateway_links`
  * and are merged in here).
  */
+
+/**
+ * Remote hosts over SSH — the VS Code Remote-SSH shape. Type user@host and the
+ * app installs the daemons there, starts them on loopback, tunnels in and
+ * pairs itself. No code to copy, no ports to open, no systemd unit to write.
+ *
+ * Rust owns the host list, because the usable address is a tunnel port that
+ * changes every launch; this only drives it and shows progress.
+ */
+function RemoteHosts() {
+  const [host, setHost] = useState("");
+  const [hosts, setHosts] = useState([]);
+  const [busy, setBusy] = useState(null); // host currently being worked on
+  const [steps, setSteps] = useState([]); // progress lines for `busy`
+  const [error, setError] = useState(null);
+  const [probes, setProbes] = useState({}); // host -> probe result
+  const [logs, setLogs] = useState(null); // { host, text }
+
+  const refresh = () =>
+    invoke("remote_list")
+      .then((list) => setHosts(Array.isArray(list) ? list : []))
+      .catch(() => {});
+
+  useEffect(() => {
+    refresh();
+    const un = listen("remote-progress", (e) => {
+      const { host: h, message } = e.payload || {};
+      setSteps((cur) => [...cur.slice(-6), `${h}: ${message}`]);
+    });
+    return () => un.then((f) => f());
+  }, []);
+
+  const connect = async (target, force = false) => {
+    const name = (target ?? host).trim();
+    if (!name) return;
+    setBusy(name);
+    setError(null);
+    setSteps([]);
+    try {
+      const bench = await invoke("remote_connect", { host: name, forceInstall: force });
+      // The sidebar reads the fleet; tell the main window a bench appeared.
+      emit("benches-changed").catch(() => {});
+      setHost("");
+      await refresh();
+      const p = await invoke("remote_probe", { host: name }).catch(() => null);
+      if (p) setProbes((cur) => ({ ...cur, [name]: p }));
+      setSteps((cur) => [...cur, `${bench.machine}: ready`]);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const installHarness = async (name, harness) => {
+    setBusy(name);
+    setError(null);
+    try {
+      await invoke("remote_install_harness", { host: name, command: harness.install });
+      const p = await invoke("remote_probe", { host: name }).catch(() => null);
+      if (p) setProbes((cur) => ({ ...cur, [name]: p }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const forget = async (name) => {
+    await invoke("remote_forget", { host: name, stopDaemons: true }).catch(() => {});
+    emit("benches-changed").catch(() => {});
+    refresh();
+  };
+
+  const showLogs = async (name) => {
+    const text = await invoke("remote_logs", { host: name }).catch((e) => String(e));
+    setLogs({ host: name, text });
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Remote hosts</h2>
+
+      <Card title="Connect to a Linux host over SSH">
+        <Row
+          title="Host"
+          sub="user@host, or any Host alias from ~/.ssh/config. AgentBench installs itself there, starts it on loopback and tunnels in — nothing is exposed and there is no code to copy."
+          stack
+        >
+          <div className="bench-link-form">
+            <input
+              className="harness-input cmd"
+              placeholder="user@10.0.0.5"
+              value={host}
+              spellCheck={false}
+              onChange={(e) => setHost(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && connect()}
+            />
+            <button
+              className="btn-sm"
+              disabled={!!busy || !host.trim()}
+              onClick={() => connect()}
+            >
+              {busy ? "Working…" : "Connect"}
+            </button>
+          </div>
+        </Row>
+        {steps.length > 0 && (
+          <Row title="Progress" stack>
+            <pre className="remote-steps">{steps.join("\n")}</pre>
+          </Row>
+        )}
+        {error && (
+          <Row title="Failed" stack>
+            <pre className="remote-error">{error}</pre>
+          </Row>
+        )}
+        <Row
+          title="Requirements"
+          sub="Key or agent SSH auth (no password prompts), Linux on x86_64 or aarch64, and curl on the host."
+        />
+      </Card>
+
+      {hosts.length > 0 && (
+        <Card title="Hosts">
+          {hosts.map((h) => {
+            const probe = probes[h.host];
+            const missing = probe
+              ? BUILTIN_HARNESSES.filter(
+                  (x) => x.install && !(probe.bins || []).includes(harnessBin(x)),
+                )
+              : [];
+            return (
+              <Row
+                key={h.host}
+                title={
+                  <span>
+                    <span className={`bench-dot${h.connected ? " on" : ""}`} />
+                    {h.machine || h.host}
+                  </span>
+                }
+                sub={h.connected ? h.host : `${h.host} — not connected`}
+                stack
+              >
+                <div className="bench-link-form">
+                  {!h.connected && (
+                    <button className="btn-sm" disabled={!!busy} onClick={() => connect(h.host)}>
+                      Reconnect
+                    </button>
+                  )}
+                  <button className="btn-sm" disabled={!!busy} onClick={() => connect(h.host, true)}>
+                    Reinstall
+                  </button>
+                  <button className="btn-sm" disabled={!!busy} onClick={() => showLogs(h.host)}>
+                    Logs
+                  </button>
+                  <button className="btn-sm danger" disabled={!!busy} onClick={() => forget(h.host)}>
+                    Forget
+                  </button>
+                </div>
+                {probe && missing.length > 0 && (
+                  <div className="remote-missing">
+                    <div className="settings-row-sub">
+                      Not installed on this host:{" "}
+                      {missing.map((m) => m.name).join(", ")}
+                    </div>
+                    <div className="bench-link-form">
+                      {missing.map((m) => (
+                        <button
+                          key={m.id}
+                          className="btn-sm"
+                          disabled={!!busy}
+                          title={m.install}
+                          onClick={() => installHarness(h.host, m)}
+                        >
+                          Install {m.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {logs?.host === h.host && <pre className="remote-steps">{logs.text}</pre>}
+              </Row>
+            );
+          })}
+        </Card>
+      )}
+    </section>
+  );
+}
+
 function LinkedBenches() {
   const [benches, setBenches] = useState(loadGateways);
   const [url, setUrl] = useState("");
@@ -642,6 +834,7 @@ const SECTIONS = [
   { id: "workspace", label: "Workspace", icon: SquaresFour },
   { id: "agents", label: "Agents", icon: Robot },
   { id: "mobile", label: "Mobile access", icon: DeviceMobile },
+  { id: "remote", label: "Remote hosts", icon: Laptop },
   { id: "benches", label: "Linked benches", icon: Laptop },
   { id: "notifications", label: "Notifications", icon: BellSimple },
   { id: "keyboard", label: "Keyboard", icon: Keyboard },
@@ -1206,6 +1399,8 @@ export default function SettingsWindow() {
         )}
 
         {section === "mobile" && <MobileAccess />}
+
+        {section === "remote" && <RemoteHosts />}
 
         {section === "benches" && <LinkedBenches />}
 
