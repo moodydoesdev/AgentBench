@@ -5,7 +5,7 @@
 //! and `agentbench-gateway` can build without Tauri — on Linux that is the
 //! difference between needing webkit2gtk on a headless VM and not.
 
-use crate::{broker, dictation, fsdata, gateway};
+use crate::{broker, dictation, fsdata, gateway, remote};
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -1021,6 +1021,287 @@ fn sync_plan_skill() -> Result<(), String> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------- remote hosts
+//
+// SSH remote hosts, VS Code Remote-SSH style. Rust owns these rather than the
+// frontend's localStorage bench list, because a host's usable address is
+// `127.0.0.1:<whatever port the tunnel got this run>` — it changes every
+// launch, so persisting it would only ever store a stale one. What survives a
+// restart is the host string and its device token; the address is rebuilt.
+
+/// Live tunnels, keyed by the host string the user typed.
+#[derive(Default)]
+pub struct RemoteState {
+    tunnels: Mutex<std::collections::HashMap<String, remote::Tunnel>>,
+}
+
+fn remote_hosts_file() -> std::path::PathBuf {
+    broker::config_dir().join("remote-hosts.json")
+}
+
+fn remote_hosts() -> Vec<Value> {
+    std::fs::read_to_string(remote_hosts_file())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_remote_hosts(hosts: &[Value]) {
+    let _ = std::fs::create_dir_all(broker::config_dir());
+    if let Ok(text) = serde_json::to_string_pretty(hosts) {
+        let _ = std::fs::write(remote_hosts_file(), text);
+    }
+}
+
+fn upsert_remote_host(entry: Value) {
+    let host = entry["host"].as_str().unwrap_or_default().to_string();
+    let mut hosts = remote_hosts();
+    hosts.retain(|h| h["host"].as_str() != Some(host.as_str()));
+    hosts.push(entry);
+    write_remote_hosts(&hosts);
+}
+
+/// Tell the UI where a slow connect has got to. The install step can run for
+/// minutes on a cold host, so silence would read as a hang.
+fn remote_step(app: &AppHandle, host: &str, step: &str, message: &str) {
+    let _ = app.emit(
+        "remote-progress",
+        json!({ "host": host, "step": step, "message": message }),
+    );
+}
+
+/// Probe a host without changing anything on it.
+#[tauri::command]
+async fn remote_probe(host: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || remote::probe(&host).map(|p| remote::describe(&p)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The whole flow: probe, install if needed, start, tunnel, pair. Returns a
+/// bench entry the frontend can drop straight into its fleet list.
+#[tauri::command]
+async fn remote_connect(
+    app: AppHandle,
+    state: State<'_, Arc<RemoteState>>,
+    host: String,
+    force_install: Option<bool>,
+) -> Result<Value, String> {
+    let state = state.inner().clone();
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let force = force_install.unwrap_or(false);
+
+    // Everything here is blocking ssh work; keep it off the async runtime.
+    let app2 = app.clone();
+    let host2 = host.clone();
+    let connected = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        remote_step(&app2, &host2, "probe", "Checking the host over SSH");
+        let probe = remote::probe(&host2)?;
+        if !probe.has_curl {
+            return Err(format!(
+                "{host2} has no curl, which is how the daemons are downloaded. \
+                 Install it there (sudo apt-get install -y curl) and try again."
+            ));
+        }
+
+        let needs = force || probe.installed.as_deref() != Some(version.as_str());
+        if needs {
+            remote_step(
+                &app2,
+                &host2,
+                "install",
+                &format!("Installing AgentBench {version} ({})", probe.arch),
+            );
+            let what = remote::install(&host2, &version, &probe.arch, force)?;
+            remote_step(&app2, &host2, "install", &what);
+        } else {
+            remote_step(&app2, &host2, "install", &format!("Already at {version}"));
+        }
+
+        remote_step(&app2, &host2, "start", "Starting the daemons");
+        let remote_port = remote::start(&host2, gateway::DEFAULT_PORT)?;
+
+        remote_step(&app2, &host2, "tunnel", "Opening the SSH tunnel");
+        let tunnel = remote::tunnel(&host2, remote_port)?;
+        let local_port = tunnel.local_port;
+        // Hold it: dropping the Tunnel closes the forward.
+        state
+            .tunnels
+            .lock()
+            .unwrap()
+            .insert(host2.clone(), tunnel);
+
+        remote_step(&app2, &host2, "pair", "Pairing");
+        let url = format!("http://127.0.0.1:{local_port}");
+        // A token from a previous connect is still good — pairing again would
+        // burn a code for nothing.
+        let known = remote_hosts()
+            .into_iter()
+            .find(|h| h["host"].as_str() == Some(host2.as_str()));
+        let token = match known.as_ref().and_then(|h| h["token"].as_str()) {
+            Some(t) if token_still_valid(&url, t) => t.to_string(),
+            _ => {
+                let code = remote::pair_code(&host2)?;
+                redeem_code(&url, &code)?
+            }
+        };
+        let machine = machine_of(&url, &token).unwrap_or_else(|| host2.clone());
+
+        upsert_remote_host(json!({
+            "host": host2,
+            "token": token,
+            "machine": machine,
+        }));
+
+        remote_step(&app2, &host2, "done", "Connected");
+        Ok(json!({
+            "host": host2,
+            "url": url,
+            "token": token,
+            "machine": machine,
+            "name": machine,
+            "kind": "ssh",
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    connected
+}
+
+/// Blocking one-shot HTTP against the tunnel. reqwest's blocking client cannot
+/// be built inside the async runtime, so these use ureq-style raw calls through
+/// the same std TcpStream approach the gateway CLI uses.
+fn tunnel_request(url: &str, method: &str, path: &str, token: Option<&str>, body: Option<&str>) -> Option<Value> {
+    use std::io::{Read, Write};
+    let port: u16 = url.rsplit(':').next()?.parse().ok()?;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok()?;
+    let body = body.unwrap_or("");
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         {auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    let (head, payload) = raw.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 2") {
+        return None;
+    }
+    serde_json::from_str(payload.trim()).ok()
+}
+
+fn redeem_code(url: &str, code: &str) -> Result<String, String> {
+    let body = json!({
+        "code": code,
+        "deviceName": format!("{} (bench)", gateway::machine_name()),
+        "kind": "bench",
+    })
+    .to_string();
+    let reply = tunnel_request(url, "POST", "/api/pair", None, Some(&body))
+        .ok_or("the host refused the pairing code")?;
+    reply["token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "no token in the pairing reply".to_string())
+}
+
+/// A token we already hold is only worth reusing if the host still honours it.
+fn token_still_valid(url: &str, token: &str) -> bool {
+    tunnel_request(url, "GET", "/api/push/key", Some(token), None).is_some()
+}
+
+fn machine_of(url: &str, _token: &str) -> Option<String> {
+    tunnel_request(url, "GET", "/api/health", None, None)?["machine"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Saved hosts plus, for the ones with a live tunnel, the address to use now.
+#[tauri::command]
+fn remote_list(state: State<'_, Arc<RemoteState>>) -> Vec<Value> {
+    let tunnels = state.tunnels.lock().unwrap();
+    remote_hosts()
+        .into_iter()
+        .map(|h| {
+            let host = h["host"].as_str().unwrap_or_default().to_string();
+            let url = tunnels
+                .get(&host)
+                .map(|t| format!("http://127.0.0.1:{}", t.local_port));
+            json!({
+                "host": host,
+                "machine": h["machine"],
+                "token": h["token"],
+                "url": url,
+                "connected": url.is_some(),
+                "kind": "ssh",
+            })
+        })
+        .collect()
+}
+
+/// Close the tunnel but keep the host (and its token) saved.
+#[tauri::command]
+fn remote_disconnect(state: State<'_, Arc<RemoteState>>, host: String) -> Result<(), String> {
+    state.tunnels.lock().unwrap().remove(&host);
+    Ok(())
+}
+
+/// Forget a host entirely. `stop_daemons` also shuts them down over there.
+#[tauri::command]
+async fn remote_forget(
+    state: State<'_, Arc<RemoteState>>,
+    host: String,
+    stop_daemons: Option<bool>,
+) -> Result<(), String> {
+    state.tunnels.lock().unwrap().remove(&host);
+    let mut hosts = remote_hosts();
+    hosts.retain(|h| h["host"].as_str() != Some(host.as_str()));
+    write_remote_hosts(&hosts);
+    if stop_daemons.unwrap_or(false) {
+        let h = host.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || remote::stop(&h)).await;
+    }
+    Ok(())
+}
+
+/// Install an agent harness on the remote, using the same install command the
+/// app would run locally (settings.js owns those strings, so there is one
+/// definition per harness rather than a second copy here).
+#[tauri::command]
+async fn remote_install_harness(
+    app: AppHandle,
+    host: String,
+    command: String,
+) -> Result<String, String> {
+    let h = host.clone();
+    remote_step(&app, &host, "harness", &format!("Running: {command}"));
+    let out = tauri::async_runtime::spawn_blocking(move || remote::install_harness(&h, &command))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(msg) = out.as_ref() {
+        remote_step(&app, &host, "harness", msg);
+    }
+    out
+}
+
+#[tauri::command]
+async fn remote_logs(host: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || remote::logs(&host, 60))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1067,6 +1348,7 @@ pub fn run() {
             let client = BrokerClient::connect(app.handle().clone())
                 .map_err(|e| format!("broker: {e}"))?;
             app.manage(client);
+            app.manage(Arc::new(RemoteState::default()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1117,6 +1399,13 @@ pub fn run() {
             check_binaries,
             install_harness,
             shutdown_broker,
+            remote_probe,
+            remote_connect,
+            remote_list,
+            remote_disconnect,
+            remote_forget,
+            remote_install_harness,
+            remote_logs,
             dictation::dictation_available,
             dictation::dictation_start,
             dictation::dictation_stop,

@@ -47,7 +47,18 @@ pub struct HostProbe {
     /// Whether a gateway is answering on the remote right now.
     pub running: bool,
     pub home: String,
+    /// Which agent/tooling binaries the host already has on a login-shell
+    /// PATH. A VM with the daemons but no `claude` runs nothing, so the UI
+    /// needs to know before it claims the host is ready.
+    pub bins: Vec<String>,
 }
+
+/// Binaries worth reporting: the harnesses the app can launch, plus what their
+/// installers need. Kept to bare names — this list is interpolated into a
+/// remote shell script.
+const PROBE_BINS: &[&str] = &[
+    "claude", "codex", "opencode", "gemini", "pi", "omp", "node", "npm", "git", "curl",
+];
 
 pub struct Tunnel {
     pub local_port: u16,
@@ -199,7 +210,12 @@ fn last_json(out: &str) -> Result<Value, String> {
 
 /// What is on the host already, and can we install there.
 pub fn probe(host: &str) -> Result<HostProbe, String> {
-    let script = r#"
+    // A login shell for the binary sweep: nvm, asdf, mise and a plain
+    // ~/.local/bin all live in the profile, and `claude` is usually in one of
+    // them. Probing with the non-login default would report it missing and
+    // send us off to reinstall something that is already there.
+    let script = format!(
+        r#"
 set -u
 root="$HOME/.agentbench"
 ver=""
@@ -209,10 +225,13 @@ if [ -x "$root/bin/agentbench-gateway" ]; then
   "$root/bin/agentbench-gateway" status >/dev/null 2>&1 && running=true
 fi
 curl_ok=false; command -v curl >/dev/null 2>&1 && curl_ok=true
-printf '{"arch":"%s","os":"%s","has_curl":%s,"installed":"%s","running":%s,"home":"%s"}\n' \
-  "$(uname -m)" "$(uname -s)" "$curl_ok" "$ver" "$running" "$HOME"
-"#;
-    let out = ssh_script(host, script, EXEC_TIMEOUT)?;
+found="$($SHELL -lc 'for b in {bins}; do command -v "$b" >/dev/null 2>&1 && printf "%s " "$b"; done' 2>/dev/null || true)"
+printf '{{"arch":"%s","os":"%s","has_curl":%s,"installed":"%s","running":%s,"home":"%s","bins":"%s"}}\n' \
+  "$(uname -m)" "$(uname -s)" "$curl_ok" "$ver" "$running" "$HOME" "$found"
+"#,
+        bins = PROBE_BINS.join(" ")
+    );
+    let out = ssh_script(host, &script, EXEC_TIMEOUT)?;
     let v = last_json(&out)?;
     let installed = v["installed"].as_str().unwrap_or("").trim().to_string();
     let os = v["os"].as_str().unwrap_or("").to_string();
@@ -237,7 +256,44 @@ printf '{"arch":"%s","os":"%s","has_curl":%s,"installed":"%s","running":%s,"home
         installed: (!installed.is_empty()).then_some(installed),
         running: v["running"].as_bool().unwrap_or(false),
         home: v["home"].as_str().unwrap_or("").to_string(),
+        bins: v["bins"]
+            .as_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
     })
+}
+
+/// Run a harness installer on the remote — `npm install -g
+/// @anthropic-ai/claude-code` and friends, the same strings the app already
+/// uses locally, so there is one definition of how each agent is installed.
+///
+/// Runs in a login shell so nvm/asdf/mise node is on PATH, and so a freshly
+/// installed binary lands somewhere the next login shell will find.
+pub fn install_harness(host: &str, command: &str) -> Result<String, String> {
+    // The command comes from the app's harness table, not from free text the
+    // user typed, but it still ends up in a remote shell: refuse anything
+    // carrying a newline so one entry cannot become two commands.
+    if command.contains('\n') || command.contains('\r') {
+        return Err("install command must be a single line".into());
+    }
+    let script = format!(
+        r#"
+set -eu
+"$SHELL" -lc {cmd}
+printf '{{"ok":true}}\n'
+"#,
+        cmd = shell_quote(command)
+    );
+    let out = ssh_script(host, &script, INSTALL_TIMEOUT)?;
+    last_json(&out).map(|_| format!("installed via: {command}"))
+}
+
+/// Single-quote for POSIX sh: wrap in quotes and turn each embedded quote
+/// into '\''. Nothing inside can then be interpreted by the remote shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Download and unpack the daemons into ~/.agentbench. Idempotent: the same
@@ -416,6 +472,8 @@ pub fn describe(probe: &HostProbe) -> Value {
         "installed": probe.installed,
         "running": probe.running,
         "home": probe.home,
+        "bins": probe.bins,
+        "hasClaude": probe.bins.iter().any(|b| b == "claude"),
     })
 }
 
@@ -458,6 +516,22 @@ mod tests {
     fn stdout_is_used_when_stderr_is_empty() {
         let msg = explain_ssh_failure("", "it broke");
         assert!(msg.contains("it broke"), "{msg}");
+    }
+
+    #[test]
+    fn shell_quote_neutralises_embedded_quotes() {
+        assert_eq!(shell_quote("npm i -g x"), "'npm i -g x'");
+        // The classic break-out: a quote, then a second command.
+        let hostile = shell_quote("x'; rm -rf ~; echo '");
+        assert_eq!(hostile, r"'x'\''; rm -rf ~; echo '\'''");
+        // Whatever it contains, it is one single-quoted word to the shell.
+        assert!(hostile.starts_with('\'') && hostile.ends_with('\''));
+    }
+
+    #[test]
+    fn install_harness_refuses_multiline_commands() {
+        let err = install_harness("nowhere", "npm i -g x\nrm -rf /").unwrap_err();
+        assert!(err.contains("single line"), "{err}");
     }
 
     /// Drives the real `ssh` binary, so it depends on the machine it runs on.
