@@ -15,6 +15,7 @@ import ResourcePanel from "./resources/ResourcePanel";
 import RemotePane from "./RemotePane";
 import RemotePreviewPopover from "./RemotePreviewPopover";
 import { groupPanes, loadGateways, saveGateways, useFleet } from "./lib/fleet";
+import { reconcileRemoteDock, remoteScope } from "./lib/remoteDock";
 
 // Lazy: keeps mdx/shiki out of the entry chunk until a plan is opened
 const PlanOverlay = lazy(() => import("./plan/PlanOverlay.jsx"));
@@ -166,7 +167,15 @@ export default function App() {
   const [dockExpanded, setDockExpanded] = useState(false);
   const [dockTabs, setDockTabs] = useState(() =>
     loadJSON("agentbench.dockTabs", {}),
-  ); // projectPath -> active dock pane id
+  ); // dock scope (projectPath, or "url::cwd" remote) -> active dock pane id
+  // Dock shells that live on linked benches: { [gatewayUrl]: [{ id,
+  // projectPath, label }] }. Kept apart from `panes` because those are the
+  // local broker's, and ids collide across brokers. Pane ids restart with the
+  // bench's broker, so this is reconciled against its live pane list on
+  // connect — the same contract the local dock's saved ids follow.
+  const [remoteDock, setRemoteDock] = useState(() =>
+    loadJSON("agentbench.remoteDock", {}),
+  );
   const [tasksOpen, setTasksOpen] = useState(
     () => localStorage.getItem("agentbench.showTasks") === "true",
   ); // background-tasks rail
@@ -190,6 +199,15 @@ export default function App() {
       setRemoteSel(null);
     }
   }, [machines, remoteSel]);
+
+  // Remote dock tabs outlive a reload, but the panes behind them do not
+  // outlive the bench's broker — ids restart from scratch there. Drop tabs
+  // whose pane is gone, and only for a bench we can currently see: a
+  // disconnected machine reports an empty pane list, which is stale, not
+  // empty, and would otherwise wipe every tab on a dropped connection.
+  useEffect(() => {
+    setRemoteDock((cur) => reconcileRemoteDock(cur, machines));
+  }, [machines]);
 
   const panesRef = useRef(panes);
   panesRef.current = panes;
@@ -321,10 +339,21 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("agentbench.showTasks", String(tasksOpen));
   }, [tasksOpen]);
+  useEffect(() => {
+    localStorage.setItem("agentbench.remoteDock", JSON.stringify(remoteDock));
+  }, [remoteDock]);
   const dockOpenRef = useRef(dockOpen);
   dockOpenRef.current = dockOpen;
   const dockTabsRef = useRef(dockTabs);
   dockTabsRef.current = dockTabs;
+  const remoteDockRef = useRef(remoteDock);
+  remoteDockRef.current = remoteDock;
+  // Read by the Ctrl+T handler, which is registered once and would otherwise
+  // close over the first render's values.
+  const remoteSelRef = useRef(remoteSel);
+  remoteSelRef.current = remoteSel;
+  const machinesRef = useRef(machines);
+  machinesRef.current = machines;
 
   const setPaneView = (id, view) =>
     setPaneViews((v) => (v[id] === view ? v : { ...v, [id]: view }));
@@ -1587,10 +1616,69 @@ export default function App() {
     if (pane) setTimeout(() => focusAgent(pane), 30);
   };
 
+  const spawnRemoteDockTerm = async (m, cwd) => {
+    if (!m?.transport || !cwd) return;
+    const harness = getHarness(settingsRef.current, "terminal");
+    try {
+      const id = await m.transport.invoke("create_pane", {
+        cwd,
+        cols: 100,
+        rows: 30,
+        resume: null,
+        theme: null,
+        harness: {
+          id: harness.id,
+          command: harness.command,
+          resume: harness.resume ?? null,
+          claude: !!harness.claude,
+          interactive: !!harness.interactive,
+        },
+      });
+      const n =
+        (remoteDockRef.current[m.url] ?? []).filter((p) => p.projectPath === cwd)
+          .length + 1;
+      setRemoteDock((d) => ({
+        ...d,
+        [m.url]: [
+          ...(d[m.url] ?? []),
+          { id, projectPath: cwd, label: `Terminal ${n}` },
+        ],
+      }));
+      setDockTabs((t) => ({ ...t, [remoteScope(m.url, cwd)]: id }));
+      setDockOpen(true);
+    } catch (err) {
+      console.error("remote dock terminal failed", err);
+    }
+  };
+
+  const closeRemoteDockTerm = (m, id) => {
+    m?.transport?.invoke("kill_pane", { id }).catch(() => {});
+    setRemoteDock((d) => ({
+      ...d,
+      [m.url]: (d[m.url] ?? []).filter((p) => p.id !== id),
+    }));
+  };
+
   // Ctrl+T / Ctrl+` / topbar button. Opening with no shells yet spawns the first one.
   const toggleDock = () => {
     if (dockOpenRef.current) {
       setDockOpen(false);
+      return;
+    }
+    // Looking at a linked bench: the dock on screen is that bench's, so the
+    // toggle has to act on it rather than on the local project's.
+    const sel = remoteSelRef.current;
+    if (sel) {
+      const m = machinesRef.current.find((x) => x.url === sel.url);
+      if (!m) return;
+      const tabs = (remoteDockRef.current[m.url] ?? []).filter(
+        (p) => p.projectPath === sel.cwd,
+      );
+      if (!tabs.length) {
+        spawnRemoteDockTerm(m, sel.cwd); // opens the dock itself
+        return;
+      }
+      setDockOpen(true);
       return;
     }
     const path = activePathRef.current;
@@ -2039,7 +2127,7 @@ export default function App() {
             <CalendarCheck size={15} />
           </button>
           <button className={`btn-icon${resourcesOpen ? " active" : ""}`} title="Agent resources" onClick={() => setResourcesOpen((open) => !open)}><Cpu size={15}/></button>
-          {activeProject && !remoteSel && (
+          {(activeProject || remoteSel) && (
             <button
               className={`btn-icon${dockOpen ? " active" : ""}`}
               title="Terminal dock (Ctrl+T)"
@@ -2663,6 +2751,9 @@ export default function App() {
               const group = groupPanes(m).find((g) => g.cwd === remoteSel.cwd);
               const projName = group?.name ?? baseName(remoteSel.cwd);
               const label = m.machine ?? m.name ?? baseName(m.url);
+              const remoteDockIds = new Set(
+                (remoteDock[m.url] ?? []).map((p) => p.id),
+              );
               return (
                 <div className="remote-view">
                   <div className="remote-bar">
@@ -2740,7 +2831,11 @@ export default function App() {
                     }}
                   >
                     {(() => {
-                      const rp = group?.panes ?? [];
+                      // Dock shells are ordinary panes on that broker, so the
+                      // grid has to skip the ones the dock is showing.
+                      const rp = (group?.panes ?? []).filter(
+                        (p) => !remoteDockIds.has(p.id),
+                      );
                       const rPacked = packSpans(rp, {}, effCols);
                       return rp.map((p) => (
                         <RemotePane
@@ -2755,7 +2850,8 @@ export default function App() {
                       ));
                     })()}
                   </main>
-                  {(group?.panes ?? []).length === 0 && (
+                  {(group?.panes ?? []).filter((p) => !remoteDockIds.has(p.id))
+                    .length === 0 && (
                     <div className="empty">
                       <div className="empty-inner">
                         <LogoMark className="empty-mark" aria-hidden="true" />
@@ -2806,6 +2902,55 @@ export default function App() {
             onActivity={onActivity}
             onTitle={onTitle}
           />
+
+          {/* One dock per linked bench, all kept mounted for the same reason
+              the local one is: a shell on a VM must not die because you
+              looked at another project. Each drives its bench's socket, so
+              the tab strip is the same component end to end. */}
+          {machines.map((m) => {
+            // No socket yet: bail rather than let the transport prop fall
+            // back to its local default, which would aim this bench's dock
+            // at the local broker — where the same pane ids mean other panes.
+            if (!m.transport) return null;
+            const cwd = remoteSel?.url === m.url ? remoteSel.cwd : null;
+            return (
+              <TerminalDock
+                key={`dock:${m.url}`}
+                panes={remoteDock[m.url] ?? []}
+                activePath={cwd}
+                scope={cwd ? remoteScope(m.url, cwd) : null}
+                transport={m.transport}
+                visible={!!cwd}
+                open={dockOpen}
+                height={dockHeight}
+                expanded={dockExpanded}
+                activeTabs={dockTabs}
+                focusedId={null}
+                titles={m.titles ?? {}}
+                statuses={m.statuses ?? {}}
+                termTheme={termTheme}
+                copyOnSelect={settings.copyOnSelect !== false}
+                scrollback={settings.terminalScrollback ?? 2000}
+                pageVisible={pageVisible}
+                // No cached scrollback for a remote pane — XtermInner pulls
+                // it from the bench over pane_buffer instead.
+                initialData={{}}
+                onSelectTab={(sc, id) =>
+                  setDockTabs((t) => (t[sc] === id ? t : { ...t, [sc]: id }))
+                }
+                onNewTerm={() => spawnRemoteDockTerm(m, cwd)}
+                onCloseTerm={(id) => closeRemoteDockTerm(m, id)}
+                // Remote panes are not in the local focus registry, and run
+                // panes have no remote restart path yet.
+                onRestart={() => {}}
+                onToggleExpand={() => setDockExpanded((x) => !x)}
+                onHeightChange={setDockHeight}
+                onRegister={() => {}}
+                onActivity={() => {}}
+                onTitle={() => {}}
+              />
+            );
+          })}
 
           {/* scoped to its project: switching projects hides the overlay,
               switching back restores it */}

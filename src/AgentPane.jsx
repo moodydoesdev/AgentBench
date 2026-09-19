@@ -22,11 +22,19 @@ import {
 } from "@phosphor-icons/react";
 import ChatView from "./chat/ChatView";
 import { formatBytes } from "./lib/resourceFormat";
+import { tauriTransport } from "./lib/transport";
 import { createOutputBatcher } from "./lib/terminalOutput";
 import { pasteAndSubmit } from "./lib/ptyPaste";
 import { isTerminalReport } from "./lib/terminalReports";
 import "@xterm/xterm/css/xterm.css";
 import "@wterm/dom/css";
+
+// XtermInner used to reach for Tauri's invoke/listen directly, which is why a
+// remote pane needed its own terminal component. It now takes a transport and
+// defaults to this one, so the same terminal drives a local pty or a linked
+// bench's over the gateway socket. Module-level so the default prop is stable
+// across renders — it sits in the terminal effect's dep list.
+const LOCAL_TRANSPORT = tauriTransport();
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -159,6 +167,7 @@ export function XtermInner({
   copyOnSelect = true,
   visible = true,
   scrollback = 2000,
+  transport = LOCAL_TRANSPORT,
 }) {
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
@@ -370,9 +379,32 @@ export function XtermInner({
 
     if (initialData) term.write(b64ToBytes(initialData));
 
+    // A local pane gets its scrollback handed to it as `initialData` from the
+    // app's own cache. A pane on a linked bench has no such cache here, so ask
+    // the bench that owns the pty. Live frames that arrive before that resolves
+    // are held rather than written: an escape sequence split across the seam
+    // corrupts the screen.
+    // Keyed on transport kind, not object identity: more than one module
+    // builds a local transport, and they must all count as local.
+    let held = initialData || transport.kind === "tauri" ? null : [];
+    if (held) {
+      const drain = () => {
+        const pending = held;
+        held = null;
+        if (pending) for (const chunk of pending) output.push(chunk);
+      };
+      transport
+        .invoke("pane_buffer", { id, limit: 512 * 1024 })
+        .then((res) => {
+          if (res?.buffer) term.write(b64ToBytes(res.buffer));
+        })
+        .catch(() => {})
+        .finally(drain);
+    }
+
     term.onData(sendData);
     term.onResize(({ cols, rows }) => {
-      invoke("resize_pane", { id, cols, rows }).catch(() => {});
+      transport.invoke("resize_pane", { id, cols, rows }).catch(() => {});
     });
     term.onTitleChange(onTitle);
 
@@ -405,13 +437,18 @@ export function XtermInner({
       if (wasHidden) {
         wasHidden = false;
         term.refresh(0, term.rows - 1);
-        invoke("resize_pane", {
-          id,
-          cols: term.cols,
-          rows: Math.max(1, term.rows - 1),
-        })
+        transport
+          .invoke("resize_pane", {
+            id,
+            cols: term.cols,
+            rows: Math.max(1, term.rows - 1),
+          })
           .then(() =>
-            invoke("resize_pane", { id, cols: term.cols, rows: term.rows }),
+            transport.invoke("resize_pane", {
+              id,
+              cols: term.cols,
+              rows: term.rows,
+            }),
           )
           .catch(() => {});
       }
@@ -426,16 +463,19 @@ export function XtermInner({
         } catch {
           /* ignore */
         }
-        invoke("resize_pane", { id, cols: term.cols, rows: term.rows }).catch(
-          () => {},
-        );
+        transport
+          .invoke("resize_pane", { id, cols: term.cols, rows: term.rows })
+          .catch(() => {});
         term.refresh(0, term.rows - 1);
       }, 150);
     });
     ro.observe(containerRef.current);
 
-    const unlisten = listen("pane-output", (e) => {
-      if (e.payload.id === id) output.push(b64ToBytes(e.payload.data));
+    const unlisten = transport.listen("pane-output", (e) => {
+      if (e.payload.id !== id) return;
+      const bytes = b64ToBytes(e.payload.data);
+      if (held) held.push(bytes);
+      else output.push(bytes);
     });
 
     register({ focus: () => term.focus(), write: (d) => term.write(d) });
@@ -454,7 +494,7 @@ export function XtermInner({
       termRef.current = null;
       term.dispose();
     };
-  }, [id]);
+  }, [id, transport]);
 
   return (
     <>

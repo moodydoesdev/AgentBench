@@ -1,8 +1,8 @@
 import { useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { ArrowsInSimple, ArrowsOutSimple, ArrowClockwise, Plus, X } from "@phosphor-icons/react";
 import { XtermInner } from "../AgentPane";
 import { isTerminalReport } from "../lib/terminalReports";
+import { tauriTransport } from "../lib/transport";
 
 // Bottom terminal dock, Claude-Code-Desktop style: a tab strip of plain
 // shells per project, outside the agent grid. Every dock pane stays mounted
@@ -10,13 +10,23 @@ import { isTerminalReport } from "../lib/terminalReports";
 // tab switches are instant — the same keep-mounted trick the project
 // switcher and the Term⇄Chat toggle already rely on; XtermInner's
 // hidden→visible resize recovery handles the reveal.
+//
+// One instance per bench: the local machine gets the default transport, and
+// each linked bench gets its own socket, so a dock tab on a VM is the same
+// component driving a pty on the other end.
 
 const MIN_H = 120;
+const LOCAL_TRANSPORT = tauriTransport();
 
 export default function TerminalDock({
-  panes, // all dock panes, every project
+  panes, // all dock panes for this bench, every project
   activePath,
-  visible, // active project view is local (not remote/empty)
+  // Key for the active-tab map. Local docks key by project path; a linked
+  // bench folds its url in, because two benches can have the same cwd and
+  // pane ids collide across brokers.
+  scope = activePath,
+  visible, // this bench's project view is the one on screen
+  transport = LOCAL_TRANSPORT,
   open,
   height,
   expanded,
@@ -42,8 +52,8 @@ export default function TerminalDock({
   const dockRef = useRef(null);
 
   const tabs = panes.filter((p) => p.projectPath === activePath);
-  const activeId = tabs.some((p) => p.id === activeTabs[activePath])
-    ? activeTabs[activePath]
+  const activeId = tabs.some((p) => p.id === activeTabs[scope])
+    ? activeTabs[scope]
     : tabs[0]?.id;
 
   const activePane = tabs.find((p) => p.id === activeId);
@@ -110,7 +120,7 @@ export default function TerminalDock({
                 onCloseTerm(p.id);
                 return;
               }
-              onSelectTab(activePath, p.id);
+              onSelectTab(scope, p.id);
             }}
           >
             <span className="dock-tab-label">
@@ -169,6 +179,7 @@ export default function TerminalDock({
           <XtermInner
             id={p.id}
             cwd={p.projectPath}
+            transport={transport}
             visible={pageVisible && shown && p.projectPath === activePath && p.id === activeId}
             scrollback={scrollback}
             termTheme={termTheme}
@@ -177,7 +188,7 @@ export default function TerminalDock({
             register={(h) => onRegister(p.id, h)}
             sendData={(d) => {
               if (!isTerminalReport(d)) onActivity(p.id);
-              invoke("write_pane", { id: p.id, data: d }).catch(() => {});
+              transport.invoke("write_pane", { id: p.id, data: d }).catch(() => {});
             }}
             onTitle={(t) => onTitle(p.id, t)}
           />
