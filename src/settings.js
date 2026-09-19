@@ -3,7 +3,7 @@ export const SETTINGS_KEY = "agentbench.settings";
 // Built-in agent harnesses. `command` is a shell command line run through the
 // user's login shell, so anything on their PATH works. Only Claude gets the
 // hook/session integration (`claude: true`): status glow, resume, plan panes.
-// Everything else is a plain terminal for now.
+// Codex also supports the transcript chat view; other agents use terminals.
 // `install` is run in the pane before first launch when the binary is
 // missing, so the user watches it happen in the terminal they spawned.
 export const BUILTIN_HARNESSES = [
@@ -89,17 +89,20 @@ export function getHarness(settings, id) {
 }
 
 export const DEFAULT_SETTINGS = {
-  cols: 3,
+  cols: 0, // grid columns; 0 = auto from workspace width
   sound: true,
   volume: 0.8,
   osNotify: true,
   engine: "xterm",
+  terminalScrollback: 2000,
   navMod: "off", // modifier for arrow-key pane navigation: off | ctrl | alt | meta
   wordMod: "ctrl", // modifier+←/→ sends ESC b / ESC f (word jump): off | ctrl | meta
   copyOnSelect: true, // highlighting text in a terminal copies it (xterm engine)
   defaultPaneView: "chat", // Claude panes open in "term" or "chat" view
   shell: "", // shell panes/installs run through ("" = auto: $SHELL, pwsh on Windows)
   theme: "midnight",
+  uiScale: 0, // webview zoom: 0 = auto (compact on MacBook-size screens), else fixed factor
+
   bgImage: "", // absolute path to a custom background image ("" = off)
   bgOverlay: 0.85, // opacity of UI surfaces over the background image (0–1)
   bgFrosted: true, // frosted-glass blur on surfaces when a bg image is set

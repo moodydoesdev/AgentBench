@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useState, useEffect, useRef } from "react";
 import { useTransport } from "../lib/TransportContext";
 import {
   ArrowsClockwise,
@@ -14,6 +14,8 @@ import {
   Wrench,
 } from "@phosphor-icons/react";
 import { toolSummary, toolDiff } from "./records";
+
+import { questionAnswerSteps, sendQuestionAnswer } from "../lib/questionAnswer";
 
 const RESULT_CLAMP = 4000;
 
@@ -32,22 +34,7 @@ const TOOL_ICONS = {
   TodoWrite: ListChecks,
 };
 
-// AskUserQuestion is a picker in the terminal TUI — the transcript only has
-// the questions (input) and, once answered, the answers (result). We render a
-// real form (radios for single-select, checkboxes for multi-select, plus an
-// "Other" free-text field) and answer by driving the picker with keystrokes:
-//   single-select  → ↓×index, Enter
-//   multi-select   → ↓ to each choice + Space to toggle, then Enter
-//   Other          → ↓ to the trailing "Other" row, Enter, type text, Enter
-// Questions are answered in order; the picker resets to the top row for each,
-// so per-question navigation is relative to row 0. This assumes an untouched
-// picker — if you already arrowed around in Term view the cursor has moved,
-// so the card says as much.
-const DOWN = "\x1b[B";
-const ENTER = "\r";
-const SPACE = " ";
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
+// Answers drive an untouched Claude terminal picker; completion comes from the transcript.
 function QuestionCard({ tool, paneId, canAnswer }) {
   const { invoke } = useTransport();
   const questions = Array.isArray(tool.input?.questions) ? tool.input.questions : [];
@@ -57,6 +44,14 @@ function QuestionCard({ tool, paneId, canAnswer }) {
   );
   const [sent, setSent] = useState(false);
   const [sendError, setSendError] = useState(null);
+  const sendingRef = useRef(false);
+  useEffect(() => {
+    if (!sent || tool.done) return;
+    const timer = setTimeout(() => {
+      setSendError((previous) => previous || "Claude has not confirmed this answer. Open Term view to check the picker before sending again.");
+    }, 15000);
+    return () => clearTimeout(timer);
+  }, [sent, tool.done]);
 
   const answerable =
     canAnswer &&
@@ -91,55 +86,23 @@ function QuestionCard({ tool, paneId, canAnswer }) {
     e.other.trim() !== "" || (q.multiSelect ? e.set.length > 0 : e.pick != null);
   const allAnswered = questions.every((q, i) => isAnswered(q, at(i)));
 
-  // key steps for one question — an array so "Other" can pace its mode switch
-  const stepsFor = (q, e) => {
-    const L = q.options.length;
-    if (e.other.trim()) {
-      return [DOWN.repeat(L) + ENTER, e.other.trim() + ENTER];
-    }
-    if (q.multiSelect) {
-      let keys = "";
-      let pos = 0;
-      for (const t of [...e.set].sort((a, b) => a - b)) {
-        keys += DOWN.repeat(t - pos) + SPACE;
-        pos = t;
-      }
-      return [keys + ENTER];
-    }
-    return [DOWN.repeat(e.pick ?? 0) + ENTER];
-  };
-
   const submit = async () => {
-    if (!answerable || !allAnswered) return;
+    if (!answerable || !allAnswered || sendingRef.current) return;
     if (paneId == null) {
-      setSendError("no terminal attached to this card — answer in Term view");
+      setSendError("No terminal attached to this card — answer in Term view");
       return;
     }
+    sendingRef.current = true;
     setSent(true);
     setSendError(null);
-    // paced so the TUI consumes each Enter (and any list→text mode switch)
-    // before the next burst arrives. Each write is awaited: a rejected
-    // write_pane used to be swallowed, so a dead pane or a restarted broker
-    // still flipped the card to "answer sent…" with nothing on the wire and
-    // no way to retry.
     try {
-      for (let i = 0; i < questions.length; i++) {
-        for (const keys of stepsFor(questions[i], at(i))) {
-          // `answers` marks this as the write that resolves a pending
-          // question. The gateway claims the question on the first one, so a
-          // second client answering the same picker is refused rather than
-          // interleaving keystrokes into it.
-          await invoke("write_pane", {
-            id: paneId,
-            data: keys,
-            answers: i === 0,
-          });
-          await sleep(160);
-        }
-      }
+      await sendQuestionAnswer(invoke, paneId, questionAnswerSteps(questions, questions.map((_, i) => at(i))));
     } catch (err) {
-      setSent(false); // let them retry — nothing (or only part) got through
-      setSendError(String(err));
+      // Some keys may have arrived. Replaying from row zero could pick a
+      // different answer, so keep the form locked and offer terminal recovery.
+      setSendError(`Answer submission failed: ${String(err)}. Open Term view to check the picker.`);
+    } finally {
+      sendingRef.current = false;
     }
   };
 
@@ -191,7 +154,7 @@ function QuestionCard({ tool, paneId, canAnswer }) {
       {tool.done ? (
         <div className="chat-question-answer">{tool.result}</div>
       ) : sent ? (
-        <div className="chat-question-hint">answer sent…</div>
+        <div className="chat-question-hint" role={sendError ? "alert" : "status"}>{sendError || "Waiting for Claude to confirm your answer…"}</div>
       ) : answerable ? (
         <div className="chat-question-foot">
           <span className="chat-question-hint">

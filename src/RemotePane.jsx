@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { X, Stop } from "@phosphor-icons/react";
@@ -76,6 +77,14 @@ function RemoteTerm({ transport, paneId, termTheme, connected }) {
       }),
     );
     term.open(containerRef.current);
+    // GPU renderer, same as local panes; DOM fallback on context loss
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
+    } catch (err) {
+      console.error("webgl renderer unavailable, using DOM renderer", err);
+    }
     fit.fit();
     termRef.current = term;
 
@@ -186,7 +195,7 @@ function RemoteChat({ machine, pane, status }) {
   );
 }
 
-export default function RemotePane({ machine, pane, status, termTheme, defaultView }) {
+export default function RemotePane({ machine, pane, status, termTheme, defaultView, span = 1 }) {
   const isChat = pane.kind === "chat";
   const isRun = pane.kind === "run";
   const claude = isChat || pane.harness === "claude";
@@ -200,7 +209,10 @@ export default function RemotePane({ machine, pane, status, termTheme, defaultVi
 
   return (
     <TransportProvider transport={machine.transport}>
-      <section className={`pane pane-remote status-${status}`}>
+      <section
+        className={`pane pane-remote status-${status}`}
+        style={{ gridColumn: `span ${span}` }}
+      >
         <header className="pane-head">
           <span className={`dot ${status}`} />
           <span className="pane-title" title={name}>{name}</span>

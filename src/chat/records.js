@@ -3,6 +3,8 @@
 //    read-along panes — written per message, so no partials
 //  - `claude -p --output-format stream-json` lines for headless panes,
 //    including stream_event deltas for token-by-token text
+import { promptKey, tokenNumbers, PASTED_TAG_RE } from "../lib/imageTokens.js";
+
 // Tool-summary shape (summary + detail per tool) adapted from t3code's
 // toolActivity.ts (github.com/pingdotgg/t3code, MIT).
 
@@ -10,7 +12,8 @@
 //            "error"|"draft", text?, tool?, sidechain?: bool,
 //            agentId?, agent?,       // sidechain only: owning Task id + label
 //            local?: bool,           // optimistic echo, unconfirmed ("sending")
-//            failed?: bool, wire? }  // send rejected; wire = text to resend
+//            failed?: bool, wire?,   // send rejected; wire = text to resend
+//            queued?: bool }         // sitting in the harness's input queue
 // tool:    { id, name, input, result?, isError?, done }
 
 export function createChatStore() {
@@ -48,13 +51,42 @@ export function addLocalUser(store, text, images) {
   return msg;
 }
 
+// Index of the pending echo a record's prompt text belongs to. Compared by
+// promptKey: the record may carry the temp paths (plain-text delivery) or
+// Claude's renumbered [Image #N] markers where the echo has the composer's.
+function findPending(store, text) {
+  const key = promptKey(text);
+  if (!key) return -1;
+  return store.pending.findIndex((p) => promptKey(p.wire ?? p.text) === key);
+}
+
 // The real record for a local echo confirms it instead of duplicating it.
 function confirmLocalUser(store, text) {
-  const i = store.pending.findIndex((p) => p.text.trim() === text.trim());
+  const i = findPending(store, text);
   if (i === -1) return false;
   const [msg] = store.pending.splice(i, 1);
   msg.local = false;
   msg.failed = false; // a marked-failed send that landed after all
+  msg.queued = false;
+  msg.rev = ++store.rev;
+  return true;
+}
+
+// Claude logs a prompt typed mid-turn as a queue-operation, not a user
+// record: "enqueue" when it's parked, "remove" (absorbed_mid_turn) when it's
+// folded into the running turn — which never yields a user record at all.
+// Either proves delivery; without this the 10s no-confirmation timer flagged
+// every queued message "may not have sent" while it sat in the queue.
+function applyQueueOp(store, rec) {
+  if (rec.operation !== "enqueue" && rec.operation !== "remove") return false;
+  const i = findPending(store, rec.content);
+  if (i === -1) return false;
+  const msg = store.pending[i];
+  if (rec.operation === "remove") store.pending.splice(i, 1);
+  // enqueue keeps it pending: the dequeued user record still has to match it
+  msg.queued = rec.operation === "enqueue";
+  msg.local = false;
+  msg.failed = false;
   msg.rev = ++store.rev;
   return true;
 }
@@ -135,15 +167,21 @@ function imageUrlFromSource(s) {
   return null;
 }
 
-// Strip the machinery from a pasted-image turn's text: Claude's [Image #N]
-// markers and the temp paths we prepend to deliver the image, so the bubble
-// shows what the user actually typed.
+// Strip the delivery machinery (temp image paths) from a pasted-image turn's
+// text. Claude's [Image #N] markers stay: they're where the user put each
+// image, and the prose may refer to them by number.
 function cleanImageText(text) {
   return text
-    .replace(/\[Image #\d+\]/g, "")
     .replace(/\S*agentbench-images[\\/]paste-\S+/g, "")
     .replace(/[ \t]+$/gm, "")
     .trim();
+}
+
+// Claude Code wraps a large paste in <pasted_content id="N"> tags in the
+// transcript record. The tags are delivery machinery, not the user's words —
+// show only the content between them.
+function unwrapPasted(text) {
+  return text.replace(PASTED_TAG_RE, "").trim();
 }
 
 function textOf(content) {
@@ -235,6 +273,29 @@ function pushCommandChip(store, chip, sidechain) {
 export function applyRecord(store, rec) {
   if (!rec || typeof rec !== "object") return false;
 
+  // Claude queues background completion notices outside normal user records.
+  // These are lifecycle records, not chat bubbles or successful sends.
+  if (rec.type === "queue-operation" && typeof rec.content === "string") {
+    const done = completeNotifiedTasks(store, rec.content, rec.timestamp);
+    return applyQueueOp(store, rec) || done;
+  }
+  if (rec.type === "attachment" && rec.attachment?.type === "queued_command"
+      && rec.attachment?.commandMode === "task-notification") {
+    return completeNotifiedTasks(store, rec.attachment.prompt ?? "", rec.timestamp);
+  }
+
+  if (rec.type === "turn_context") return noteModel(store, rec.payload?.model);
+  if (rec.type === "event_msg") {
+    const type = rec.payload?.type;
+    if (["task_started", "task_complete", "task_completed", "turn_aborted"].includes(type)) {
+      store.turnActive = type === "task_started";
+      store.rev++;
+      return true;
+    }
+    return false; // response_item is canonical; event messages duplicate it
+  }
+  if (rec.type === "response_item") return applyCodexItem(store, rec);
+
   // transcript backfill overlaps the live tail; uuids dedupe the seam
   if (rec.uuid) {
     if (store.seen.has(rec.uuid)) return false;
@@ -274,6 +335,34 @@ export function applyRecord(store, rec) {
   }
 }
 
+function applyCodexItem(store, rec) {
+  const item = rec.payload ?? {};
+  const uuid = item.id ? `codex:${item.id}` : undefined;
+  const wrap = (type, content) => applyRecord(store, {
+    type, uuid, timestamp: rec.timestamp, message: { content },
+  });
+  if (item.type === "message" && ["user", "assistant"].includes(item.role)) {
+    const text = (item.content ?? []).filter((b) => ["input_text", "output_text", "text"].includes(b.type))
+      .map((b) => b.text ?? "").join("\n");
+    // Rollouts contain injected context as user messages before the prompt.
+    if (item.role === "user" && /^(?:# AGENTS\.md instructions|<environment_context>|<permissions instructions>)/.test(text)) return false;
+    return wrap(item.role, [{ type: "text", text }]);
+  }
+  if (item.type === "reasoning") {
+    return wrap("assistant", (item.summary ?? []).map((b) => ({ type: "thinking", thinking: b.text ?? "" })));
+  }
+  if (["function_call", "custom_tool_call"].includes(item.type)) {
+    let input = item.arguments ?? item.input ?? "";
+    try { input = JSON.parse(input); } catch { input = { input }; }
+    return wrap("assistant", [{ type: "tool_use", id: item.call_id, name: item.name, input }]);
+  }
+  if (["function_call_output", "custom_tool_call_output"].includes(item.type)) {
+    return wrap("user", [{ type: "tool_result", tool_use_id: item.call_id,
+      content: typeof item.output === "string" ? item.output : JSON.stringify(item.output) }]);
+  }
+  return false;
+}
+
 /** Remember the model the session is actually on, as reported by the stream
  *  init message or an assistant reply — so the picker can show it even when
  *  the user never chose one here. Sidechain replies are subagents (often a
@@ -308,6 +397,17 @@ function applyAssistant(store, rec) {
   const blocks = rec.message?.content;
   if (!Array.isArray(blocks)) return false;
   const { sidechain, agentId, agent } = sidechainOf(store, rec);
+  if (sidechain && agentId) {
+    const act = store.activity.get(agentId)
+      ?? [...store.activity.values()].find((item) => item.bgId === agentId);
+    if (act && !act.done) {
+      act.updatedAt = Date.parse(rec.timestamp) || Date.now();
+      const output = blocks.map((block) => block.type === "text" ? block.text
+        : block.type === "tool_use" ? `${block.name}: ${JSON.stringify(block.input ?? {})}` : "")
+        .filter(Boolean).join("\n");
+      if (output) act.output = output.slice(-12000);
+    }
+  }
   // assistant output proves the prompt was consumed — stop any send spinner
   let changed = confirmPending(store);
   if (!sidechain) changed = noteModel(store, rec.message?.model) || changed;
@@ -357,7 +457,7 @@ function applyAssistant(store, rec) {
           agent,
         });
         store.toolMsg.set(b.id, msg);
-        if (!sidechain) trackToolStart(store, tool, msg);
+        if (!sidechain) trackToolStart(store, tool, msg, rec);
       }
       changed = true;
     }
@@ -369,15 +469,17 @@ function applyAssistant(store, rec) {
 
 // Tools that spawn work outliving their own tool_result: sub-agents (Task)
 // and background shells. Everything else finishes when its result lands.
-function trackToolStart(store, tool, msg) {
+function trackToolStart(store, tool, msg, rec) {
   const input = tool.input ?? {};
   const bg = input.run_in_background === true;
-  if (tool.name === "Task") {
+  if (tool.name === "Task" || tool.name === "Agent") {
     store.activity.set(tool.id, {
       kind: "agent",
       label: input.description || input.subagent_type || "subagent",
-      detail: input.subagent_type,
+      detail: input.prompt || input.subagent_type,
       msgKey: msg.key,
+      startedAt: Date.parse(rec.timestamp) || Date.now(),
+      updatedAt: Date.parse(rec.timestamp) || Date.now(),
       bg,
       done: false,
     });
@@ -387,67 +489,89 @@ function trackToolStart(store, tool, msg) {
       label: input.description || (input.command ?? "shell").slice(0, 80),
       detail: input.command,
       msgKey: msg.key,
+      startedAt: Date.parse(rec.timestamp) || Date.now(),
+      updatedAt: Date.parse(rec.timestamp) || Date.now(),
       bg: true,
       done: false,
     });
-  } else if (
-    (tool.name === "KillShell" || tool.name === "KillBash" || tool.name === "TaskStop") &&
-    (input.shell_id || input.bash_id || input.task_id)
-  ) {
-    completeByBgId(store, input.shell_id ?? input.bash_id ?? input.task_id);
   }
 }
 
 // A tool_result arriving for a tracked tool: synchronous work is over;
 // background launches instead reveal the id later notifications refer to.
-function trackToolResult(store, toolId, tool, resultText) {
-  const act = store.activity.get(toolId);
-  if (!act || act.done) {
-    // output polls report completion for a background id they were asked about
-    if (
-      tool &&
-      (tool.name === "BashOutput" || tool.name === "TaskOutput") &&
-      /\b(completed|failed|killed|exit code)\b/i.test(resultText ?? "")
-    ) {
-      const input = tool.input ?? {};
-      completeByBgId(store, input.bash_id ?? input.task_id ?? input.shell_id);
+function trackToolResult(store, toolId, tool, resultText, rec) {
+  const now = Date.parse(rec?.timestamp) || Date.now();
+  const input = tool?.input ?? {};
+  const id = input.bash_id ?? input.task_id ?? input.shell_id;
+  if (["KillShell", "KillBash", "TaskStop"].includes(tool?.name) && !tool.isError) {
+    completeByBgId(store, id, { output: resultText, updatedAt: now });
+  }
+  if (["BashOutput", "TaskOutput"].includes(tool?.name)) {
+    const status = /<(?:status|task_status)>\s*(completed|failed|killed|running)\s*<\//i.exec(resultText ?? "")?.[1]?.toLowerCase();
+    for (const act of store.activity.values()) {
+      if (act.bgId !== id || act.done) continue;
+      act.output = (resultText ?? "").slice(-12000);
+      act.updatedAt = now;
+      if (status && status !== "running") {
+        act.done = true;
+        act.failed = status === "failed";
+        act.endedAt = now;
+      }
     }
-    return;
   }
-  if (!act.bg) {
+  const act = store.activity.get(toolId);
+  if (!act || act.done) return;
+  act.output = (resultText ?? "").slice(-12000);
+  act.updatedAt = now;
+  if (!act.bg || tool?.isError) {
     act.done = true;
+    act.failed = !!tool?.isError;
+    act.endedAt = now;
     store.rev++;
     return;
   }
-  if (tool?.isError) {
-    act.done = true;
-    store.rev++;
+  const result = rec?.toolUseResult;
+  const structuredId = result?.backgroundTaskId ?? result?.agentId;
+  if (structuredId) { act.bgId = structuredId; return; }
+  if (tool.name === "Bash" && result && typeof result === "object"
+      && ("stdout" in result || "stderr" in result) && !("backgroundTaskId" in result)) {
+    act.done = true; act.failed = !!result.interrupted; act.endedAt = now; store.rev++;
     return;
   }
-  const m = /\bid\b\s*[:=]?\s*([A-Za-z0-9_-]{2,})/i.exec(resultText ?? "");
+  const m = /<(?:task-id|task_id)>\s*([^<\s]+)\s*<\//i.exec(resultText ?? "")
+    ?? /\b(?:agentId|task_id|shell_id|bash_id)\s*[:=]\s*([A-Za-z0-9_-]+)/i.exec(resultText ?? "")
+    ?? /\b(?:background|agent|task|shell)\s+(?:with\s+)?ID\s*[:=]?\s*([A-Za-z0-9_-]+)/i.exec(resultText ?? "");
   if (m) act.bgId = m[1];
 }
 
-function completeByBgId(store, id) {
+function completeByBgId(store, id, details = {}) {
   if (!id) return;
-  for (const act of store.activity.values()) {
-    if (!act.done && act.bgId === id) {
-      act.done = true;
+  for (const [toolId, act] of store.activity) {
+    if (!act.done && (act.bgId === id || toolId === id)) {
+      Object.assign(act, details, { done: true, endedAt: details.updatedAt || Date.now() });
       store.rev++;
     }
   }
 }
 
-// <task-notification> means one or more background tasks finished — retire
-// their strip entries by the ids the notification names.
-function completeNotifiedTasks(store, text) {
-  for (const m of text.matchAll(/<task-id>\s*([^<]+?)\s*<\/task-id>/g)) {
-    completeByBgId(store, m[1]);
+function completeNotifiedTasks(store, text, timestamp) {
+  const before = store.rev;
+  const updatedAt = Date.parse(timestamp) || Date.now();
+  for (const notice of text.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)) {
+    const id = /<task-id>\s*([^<]+?)\s*<\/task-id>/.exec(notice[1])?.[1];
+    const status = /<status>\s*([^<]+?)\s*<\/status>/.exec(notice[1])?.[1];
+    if (["completed", "failed", "killed"].includes(status)) {
+      completeByBgId(store, id, { failed: status === "failed", output: notice[1].slice(-12000), updatedAt });
+    }
   }
+  return store.rev !== before;
 }
 
 function applyUser(store, rec) {
-  if (rec.isMeta) return false;
+  // Meta task notifications still carry authoritative completion events.
+  const notificationText = textOf(rec.message?.content);
+  completeNotifiedTasks(store, notificationText);
+  if (rec.isMeta) return notificationText.includes("<task-notification>");
   const content = rec.message?.content;
   const { sidechain, agentId, agent } = sidechainOf(store, rec);
 
@@ -457,25 +581,31 @@ function applyUser(store, rec) {
   // image(s) for real and fold them into the optimistic echo (upgrading its
   // local preview to the transcript bytes) so we don't double up.
   if (Array.isArray(content) && content.some((b) => b.type === "image")) {
+    const text = cleanImageText(
+      unwrapPasted(
+        content
+          .filter((b) => b.type === "text" && typeof b.text === "string")
+          .map((b) => b.text)
+          .join("\n"),
+      ),
+    );
+    // label each image with the marker Claude placed for it, in order
+    const nums = tokenNumbers(text);
     const images = content
       .filter((b) => b.type === "image")
       .map((b) => imageUrlFromSource(b.source))
       .filter(Boolean)
-      .map((url) => ({ url }));
-    const text = cleanImageText(
-      content
-        .filter((b) => b.type === "text" && typeof b.text === "string")
-        .map((b) => b.text)
-        .join("\n"),
-    );
+      .map((url, k) => ({ url, n: nums[k] }));
     // a sub-agent's records must never confirm (and eat) a pending echo
-    const i = sidechain ? -1 : store.pending.findIndex((p) => p.images?.length);
+    let i = sidechain ? -1 : findPending(store, text);
+    if (i === -1 && !sidechain) i = store.pending.findIndex((p) => p.images?.length);
     if (i !== -1) {
       const [msg] = store.pending.splice(i, 1);
       if (images.length) msg.images = images;
-      if (text) msg.text = text;
+      if (text) msg.text = text; // Claude's numbering is what the model saw
       msg.local = false;
       msg.failed = false; // a marked-failed send that landed after all
+      msg.queued = false;
       msg.rev = ++store.rev;
     } else {
       push(store, { role: "user", kind: "text", text, images, sidechain, agentId, agent });
@@ -494,7 +624,7 @@ function applyUser(store, rec) {
           tool.done = true;
           const msg = store.toolMsg.get(b.tool_use_id);
           if (msg) msg.rev = ++store.rev;
-          trackToolResult(store, b.tool_use_id, tool, tool.result);
+          trackToolResult(store, b.tool_use_id, tool, tool.result, rec);
           changed = true;
         }
       } else if (b.type === "text" && b.text?.trim()) {
@@ -508,10 +638,11 @@ function applyUser(store, rec) {
           pushCommandChip(store, chip, sidechain);
           changed = true;
         } else if (!isNoiseUserText(b.text)) {
+          const text = unwrapPasted(b.text);
           // a sub-agent's "user" text is its spawn prompt, not something the
           // person typed — it must never confirm (and eat) a pending echo
-          if (sidechain || !confirmLocalUser(store, b.text)) {
-            push(store, { role: "user", kind: "text", text: b.text, sidechain, agentId, agent });
+          if (sidechain || !confirmLocalUser(store, text)) {
+            push(store, { role: "user", kind: "text", text, sidechain, agentId, agent });
           }
           changed = true;
         }
@@ -528,8 +659,9 @@ function applyUser(store, rec) {
       pushCommandChip(store, chip, sidechain);
       changed = true;
     } else if (!isNoiseUserText(content)) {
-      if (sidechain || !confirmLocalUser(store, content)) {
-        push(store, { role: "user", kind: "text", text: content, sidechain, agentId, agent });
+      const text = unwrapPasted(content);
+      if (sidechain || !confirmLocalUser(store, text)) {
+        push(store, { role: "user", kind: "text", text, sidechain, agentId, agent });
       }
       changed = true;
     }

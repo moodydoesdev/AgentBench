@@ -889,6 +889,7 @@ body {
 /* ── empty state ─────────────────────────────────── */
 
 .empty {
+  min-height: 0;
   flex: 1;
   display: grid;
   place-items: center;
@@ -1133,6 +1134,7 @@ body {
 }
 
 .content {
+  overflow: hidden;
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -1155,7 +1157,7 @@ body {
   gap: 0;
   padding: 0;
   grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
-  grid-auto-rows: minmax(340px, 1fr);
+  grid-auto-rows: minmax(0, 1fr);
 }
 
 .pane {
@@ -1516,6 +1518,8 @@ body {
   height: 100%;
   --term-bg: var(--theme-term-bg);
   --term-fg: var(--theme-term-fg);
+  --term-color-0: var(--theme-term-bg);
+  --term-color-8: var(--text-dim);
   --term-font-size: 13px;
   border-radius: 0;
   box-shadow: none;
@@ -1947,6 +1951,114 @@ body.bg-image .pane-term.wterm-host .wterm {
   max-height: 80vh;
 }
 
+/* ---- teams editor ---- */
+.composer.teams {
+  width: min(900px, calc(100vw - 96px));
+  height: min(80vh, 760px);
+}
+.teams-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 18px;
+  margin-top: 14px;
+}
+.teams-list {
+  flex: 0 0 190px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
+.teams-list .composer-btn { justify-content: center; }
+.teams-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.teams-item span { overflow-wrap: anywhere; font-weight: 550; }
+.teams-item small { color: var(--text-dim); font-size: 11px; }
+.teams-item:hover { background: var(--panel-head); }
+.teams-item.on { background: var(--panel-head); border-color: rgba(var(--blue), 0.5); }
+.teams-empty { color: var(--text-dim); font-size: 12px; margin: 4px 2px 8px; }
+.teams-editor {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.teams-placeholder {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+.teams-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 12px;
+}
+.teams-fields .composer-label { display: flex; flex-direction: column; gap: 4px; margin-top: 0; }
+.teams-fields .composer-input { text-transform: none; letter-spacing: normal; font-family: inherit; }
+.teams-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+.teams-agent {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.teams-agent-row { display: flex; align-items: center; gap: 8px; }
+.teams-role { flex: 1 1 160px; min-width: 0; }
+.teams-harness { flex: 0 0 130px; }
+.teams-model {
+  flex: 0 1 140px;
+  min-width: 0;
+  font-family: "FiraCode Nerd Font Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.teams-agent-row .btn-icon { flex: none; }
+.teams-instructions { font-size: 12.5px; resize: vertical; }
+.teams-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.teams-run { display: flex; gap: 8px; margin-left: auto; }
+.teams-delete:hover { color: rgb(var(--red)); border-color: rgba(var(--red), 0.5); }
+.teams-error { margin-top: 14px; color: rgb(var(--red)); font-size: 12.5px; overflow-wrap: anywhere; }
+.teams-error-inline { margin-right: auto; align-self: center; color: rgb(var(--red)); font-size: 12px; }
+.teams-error-inline + .composer-btn { margin-left: 0; }
+
+.pane-team {
+  flex: none;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: rgb(var(--blue));
+  border: 1px solid rgba(var(--blue), 0.4);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.teams-running { color: rgb(var(--green, var(--blue))); }
+
 /* ---- resume-session picker ---- */
 .composer.sessions {
   width: min(640px, calc(100vw - 96px));
@@ -2153,7 +2265,8 @@ body.bg-image .pane-term.wterm-host .wterm {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  font: 13px/1.6 var(--font-ui);
+  /* sized to match the Claude Code desktop app's transcript */
+  font: 14.5px/1.65 var(--font-ui);
   color: var(--text);
 }
 
@@ -2301,12 +2414,20 @@ body.bg-image .pane-term.wterm-host .wterm {
   word-break: break-word;
 }
 
-/* optimistic echo, not yet confirmed by the transcript */
-.chat-user.pending { opacity: 0.6; }
+/* optimistic echo, not yet confirmed by the transcript — dashed border so
+   "still sending" reads at a glance, not just as a dimmer bubble */
+.chat-user.pending {
+  opacity: 0.6;
+  border-style: dashed;
+  border-color: rgba(var(--hilite), 0.4);
+}
 
 /* the send provably failed — keep the message visible and offer a resend
    instead of letting it silently vanish */
-.chat-user.failed { border-color: rgba(var(--red), 0.5); }
+.chat-user.failed {
+  border-color: rgba(var(--red), 0.55);
+  background: rgba(var(--red), 0.07);
+}
 
 .chat-user-retry {
   display: block;
@@ -2315,7 +2436,7 @@ body.bg-image .pane-term.wterm-host .wterm {
   background: none;
   border: none;
   color: rgb(var(--red));
-  font: 11px var(--font-ui);
+  font: 600 12px var(--font-ui);
   cursor: pointer;
   text-align: right;
 }
@@ -2445,7 +2566,7 @@ body.bg-image .pane-term.wterm-host .wterm {
   border: none;
   padding: 0;
   color: var(--text-dim);
-  font: italic 12px var(--font-ui);
+  font: italic 13px var(--font-ui);
   cursor: pointer;
 }
 .chat-thinking button:hover { color: var(--text); }
@@ -2454,7 +2575,7 @@ body.bg-image .pane-term.wterm-host .wterm {
   padding-left: 10px;
   border-left: 2px solid var(--border);
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 13px;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -2468,16 +2589,16 @@ body.bg-image .pane-term.wterm-host .wterm {
 .chat-md ul, .chat-md ol { padding-left: 20px; }
 .chat-md li { margin-bottom: 3px; }
 .chat-md h1, .chat-md h2, .chat-md h3, .chat-md h4 {
-  font-size: 13px;
+  font-size: 14.5px;
   font-weight: 650;
   margin: 14px 0 6px;
 }
-.chat-md h1 { font-size: 16px; }
-.chat-md h2 { font-size: 14px; }
+.chat-md h1 { font-size: 18px; }
+.chat-md h2 { font-size: 16px; }
 .chat-md a { color: rgb(var(--blue)); text-decoration: none; }
 .chat-md a:hover { text-decoration: underline; }
 .chat-md code {
-  font: 11.5px/1.5 var(--font-mono);
+  font: 13px/1.5 var(--font-mono);
   background: rgba(var(--hilite), 0.07);
   border: 1px solid rgba(var(--hilite), 0.06);
   border-radius: 4px;
@@ -2492,7 +2613,7 @@ body.bg-image .pane-term.wterm-host .wterm {
 .chat-md th, .chat-md td {
   border: 1px solid var(--border);
   padding: 4px 9px;
-  font-size: 12px;
+  font-size: 13px;
   text-align: left;
 }
 .chat-md th { background: rgba(var(--hilite), 0.04); }
@@ -2532,7 +2653,7 @@ body.bg-image .pane-term.wterm-host .wterm {
   border: none;
   border-radius: 6px;
   color: var(--text-dim);
-  font: 12px/1.7 var(--font-ui);
+  font: 13px/1.7 var(--font-ui);
   cursor: pointer;
   text-align: left;
 }
@@ -2558,7 +2679,7 @@ body.bg-image .pane-term.wterm-host .wterm {
 
 .chat-tool-detail {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3022,6 +3143,32 @@ button.chat-question-opt.choice.on {
   border-radius: 10px;
   border: 1px solid var(--border);
   display: block;
+}
+
+/* "[Image #N]" badge, so the prose's references map onto the pictures */
+.chat-img-labelled { position: relative; display: block; }
+.chat-img-labelled::after,
+.chat-img-thumb::after {
+  content: attr(data-n);
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font: 600 10px var(--font-ui);
+  pointer-events: none;
+}
+.chat-img-thumb::after { left: 2px; bottom: 2px; padding: 0 4px; font-size: 9px; }
+
+/* delivered to the harness's input queue; runs after the current turn */
+.chat-user-queued {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-dim);
+  font: 500 11.5px var(--font-ui);
+  text-align: right;
 }
 
 .chat-question-hint {
@@ -3900,3 +4047,446 @@ button.chat-question-opt.choice.on {
 .sched-error { color: rgb(var(--red)); font-size: 12px; }
 
 .sched-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ── terminal dock (bottom, tabbed shells) ───────── */
+
+.dock {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+/* height drag handle riding the dock's top edge */
+.dock-resize {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: row-resize;
+  z-index: 4;
+}
+
+.dock-strip {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 33px; /* matches .pane-head / .plan-rail-head */
+  box-sizing: border-box;
+  flex: none;
+  padding: 0 6px;
+  background: var(--panel-head);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.dock-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 4px 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  flex: none;
+}
+
+.dock-tab:hover {
+  background: rgba(var(--hilite), 0.06);
+  color: var(--text);
+}
+
+.dock-tab.on {
+  background: rgba(var(--hilite), 0.09);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.dock-tab.focused.on {
+  border-color: rgba(var(--blue), 0.45);
+}
+
+.dock-tab-label {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-tab-x {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  opacity: 0;
+}
+
+.dock-tab:hover .dock-tab-x,
+.dock-tab.on .dock-tab-x {
+  opacity: 0.7;
+}
+
+.dock-tab-x:hover {
+  opacity: 1;
+  background: rgba(var(--red), 0.18);
+  color: rgb(var(--red));
+}
+
+.dock-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.dock-new:hover {
+  background: rgba(var(--hilite), 0.08);
+  color: var(--text);
+}
+
+.dock-spacer {
+  flex: 1;
+}
+
+/* the terminal body reuses .pane-term inside */
+.dock-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  background: var(--theme-term-bg);
+}
+
+.dock-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.dock-empty-new {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: rgb(var(--blue));
+  cursor: pointer;
+}
+
+/* ── background tasks rail (right side) ──────────── */
+
+.task-rail {
+  width: 280px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  min-height: 0;
+}
+
+.task-btn {
+  position: relative;
+}
+
+.task-badge {
+  background: rgb(var(--blue));
+}
+
+.task-rail-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.task-section {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 6px 3px;
+  border: none;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  text-align: left;
+}
+
+.task-section-toggle {
+  cursor: pointer;
+}
+
+.task-section-toggle .flip {
+  transform: rotate(-90deg);
+}
+
+.task-clear {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.task-clear:hover {
+  color: var(--text);
+}
+
+.task-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  font: inherit;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.task-item:hover {
+  background: rgba(var(--hilite), 0.05);
+}
+
+.task-item.done {
+  opacity: 0.6;
+}
+
+.task-item.failed .task-label {
+  color: rgb(var(--red));
+}
+
+.task-icon {
+  flex: none;
+  color: var(--text-dim);
+}
+
+.task-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.task-label {
+  font-size: 12.5px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-time {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.task-spin {
+  flex: none;
+  color: rgb(var(--green));
+  animation: task-spin 0.9s linear infinite;
+}
+
+@keyframes task-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.task-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 22px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.task-quiet { padding: 0 8px 6px 29px; color: var(--text-dim); font-size: 11px; }
+.task-details { padding: 6px 10px 12px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.task-details strong { overflow-wrap: anywhere; }
+.task-details pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow-y: auto; font: 11px/1.5 var(--font-mono); color: var(--text-dim); }
+.task-open { align-self: flex-start; background: none; border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 5px 8px; cursor: pointer; }
+
+/* Resource management uses the workspace palette. */
+.resource-panel { position: absolute; z-index: 50; right: 0; top: 0; bottom: 0; width: min(420px, 100%); background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: auto; padding: 16px; gap: 14px; }
+.resource-panel > header { display: flex; align-items: center; justify-content: space-between; }
+.resource-summary { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.resource-note { color: var(--text-dim); font-size: 11px; line-height: 1.5; margin: 0; }
+.resource-error { color: rgb(var(--red)); font-size: 12px; }
+.resource-list { display: flex; flex-direction: column; }
+.resource-row { border-top: 1px solid var(--border); padding: 13px 0; display: flex; flex-direction: column; gap: 6px; }
+.resource-name { text-align: left; color: var(--text); font-weight: 600; background: none; border: 0; cursor: pointer; overflow-wrap: anywhere; }
+.resource-numbers { font-size: 12px; font-variant-numeric: tabular-nums; }
+.resource-row small { color: var(--text-dim); font-size: 11px; }
+.resource-actions { display: flex; gap: 8px; }
+.resource-actions button { display: flex; align-items: center; gap: 5px; }
+.resource-policy { display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--border); padding: 12px; font-size: 12px; }
+.resource-policy label { display: flex; align-items: center; gap: 7px; }
+.resource-policy select { background: var(--panel-head); color: var(--text); border: 1px solid var(--border); padding: 4px; }
+.resource-pressure { display: flex; gap: 12px; align-items: center; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--panel-head); font-size: 12px; }
+.pane-resource { font-size: 10px; color: var(--text-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pane-sleep-banner { padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 12px; }
+.pane-size.pinned { color: rgb(var(--amber)); }
+.resource-panel button:disabled { opacity: .45; cursor: default; }
+.content { position: relative; }
+/* Browser skips offscreen chat layout and painting, retaining measured sizes
+   for stable scroll positions when earlier messages are revealed. */
+.chat-col > .chat-user, .chat-col > .chat-assistant, .chat-col > .chat-thinking, .chat-col > .chat-sidechain, .chat-col > .chat-tools { content-visibility: auto; contain-intrinsic-size: auto 120px; }
+.pane-size:disabled { opacity: .35; cursor: default; }
+
+/* sidebar project reorder (pointer drag) */
+.project.dragging {
+  opacity: 0.45;
+}
+
+.project.drop-before::before,
+.project.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgb(var(--green));
+  pointer-events: none;
+}
+
+.project.drop-before::before {
+  top: -1px;
+}
+
+.project.drop-after::after {
+  bottom: -1px;
+}
+
+/* temporarily hidden projects: tucked into a collapsible group */
+.project.is-hidden {
+  opacity: 0.55;
+}
+
+.project.is-hidden:hover,
+.project.is-hidden.active {
+  opacity: 0.85;
+}
+
+.hidden-projects-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 14px 6px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+}
+
+.hidden-projects-toggle:hover {
+  color: var(--text);
+}
+
+.hidden-projects-caret {
+  transform: rotate(-90deg);
+  transition: transform 0.15s;
+}
+
+.hidden-projects-toggle.open .hidden-projects-caret {
+  transform: none;
+}
+
+/* focus-layout team: members share one pane, switched from header tabs */
+.pane-team-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+.pane-team-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pane-team-tab:hover {
+  color: var(--text);
+  background: rgba(var(--hilite), 0.05);
+}
+
+.pane-team-tab.active {
+  color: var(--text);
+  font-weight: 600;
+  border-color: var(--border);
+  background: rgba(var(--hilite), 0.06);
+}
+
+.pane-team-tab.status-input:not(.active) {
+  color: rgb(var(--amber));
+}

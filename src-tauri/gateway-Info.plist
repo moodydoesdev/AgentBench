@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Same story as broker-Info.plist: the gateway is a detached bare
+	     executable and needs its own identity for TCC/System Settings. -->
+	<key>CFBundleIdentifier</key>
+	<string>com.connor.agentbench.gateway</string>
+	<key>CFBundleName</key>
+	<string>AgentBench Gateway</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+</dict>
+</plist>

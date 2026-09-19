@@ -22,6 +22,7 @@ path = "src/bin/gateway.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+sysinfo = { version = "=0.37.2", default-features = false, features = ["system"] }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

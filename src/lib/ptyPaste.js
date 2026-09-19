@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { pasteChunks, IMAGE_SETTLE_MS, CHUNK_GAP_MS } from "./imageTokens";
 
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
@@ -24,12 +25,22 @@ export function pasteAndSubmit(id, text) {
   if (prev && prev.text === text && now - prev.at < DEDUPE_MS) return;
   lastSend.set(id, { text, at: now });
 
-  invoke("write_pane", { id, data: `\x1b[200~${text}\x1b[201~` }).catch(() => {});
   const submit = () => invoke("write_pane", { id, data: "\r" }).catch(() => {});
-  if (IS_WINDOWS) {
-    setTimeout(submit, 450);
-    setTimeout(submit, 1300);
-  } else {
-    setTimeout(submit, 150);
-  }
+  const chunks = pasteChunks(text);
+  (async () => {
+    // one paste per image path (see imageTokens.js), in order
+    for (const [i, c] of chunks.entries()) {
+      await invoke("write_pane", { id, data: `\x1b[200~${c.text}\x1b[201~` }).catch(() => {});
+      if (c.image) await sleep(IMAGE_SETTLE_MS);
+      else if (i < chunks.length - 1) await sleep(CHUNK_GAP_MS);
+    }
+    if (IS_WINDOWS) {
+      setTimeout(submit, 450);
+      setTimeout(submit, 1300);
+    } else {
+      setTimeout(submit, 150);
+    }
+  })();
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

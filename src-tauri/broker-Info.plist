@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Embedded into the agentbench-broker binary (__TEXT,__info_plist) by
+	  build.rs. The broker runs detached from the .app bundle and outlives it,
+	  so TCC attributes pane-child screen captures (agents running
+	  `screencapture` etc.) to the broker itself. Without a bundle identifier
+	  macOS cannot list it under Privacy & Security at all, let alone persist
+	  a grant. This plist gives the bare executable a TCC-grantable identity.
+	-->
+	<key>CFBundleIdentifier</key>
+	<string>com.connor.agentbench.broker</string>
+	<key>CFBundleName</key>
+	<string>AgentBench Broker</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+</dict>
+</plist>

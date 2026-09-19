@@ -176,8 +176,14 @@ fn create_pane(
 }
 
 #[tauri::command]
-fn write_pane(client: State<'_, Arc<BrokerClient>>, id: u32, data: String) -> Result<(), String> {
-    client.send(json!({ "op": "write", "id": id, "data": data }))
+async fn write_pane(client: State<'_, Arc<BrokerClient>>, id: u32, data: String, ack: Option<bool>) -> Result<(), String> {
+    if ack != Some(true) {
+        return client.send(json!({ "op": "write", "id": id, "data": data }));
+    }
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        client.request(json!({ "op": "write", "id": id, "data": data, "ack": true })).map(|_| ())
+    }).await.map_err(|e| e.to_string())?
 }
 
 /// Headless Claude pane: stream-json over pipes instead of a pty.
@@ -196,6 +202,49 @@ fn create_chat_pane(
 
 /// Start tailing a pane's transcript for its chat view; returns
 /// { sid, text } — the session id and the transcript so far.
+// Broker round-trips — keep them off the main thread. resource-draft fires on
+// composer focus and waits on the resource operation lock, which a hibernate
+// holds for seconds; a sync command here froze the whole webview.
+async fn broker_request(client: State<'_, Arc<BrokerClient>>, req: Value) -> Result<Value, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.request(req))
+        .await.map_err(|e|e.to_string())?
+}
+
+#[tauri::command]
+async fn resource_state(client: State<'_, Arc<BrokerClient>>) -> Result<Value, String> {
+    broker_request(client, json!({"op":"resources"})).await
+}
+
+#[tauri::command]
+async fn resource_policy(client: State<'_, Arc<BrokerClient>>, policy: Value) -> Result<Value, String> {
+    broker_request(client, json!({"op":"resource-policy", "policy":policy})).await
+}
+
+#[tauri::command]
+async fn resource_draft(client: State<'_, Arc<BrokerClient>>, id: u32, owner: String, present: bool) -> Result<Value, String> {
+    broker_request(client, json!({"op":"resource-draft", "id":id, "owner":owner, "present":present})).await
+}
+
+#[tauri::command]
+async fn resource_pin(client: State<'_, Arc<BrokerClient>>, id: u32, pinned: bool) -> Result<Value, String> {
+    broker_request(client, json!({"op":"resource-pin", "id":id, "pinned":pinned})).await
+}
+
+#[tauri::command]
+async fn hibernate_pane(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<Value, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.request(json!({"op":"hibernate", "id":id})))
+        .await.map_err(|e|e.to_string())?
+}
+
+#[tauri::command]
+async fn resume_hibernated(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<Value, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.request(json!({"op":"resume-hibernated", "id":id})))
+        .await.map_err(|e|e.to_string())?
+}
+
 #[tauri::command]
 fn watch_transcript(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<Value, String> {
     client.request(json!({ "op": "watch", "id": id }))
@@ -285,6 +334,17 @@ fn read_plan(path: String) -> Result<Value, String> {
 #[tauri::command]
 fn list_plans(project: String) -> Result<Value, String> {
     Ok(fsdata::list_plans(&project))
+}
+
+/// A project's saved agent teams (.agentbench/teams.json).
+#[tauri::command]
+fn list_teams(project: String) -> Result<Value, String> {
+    fsdata::read_teams(&project)
+}
+
+#[tauri::command]
+fn save_teams(project: String, teams: Value) -> Result<(), String> {
+    fsdata::write_teams(&project, &teams)
 }
 
 /// Mirror the desktop's project registry to disk so the mobile gateway can
@@ -1010,6 +1070,12 @@ pub fn run() {
             write_pane,
             create_chat_pane,
             watch_transcript,
+            resource_state,
+            resource_policy,
+            resource_pin,
+            resource_draft,
+            hibernate_pane,
+            resume_hibernated,
             unwatch_transcript,
             interrupt_pane,
             resize_pane,
@@ -1022,6 +1088,8 @@ pub fn run() {
             schedule_run,
             read_plan,
             list_plans,
+            list_teams,
+            save_teams,
             save_projects,
             gateway_status,
             gateway_start,

@@ -15,6 +15,8 @@
  * visible with a retry affordance instead of losing it.
  */
 
+import { pasteChunks, IMAGE_SETTLE_MS, CHUNK_GAP_MS } from "./imageTokens";
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // transport -> { unready: Set<paneId>, everReady: Set<paneId> }, fed by the
@@ -147,7 +149,13 @@ export function sendToPane(transport, pane, text) {
   }
   return enqueue(transport, pane.paneId, async () => {
     await waitForReady(transport, pane.paneId);
-    await writeAcked(transport, pane.paneId, `\x1b[200~${text}\x1b[201~`);
+    // one paste per image path (see imageTokens.js), in order
+    const chunks = pasteChunks(text);
+    for (const [i, c] of chunks.entries()) {
+      await writeAcked(transport, pane.paneId, `\x1b[200~${c.text}\x1b[201~`);
+      if (c.image) await sleep(IMAGE_SETTLE_MS);
+      else if (i < chunks.length - 1) await sleep(CHUNK_GAP_MS);
+    }
     // Two Enters for ConPTY chunking (see ptyPaste.js), inside the queue so
     // the next message can't interleave. Their failure is not message loss —
     // the text is in the input box and ChatView's submit guard re-Enters —

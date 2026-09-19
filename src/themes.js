@@ -202,6 +202,8 @@ export function terminalThemeFromVars(v, transparent = false) {
   return {
     background: transparent ? "#00000000" : v["--theme-term-bg"],
     foreground: v["--theme-term-fg"],
+    black: v["--theme-term-bg"],
+    brightBlack: v["--text-dim"],
     cursor: v["--theme-term-cursor"],
     cursorAccent: v["--theme-term-bg"],
     selectionBackground: v["--theme-term-sel"],

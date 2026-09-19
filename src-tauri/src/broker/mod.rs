@@ -4,6 +4,9 @@
 
 pub mod schedules;
 
+mod codex;
+pub mod resources;
+
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
@@ -29,6 +32,7 @@ pub fn broker_file() -> PathBuf {
 }
 
 pub struct Core {
+    pub resources: resources::Manager,
     pub panes: Mutex<HashMap<u32, Pane>>,
     pub next_id: AtomicU32,
     pub hook_port: AtomicU32,
@@ -88,6 +92,7 @@ pub struct Pane {
     killer: Box<dyn ChildKiller + Send + Sync>,
     cwd: String,
     harness: String,
+    team: Option<TeamSeat>,
     buffer: Arc<Mutex<Vec<u8>>>,
     /// When the harness was spawned — lets the transcript watcher adopt a
     /// session by file mtime when the hooks never deliver a session id
@@ -99,13 +104,41 @@ pub struct Pane {
 pub struct SavedPane {
     pub cwd: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
     /// Harness id (claude/opencode/custom …); None in old files = claude.
     #[serde(default)]
     pub harness: Option<String>,
+    /// Team membership, so a restored agent relaunches as the same role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamSeat>,
+}
+
+/// An agent's place in a saved team (.agentbench/teams.json). Launch flags
+/// come from here: Claude gets --name/--model/--append-system-prompt, codex
+/// gets -m. Travels inside HarnessSpec so hibernate/resume and restarts keep it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct TeamSeat {
+    pub team_id: String,
+    pub team: String,
+    pub role: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Full system-prompt addition (team roster + the role's instructions).
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+impl TeamSeat {
+    fn from_value(v: &Value) -> Option<TeamSeat> {
+        let seat: TeamSeat = serde_json::from_value(v.clone()).ok()?;
+        (!seat.role.trim().is_empty()).then_some(seat)
+    }
 }
 
 /// How to launch an agent in a pane. Sent by the frontend on `create`; built
 /// from the presets + user-defined custom harnesses in Settings.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct HarnessSpec {
     pub id: String,
     /// Shell command line, e.g. "claude --dangerously-skip-permissions".
@@ -118,6 +151,8 @@ pub struct HarnessSpec {
     /// functions resolve — project run commands are typed by users, who
     /// expect whatever works in their terminal to work here.
     pub interactive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamSeat>,
 }
 
 impl HarnessSpec {
@@ -132,6 +167,7 @@ impl HarnessSpec {
             resume: v["resume"].as_str().map(String::from),
             claude: v["claude"].as_bool().unwrap_or(false),
             interactive: v["interactive"].as_bool().unwrap_or(false),
+            team: TeamSeat::from_value(&v["team"]),
         })
     }
 
@@ -143,6 +179,7 @@ impl HarnessSpec {
             resume: Some("--resume {session_id}".into()),
             claude: true,
             interactive: false,
+            team: None,
         }
     }
 }
@@ -151,9 +188,12 @@ impl Core {
     pub fn new() -> Arc<Core> {
         let config_dir = config_dir();
         let _ = std::fs::create_dir_all(&config_dir);
+        let resources = resources::Manager::load(&config_dir);
+        let next_id = resources.next_id();
         let core = Arc::new(Core {
+            resources,
             panes: Mutex::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
+            next_id: AtomicU32::new(next_id),
             hook_port: AtomicU32::new(0),
             sessions: Mutex::new(HashMap::new()),
             claimed: Mutex::new(HashSet::new()),
@@ -194,6 +234,7 @@ impl Core {
         start_color_watcher(core.clone());
         start_transcript_watcher(core.clone());
         schedules::start(core.clone());
+        resources::start(core.clone());
         core
     }
 
@@ -220,6 +261,7 @@ fn load_saved(config_dir: &PathBuf) -> Vec<SavedPane> {
 /// Snapshot live panes (+ their newest resumable session id) so a future
 /// broker can restore them with `claude --resume`.
 fn persist_panes(core: &Core) {
+    let pins = resources::pins(core);
     let panes = core.panes.lock().unwrap();
     let chat_panes = core.chat_panes.lock().unwrap();
     let sessions = core.sessions.lock().unwrap();
@@ -230,17 +272,23 @@ fn persist_panes(core: &Core) {
                 .cloned()
         })
     };
+    let sleepers = core.resources.sleepers.lock().unwrap();
     let entries: Vec<SavedPane> = panes
         .iter()
+        .filter(|(id, _)| !sleepers.contains_key(id))
         .map(|(id, p)| SavedPane {
             cwd: p.cwd.clone(),
+            pinned: pins.get(id).copied().unwrap_or(false),
             session_id: resumable(id, &p.cwd),
             harness: Some(p.harness.clone()),
+            team: p.team.clone(),
         })
-        .chain(chat_panes.iter().map(|(id, p)| SavedPane {
+        .chain(chat_panes.iter().filter(|(id, _)| !sleepers.contains_key(id)).map(|(id, p)| SavedPane {
             cwd: p.cwd.clone(),
+            pinned: pins.get(id).copied().unwrap_or(false),
             session_id: resumable(id, &p.cwd),
             harness: Some("claude-chat".into()),
+            team: None,
         }))
         .collect();
     let path = core.config_dir.join("panes.json");
@@ -317,7 +365,7 @@ fn write_hook_settings(
     };
     let mut settings = json!({
         "hooks": {
-            "SessionStart": [{ "hooks": [{ "type": "command", "command": curl("session"), "timeout": 10 }] }],
+            "SessionStart": [{ "hooks": [{ "type": "command", "command": curl("session"), "timeout": 10 }, { "type": "command", "command": curl("resource-ready"), "timeout": 3 }] }],
             "Stop": [{ "hooks": [{ "type": "command", "command": curl("done"), "timeout": 10 }] }],
             // Turn boundaries for the chat view's stop affordance. The
             // transcript alone can't say whether a turn is live — it lands
@@ -333,7 +381,15 @@ fn write_hook_settings(
             // PreToolUse fires with tool_input the instant the question is
             // posed, so the broker can push the questions to the chat view for
             // an immediate, answerable card. Scoped to AskUserQuestion only.
-            "PreToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": curl("ask"), "timeout": 10 }] }]
+            "PreToolUse": [
+                { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": curl("ask"), "timeout": 10 }] },
+                { "hooks": [{ "type": "command", "command": curl("resource-pre"), "timeout": 3 }] }
+            ],
+            "PostToolUse": [{ "hooks": [{ "type": "command", "command": curl("resource-post"), "timeout": 3 }] }],
+            "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": curl("resource-failure"), "timeout": 3 }] }],
+            "SubagentStart": [{ "hooks": [{ "type": "command", "command": curl("resource-agent-start"), "timeout": 3 }] }],
+            "SubagentStop": [{ "hooks": [{ "type": "command", "command": curl("resource-agent-stop"), "timeout": 3 }] }],
+            "TaskCompleted": [{ "hooks": [{ "type": "command", "command": curl("resource-task-done"), "timeout": 3 }] }]
         }
     });
     // accept only Claude's known theme names
@@ -354,6 +410,25 @@ fn write_hook_settings(
 /// Shell to run panes/installs through. `pref` is the user's Settings choice
 /// ("" / None = auto). Auto: $SHELL on unix; pwsh → powershell → cmd on
 /// Windows (PATH scanned directly — spawning `where` flashes a console).
+/// A quoted reference to an env var in the syntax of the shell that will run
+/// the command line.
+fn env_ref(shell: &str, name: &str) -> String {
+    #[cfg(windows)]
+    {
+        let stem = std::path::Path::new(shell)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        match stem.as_str() {
+            "cmd" => return format!("\"%{name}%\""),
+            "pwsh" | "powershell" => return format!("\"$env:{name}\""),
+            _ => {}
+        }
+    }
+    let _ = shell;
+    format!("\"${name}\"")
+}
+
 pub fn resolve_shell(pref: Option<&str>) -> String {
     if let Some(s) = pref.map(str::trim).filter(|s| !s.is_empty()) {
         return s.to_string();
@@ -509,6 +584,32 @@ fn harness_command(
         }
     }
     let shell = resolve_shell(shell_pref);
+    // Team values reach the command line as env var references, never
+    // spliced text — role names and instructions can hold any character.
+    let mut team_env: Vec<(&str, &str)> = Vec::new();
+    if let Some(seat) = &spec.team {
+        let var = |name: &str| env_ref(&shell, name);
+        let model = seat.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        let prompt = seat.prompt.as_deref().filter(|p| !p.trim().is_empty());
+        team_env.push(("AGENTBENCH_TEAM", &seat.team));
+        team_env.push(("AGENTBENCH_TEAM_ROLE", &seat.role));
+        if spec.claude {
+            line.push_str(&format!(" --name {}", var("AGENTBENCH_TEAM_ROLE")));
+            if let Some(m) = model {
+                team_env.push(("AGENTBENCH_TEAM_MODEL", m));
+                line.push_str(&format!(" --model {}", var("AGENTBENCH_TEAM_MODEL")));
+            }
+            if let Some(p) = prompt {
+                team_env.push(("AGENTBENCH_TEAM_PROMPT", p));
+                line.push_str(&format!(" --append-system-prompt {}", var("AGENTBENCH_TEAM_PROMPT")));
+            }
+        } else if spec.id == "codex" {
+            if let Some(m) = model {
+                team_env.push(("AGENTBENCH_TEAM_MODEL", m));
+                line.push_str(&format!(" -m {}", var("AGENTBENCH_TEAM_MODEL")));
+            }
+        }
+    }
     let mut cmd;
     #[cfg(unix)]
     {
@@ -554,6 +655,15 @@ fn harness_command(
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    for (k, v) in team_env {
+        cmd.env(k, v);
+    }
+    if spec.id == "codex" {
+        cmd.env(
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+            codex::originator(hook_port, pane_id),
+        );
+    }
     // let agents (and their skills) reach the hook server, e.g. to publish
     // visual plans: POST /event/{pane_id}/plan
     cmd.env("AGENTBENCH_PANE_ID", pane_id.to_string());
@@ -612,6 +722,11 @@ pub fn create_pane(
         .map_err(|e| e.to_string())?;
     drop(pair.slave);
 
+    if let Some(pid) = child.process_id() {
+        resources::register(core, id, pid, resources::Launch {
+            cwd: cwd.clone(), harness: Some(spec.clone()), shell: shell.clone(), theme: theme.clone(), chat: false,
+        });
+    }
     let killer = child.clone_killer();
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
@@ -691,6 +806,7 @@ pub fn create_pane(
     std::thread::spawn(move || {
         let code = child.wait().ok().map(|s| s.exit_code());
         exit_core.panes.lock().unwrap().remove(&id);
+        resources::exited(&exit_core, id);
         exit_core.sessions.lock().unwrap().remove(&id);
         exit_core.colors.lock().unwrap().remove(&id);
         exit_core.watched.lock().unwrap().remove(&id);
@@ -707,6 +823,7 @@ pub fn create_pane(
             killer,
             cwd,
             harness: spec.id,
+            team: spec.team,
             buffer,
             spawned: std::time::SystemTime::now(),
         },
@@ -726,6 +843,9 @@ fn mark_pane_ready(core: &Core, id: u32) {
 }
 
 pub fn write_pane(core: &Core, id: u32, data: &str) -> Result<(), String> {
+    let _op = core.resources.operation.lock().unwrap();
+    if core.resources.sleepers.lock().unwrap().contains_key(&id) { return Err("Agent is hibernated; resume it before sending".into()); }
+    resources::input(core, id, data);
     // Focus in/out reports (sent when the user merely clicks into the pane)
     // are not real input; don't let them re-arm the needs_input badge.
     if data != "\u{1b}[I" && data != "\u{1b}[O" {
@@ -759,6 +879,7 @@ pub fn resize_pane(core: &Core, id: u32, cols: u16, rows: u16) -> Result<(), Str
 }
 
 pub fn kill_pane(core: &Core, id: u32) {
+    let _ = resources::forget(core, id);
     if let Some(pane) = core.panes.lock().unwrap().get_mut(&id) {
         let _ = pane.killer.kill();
     }
@@ -796,6 +917,7 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
                 "id": id,
                 "cwd": p.cwd,
                 "harness": p.harness,
+                "team": p.team,
                 "color": colors.get(id),
                 // Newest known session id. Clients that cannot see a terminal
                 // (the mobile app) use it to name a pane from its transcript
@@ -821,6 +943,9 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
             })
         }))
         .collect();
+    let sleeping = resources::sleeping_panes(core);
+    out.retain(|p| !sleeping.iter().any(|s| s["id"] == p["id"]));
+    out.extend(sleeping);
     out.sort_by_key(|v| v["id"].as_u64());
     out
 }
@@ -828,7 +953,10 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
 /// Panes persisted by a previous broker run; consumed on first call so a
 /// reloading client can't restore duplicates.
 pub fn saved_panes(core: &Core) -> Vec<SavedPane> {
-    std::mem::take(&mut *core.saved.lock().unwrap())
+    let sleepers = core.resources.sleepers.lock().unwrap();
+    std::mem::take(&mut *core.saved.lock().unwrap()).into_iter().filter(|p|
+        !sleepers.values().any(|s| p.cwd == s.launch.cwd && p.session_id.as_deref() == Some(&s.session_id))
+    ).collect()
 }
 
 /// `/color` appends {"type":"agent-color","agentColor":"red"} lines to the
@@ -898,6 +1026,7 @@ fn newest_session(core: &Core, id: u32, cwd: &str) -> Option<String> {
 /// session id plus the full transcript so far; the watcher streams every
 /// line written after this snapshot as `transcript-lines` events.
 pub fn watch_transcript(core: &Core, id: u32) -> Result<Value, String> {
+    if let Some(v) = resources::transcript(core, id) { return Ok(v); }
     let cwd = core
         .panes
         .lock()
@@ -905,12 +1034,19 @@ pub fn watch_transcript(core: &Core, id: u32) -> Result<Value, String> {
         .get(&id)
         .map(|p| p.cwd.clone())
         .ok_or("no such pane")?;
-    let sid = newest_session(core, id, &cwd);
+    let is_codex = core.panes.lock().unwrap().get(&id)
+        .is_some_and(|p| p.harness == "codex");
+    let sid = if is_codex {
+        codex::transcript(core, id, &cwd)
+    } else {
+        newest_session(core, id, &cwd)
+    };
     let (text, offset) = match &sid {
         Some(sid) => {
-            let raw = std::fs::read(transcript_path(core, &cwd, sid)).unwrap_or_default();
-            let len = raw.len() as u64;
-            (String::from_utf8_lossy(&raw).into_owned(), len)
+            let path = if is_codex { PathBuf::from(sid) } else { transcript_path(core, &cwd, sid) };
+            let raw = std::fs::read(path).unwrap_or_default();
+            let len = raw.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            (String::from_utf8_lossy(&raw[..len]).into_owned(), len as u64)
         }
         // session id not hooked yet — watcher picks the file up when it lands
         None => (String::new(), 0),
@@ -924,7 +1060,7 @@ pub fn watch_transcript(core: &Core, id: u32) -> Result<Value, String> {
     let hist_len = core.sessions.lock().unwrap().get(&id).map_or(0, |h| h.len());
     let (path, exists) = match &sid {
         Some(s) => {
-            let p = transcript_path(core, &cwd, s);
+            let p = if is_codex { PathBuf::from(s) } else { transcript_path(core, &cwd, s) };
             (p.display().to_string(), p.exists())
         }
         None => {
@@ -1020,18 +1156,22 @@ fn start_transcript_watcher(core: Arc<Core>) {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let ids: Vec<u32> = core.watched.lock().unwrap().keys().copied().collect();
         for id in ids {
-            let Some((cwd, spawned)) = core
+            let Some((cwd, spawned, is_codex)) = core
                 .panes
                 .lock()
                 .unwrap()
                 .get(&id)
-                .map(|p| (p.cwd.clone(), p.spawned))
+                .map(|p| (p.cwd.clone(), p.spawned, p.harness == "codex"))
             else {
                 core.watched.lock().unwrap().remove(&id);
                 continue;
             };
-            let mut newest = newest_session(&core, id, &cwd);
-            if newest.is_none() {
+            let mut newest = if is_codex {
+                codex::transcript(&core, id, &cwd)
+            } else {
+                newest_session(&core, id, &cwd)
+            };
+            if newest.is_none() && !is_codex {
                 newest = adopt_session(&core, id, &cwd, spawned);
             }
             let mut reset = false;
@@ -1052,7 +1192,7 @@ fn start_transcript_watcher(core: Arc<Core>) {
                 Some(w) => w.offset,
                 None => continue,
             };
-            let path = transcript_path(&core, &cwd, &sid);
+            let path = if is_codex { PathBuf::from(&sid) } else { transcript_path(&core, &cwd, &sid) };
             let Ok(mut f) = std::fs::File::open(&path) else { continue };
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             if len < offset {
@@ -1117,6 +1257,12 @@ pub fn create_chat_pane(
         bind_session(core, id, sid);
     }
 
+    let settings = write_hook_settings(core, id, port, None)?;
+    #[cfg(unix)]
+    line.push_str(&format!(" --settings '{}'", settings.to_string_lossy().replace('\'', "'\\''")));
+    #[cfg(windows)]
+    line.push_str(&format!(" --settings \"{}\"", settings.display()));
+
     let shell = resolve_shell(shell_pref);
     let mut cmd;
     #[cfg(unix)]
@@ -1143,6 +1289,9 @@ pub fn create_chat_pane(
         .stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    resources::register(core, id, child.id(), resources::Launch {
+        cwd: cwd.clone(), harness: None, shell: shell_pref.map(String::from), theme: None, chat: true,
+    });
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -1169,6 +1318,7 @@ pub fn create_chat_pane(
                     }
                 }
                 if v["type"] == "result" {
+                    if v["parent_tool_use_id"].is_null() { resources::event(&out_core, id, "done", &v); }
                     out_core.last_done.lock().unwrap().insert(id, Instant::now());
                     let sid = out_core
                         .sessions
@@ -1202,6 +1352,7 @@ pub fn create_chat_pane(
             .get(&id)
             .and_then(|h| h.first().cloned());
         out_core.chat_panes.lock().unwrap().remove(&id);
+        resources::exited(&out_core, id);
         out_core.sessions.lock().unwrap().remove(&id);
         out_core.last_done.lock().unwrap().remove(&id);
         persist_panes(&out_core);
@@ -1336,6 +1487,12 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
             let parts: Vec<&str> = url.trim_matches('/').split('/').collect();
             if parts.len() == 3 && parts[0] == "event" {
                 if let (Ok(id), kind) = (parts[1].parse::<u32>(), parts[2]) {
+                    let resource_payload = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+                    resources::event(&core, id, kind, &resource_payload);
+                    if kind.starts_with("resource-") {
+                        let _ = req.respond(tiny_http::Response::empty(200));
+                        continue;
+                    }
                     // Belt-and-braces ready signal for panes whose
                     // bracketed-paste enable never made it through the pty
                     // (ConPTY has eaten stranger things). NOT SessionStart:
@@ -1551,6 +1708,23 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
         Some("list") => Some(json!({ "result": list_panes(core) })),
         Some("saved") => Some(json!({ "result": saved_panes(core) })),
         Some("ping") => Some(json!({ "result": "pong" })),
+        Some("resources") => Some(json!({ "result": resources::snapshot(core) })),
+        Some("resource-policy") => Some(match serde_json::from_value::<resources::Policy>(req["policy"].clone())
+            .map_err(|e| e.to_string()).and_then(|p| resources::set_policy(core, p)) {
+                Ok(()) => json!({"result":null}), Err(e) => json!({"error":e}),
+            }),
+        Some("resource-draft") => Some(match resources::draft(core,req["id"].as_u64().unwrap_or(0) as u32,req["owner"].as_str().unwrap_or("unknown"),req["present"].as_bool().unwrap_or(false)) {
+            Ok(()) => json!({"result":null}), Err(e) => json!({"error":e}),
+        }),
+        Some("resource-pin") => Some(match resources::pin(core,req["id"].as_u64().unwrap_or(0) as u32,req["pinned"].as_bool().unwrap_or(false)) {
+            Ok(()) => json!({"result":null}), Err(e) => json!({"error":e}),
+        }),
+        Some("hibernate") => Some(match resources::hibernate(core,req["id"].as_u64().unwrap_or(0) as u32) {
+            Ok(v) => json!({"result":v}), Err(e) => json!({"error":e}),
+        }),
+        Some("resume-hibernated") => Some(match resources::resume(core,req["id"].as_u64().unwrap_or(0) as u32) {
+            Ok(v) => json!({"result":v}), Err(e) => json!({"error":e}),
+        }),
         Some("schedules") => Some(json!({ "result": schedules::state_json(core) })),
         Some("schedule-save") => Some(match schedules::save_op(core, req) {
             Ok(v) => json!({ "result": v }),
@@ -1587,5 +1761,66 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
             return Some(json!({ "result": "bye" }));
         }
         _ => Some(json!({ "error": "unknown op" })),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod team_launch_tests {
+    use super::*;
+
+    fn seat(model: Option<&str>) -> TeamSeat {
+        TeamSeat {
+            team_id: "t1".into(),
+            team: "Hexa".into(),
+            role: "Dev 'one' $(x)".into(),
+            model: model.map(String::from),
+            prompt: Some("Line one\n\"quoted\" `tick`".into()),
+        }
+    }
+
+    fn line_and_env(spec: &HarnessSpec) -> (String, CommandBuilder) {
+        let cmd = harness_command("/tmp", spec, None, None, 7, 9000, Some("/bin/zsh"));
+        let line = cmd.get_argv()[2].to_string_lossy().to_string();
+        (line, cmd)
+    }
+
+    #[test]
+    fn claude_seat_passes_flags_through_env() {
+        let mut spec = HarnessSpec::claude_default();
+        spec.team = Some(seat(Some("opus")));
+        let (line, cmd) = line_and_env(&spec);
+        assert!(line.ends_with(
+            " --name \"$AGENTBENCH_TEAM_ROLE\" --model \"$AGENTBENCH_TEAM_MODEL\" --append-system-prompt \"$AGENTBENCH_TEAM_PROMPT\""
+        ), "{line}");
+        assert!(!line.contains("Dev 'one'"));
+        assert_eq!(cmd.get_env("AGENTBENCH_TEAM_ROLE").unwrap(), "Dev 'one' $(x)");
+        assert_eq!(cmd.get_env("AGENTBENCH_TEAM_MODEL").unwrap(), "opus");
+        assert_eq!(cmd.get_env("AGENTBENCH_TEAM").unwrap(), "Hexa");
+    }
+
+    #[test]
+    fn codex_seat_gets_model_only_and_plain_spec_is_untouched() {
+        let mut spec = HarnessSpec::claude_default();
+        spec.id = "codex".into();
+        spec.claude = false;
+        spec.command = "codex".into();
+        spec.team = Some(seat(Some("gpt-5")));
+        let (line, cmd) = line_and_env(&spec);
+        assert!(line.ends_with("codex -m \"$AGENTBENCH_TEAM_MODEL\""), "{line}");
+        assert!(cmd.get_env("AGENTBENCH_TEAM_PROMPT").is_none());
+
+        spec.team = None;
+        let (line, cmd) = line_and_env(&spec);
+        assert!(line.ends_with("exec codex"), "{line}");
+        assert!(cmd.get_env("AGENTBENCH_TEAM_ROLE").is_none());
+    }
+
+    #[test]
+    fn seat_parses_from_create_request() {
+        let spec = HarnessSpec::from_value(&json!({"id":"claude","command":"claude","claude":true,
+            "team":{"team_id":"t","team":"Hexa","role":"Manager","model":"opus"}})).unwrap();
+        assert_eq!(spec.team.unwrap().role, "Manager");
+        let spec = HarnessSpec::from_value(&json!({"command":"claude","team":{"team_id":"t","team":"H","role":" "}})).unwrap();
+        assert!(spec.team.is_none());
     }
 }

@@ -30,6 +30,8 @@ import {
 import Markdown from "./Markdown";
 import ToolCard from "./ToolCard";
 import { isAmbiguousSendError } from "../lib/paneSend";
+import { buildWire, imageToken } from "../lib/imageTokens";
+import { removeChatPane, reportChatActivity } from "../tasks/taskRegistry";
 
 // Older sessions can be thousands of messages; mount only the recent tail
 // and let "Show earlier" page backwards. content-visibility handles paint,
@@ -154,13 +156,22 @@ const Row = memo(
         <div className={`chat-user${msg.local ? " pending" : ""}${msg.failed ? " failed" : ""}`}>
           {msg.images?.length > 0 && (
             <div className="chat-user-images">
-              {msg.images.map((im, i) => (
-                <img key={i} className="chat-user-img" src={im.url} alt="" />
-              ))}
+              {msg.images.map((im, i) =>
+                im.n != null ? (
+                  <span key={i} className="chat-img-labelled" data-n={`#${im.n}`}>
+                    <img className="chat-user-img" src={im.url} alt={imageToken(im.n)} />
+                  </span>
+                ) : (
+                  <img key={i} className="chat-user-img" src={im.url} alt="" />
+                ),
+              )}
             </div>
           )}
           {msg.text}
           {msg.local && <span className="chat-user-spin" aria-label="sending" />}
+          {msg.queued && !msg.failed && (
+            <span className="chat-user-queued">queued · sends when the agent is free</span>
+          )}
           {msg.failed && (
             // "may not have sent": the reply was lost, not necessarily the
             // message — a resend could double-deliver, so don't overclaim
@@ -282,6 +293,9 @@ export default memo(function ChatView({
   id,
   cwd,
   mode,
+  agent = "Claude",
+  visible = true,
+  readOnly = false,
   initialLines,
   onSend,
   onStop,
@@ -308,6 +322,10 @@ export default memo(function ChatView({
   // — a phone that was asleep, or a chat opened after the fact — would never
   // learn the agent is blocked on an answer.
   pendingAsks,
+  // Report background work (sub-agents/shells) into the app-level task
+  // registry. Local desktop panes only — remote pane ids would collide with
+  // local ones in the registry.
+  trackTasks = false,
 }) {
   // Desktop: Tauri IPC. Phone: the WebSocket to the machine owning this pane.
   const { invoke, listen } = useTransport();
@@ -324,6 +342,12 @@ export default memo(function ChatView({
   const listRef = useRef(null);
   const atBottomRef = useRef(true);
   const inputRef = useRef(null);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const dirtyRef = useRef(false);
+  useEffect(() => {
+    if (visible && dirtyRef.current) { dirtyRef.current = false; forceRender(); }
+  }, [visible]);
   const rafRef = useRef(0);
   const lastRevRef = useRef(0);
   // Authoritative turn state from the UserPromptSubmit/Stop hooks; null until
@@ -358,8 +382,49 @@ export default memo(function ChatView({
   // They render inline (WYSIWYG), can be removed, and are written to temp files
   // on send so Claude gets them by path.
   const [images, setImages] = useState([]);
+  const draftOwner = useRef(crypto.randomUUID());
+  const lastDraft = useRef(null);
+  const publishDraft = (focused = document.activeElement === inputRef.current) => {
+    if (!trackTasks || readOnly) return;
+    const present = focused || !!inputRef.current?.value.trim() || images.length > 0;
+    if (lastDraft.current === present) return;
+    lastDraft.current = present;
+    invoke("resource_draft", { id, owner: draftOwner.current, present }).catch(() => {});
+  };
+  useEffect(() => { publishDraft(); }, [images]);
+  useEffect(() => () => {
+    if (trackTasks && !readOnly) invoke("resource_draft", { id, owner: draftOwner.current, present: false }).catch(() => {});
+  }, [id, trackTasks, readOnly]);
+
   const [dragOver, setDragOver] = useState(false);
   const imgKeyRef = useRef(0);
+  // Staging an image drops its "[Image #N]" token at the cursor, like Claude
+  // Code's composer, so the message can say which image it means. Numbers
+  // restart once the tray is empty.
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  const stageImage = (url, name) => {
+    const n = imagesRef.current.reduce((max, im) => Math.max(max, im.n), 0) + 1;
+    const next = [...imagesRef.current, { key: `img${imgKeyRef.current++}`, url, name, n }];
+    imagesRef.current = next; // several files in one drop stage back-to-back
+    setImages(next);
+    const el = inputRef.current;
+    if (!el) return;
+    const tok = imageToken(n);
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? start;
+    const before = el.value.slice(0, start);
+    const after = el.value.slice(end);
+    const lead = before && !/\s$/.test(before) ? " " : "";
+    const trail = /^\s/.test(after) ? "" : " ";
+    el.value = before + lead + tok + trail + after;
+    const caret = (before + lead + tok + trail).length;
+    el.setSelectionRange(caret, caret);
+    el.style.height = "";
+    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  };
+  const stageImageRef = useRef(stageImage);
+  stageImageRef.current = stageImage;
   const fileInputRef = useRef(null);
   const commandsRef = useRef(null); // merged builtin + custom, fetched once
 
@@ -414,6 +479,7 @@ export default memo(function ChatView({
 
   const loadCommands = () => {
     if (commandsRef.current) return;
+    if (agent === "Codex") { commandsRef.current = []; return; }
     commandsRef.current = BUILTIN_COMMANDS;
     invoke("list_slash_commands", { project: cwd ?? "" })
       .then((custom) => {
@@ -428,7 +494,7 @@ export default memo(function ChatView({
 
   const cmdMatches =
     cmdQuery != null
-      ? (commandsRef.current ?? BUILTIN_COMMANDS)
+      ? (commandsRef.current ?? (agent === "Codex" ? [] : BUILTIN_COMMANDS))
           .filter((c) => c.name.toLowerCase().startsWith(cmdQuery.toLowerCase()))
           // no terminal behind a headless pane — hide dialog-only commands,
           // except the ones the chat view re-implements itself
@@ -469,6 +535,11 @@ export default memo(function ChatView({
 
   // events arrive per token in stream mode — coalesce renders per frame
   const bump = () => {
+    if (!visibleRef.current) {
+      dirtyRef.current = true;
+      if (trackTasks) reportChatActivity(id, cwd, storeRef.current.activity);
+      return;
+    }
     if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = 0;
@@ -610,14 +681,10 @@ export default memo(function ChatView({
 
   useEffect(() => {
     register?.({
-      focus: () => inputRef.current?.focus(),
+      focus: () => readOnly ? listRef.current?.focus() : inputRef.current?.focus(),
       // OS file drops arrive through Tauri's native drag-drop (the webview
       // never sees HTML5 file drops), so the pane pushes them in here.
-      addImage: (img) =>
-        setImages((imgs) => [
-          ...imgs,
-          { key: `img${imgKeyRef.current++}`, url: img.url, name: img.name || "image" },
-        ]),
+      addImage: (img) => stageImageRef.current(img.url, img.name || "image"),
       insertText: (t) => {
         const el = inputRef.current;
         if (!el) return;
@@ -661,11 +728,27 @@ export default memo(function ChatView({
         }
         bump();
       });
+    // The desktop's onSend can't reject (write_pane is fire-and-forget) and
+    // the re-Enter guard gives up silently — without this, an echo nothing
+    // ever confirmed just spins forever, indistinguishable from "sent". If
+    // nothing has confirmed it after 10s, surface the doubt: the message may
+    // have landed (so the wording stays "may not have sent"), but the user
+    // must see that delivery is unproven and get the resend affordance.
+    if (echo) {
+      setTimeout(() => {
+        if (!echo.local || echo.failed) return; // confirmed or already failed
+        echo.ambiguous = true;
+        echo.sendError ??= "no confirmation from the agent";
+        markSendFailed(storeRef.current, echo);
+        bump();
+      }, 10000);
+    }
   };
   // Stable identity so the memoized Row (which only re-renders on msg/rev)
   // never holds a stale closure.
   const retryFnRef = useRef(null);
   retryFnRef.current = (msg) => {
+    if (readOnly) return;
     retrySend(storeRef.current, msg);
     if (workingRef.current) queuedRef.current = true;
     sendWire(msg.wire ?? msg.text, msg);
@@ -729,6 +812,7 @@ export default memo(function ChatView({
   };
 
   const submit = async () => {
+    if (readOnly) return;
     const el = inputRef.current;
     // Sending ends any phrase in flight. Without this the recognizer's last
     // result lands after the box is cleared and types the sent message
@@ -737,7 +821,7 @@ export default memo(function ChatView({
     dictation.cancel();
     dictBaseRef.current = "";
     const text = el?.value.trim() ?? "";
-    const imgs = images;
+    const imgs = imagesRef.current;
     if (!text && imgs.length === 0) return;
 
     // Persist staged images to temp files up front — Claude ingests them by
@@ -757,6 +841,7 @@ export default memo(function ChatView({
     el.value = "";
     el.style.height = "";
     setCmdQuery(null);
+    imagesRef.current = [];
     setImages([]);
 
     const parts = text.startsWith("/") ? text.slice(1).split(/\s+/) : null;
@@ -771,7 +856,7 @@ export default memo(function ChatView({
         onResume();
         return;
       }
-      if (tok === "model") {
+      if (tok === "model" && agent !== "Codex") {
         if (!arg) {
           setModelMenuOpen(true);
           return;
@@ -799,26 +884,27 @@ export default memo(function ChatView({
     // render in the terminal — flip to Term view so the dialog is visible.
     // With an argument, /model and /resume apply directly: no flip.
     const opensDialog =
-      tok != null && TUI_COMMANDS.has(tok) && !(arg && ARG_DIRECT.has(tok));
-    // Wire text: image paths first (temp names never contain spaces, so no
-    // quoting needed), then the user's message. Claude Code loads images
-    // referenced by path.
+      tok != null && (agent === "Codex" || (TUI_COMMANDS.has(tok) && !(arg && ARG_DIRECT.has(tok))));
+    // Wire text: each [Image #N] token becomes its image's temp path (names
+    // never contain spaces, so no quoting); untokened images lead. The pty
+    // paste sends each path on its own so Claude attaches it in place.
     const wire = paths.length
-      ? [...paths, text].filter(Boolean).join(" ")
+      ? buildWire(text, imgs.map((im, i) => ({ n: im.n, path: paths[i] })))
       : text;
     let echo = null;
     if (!opensDialog) {
-      echo = addLocalUser(store, text, imgs.map((im) => ({ url: im.url })));
+      echo = addLocalUser(store, text, imgs.map((im) => ({ url: im.url, n: im.n })));
       echo.wire = wire; // what a retry must resend (paths included)
     }
     // Sending into a live turn means the TUI queues this message — remember
     // that, so a later stop knows to push it through rather than drop it.
     if (workingRef.current) queuedRef.current = true;
+    if (agent === "Codex") store.turnActive = true;
     setTurnActive(true); // don't wait on the hook to offer a stop button
     sendWire(wire, echo);
     if (opensDialog && mode === "transcript") onNeedsTerm?.();
     // plain messages only — see armSubmitGuard on why commands are exempt
-    if (mode === "transcript" && !tok && !workingRef.current) armSubmitGuard();
+    if (agent !== "Codex" && mode === "transcript" && !tok && !workingRef.current) armSubmitGuard();
     atBottomRef.current = true;
     bump();
   };
@@ -826,7 +912,7 @@ export default memo(function ChatView({
   // One funnel for every stop affordance, so the queued-message flag is
   // consumed exactly once and a second stop can't fire a stray Enter.
   const stop = () => {
-    const resubmit = queuedRef.current;
+    const resubmit = agent !== "Codex" && queuedRef.current;
     queuedRef.current = false;
     onStop?.(resubmit);
   };
@@ -836,20 +922,19 @@ export default memo(function ChatView({
   const addImageFile = (file) => {
     if (!file || !file.type.startsWith("image/")) return;
     const reader = new FileReader();
-    reader.onload = () =>
-      setImages((imgs) => [
-        ...imgs,
-        {
-          key: `img${imgKeyRef.current++}`,
-          url: String(reader.result),
-          name: file.name || "pasted image",
-        },
-      ]);
+    reader.onload = () => stageImage(String(reader.result), file.name || "pasted image");
     reader.readAsDataURL(file);
   };
 
-  const removeImage = (key) =>
-    setImages((imgs) => imgs.filter((i) => i.key !== key));
+  // Dropping an image takes its token out of the text too.
+  const removeImage = (key) => {
+    const gone = imagesRef.current.find((i) => i.key === key);
+    const next = imagesRef.current.filter((i) => i.key !== key);
+    imagesRef.current = next;
+    setImages(next);
+    const el = inputRef.current;
+    if (gone && el) el.value = el.value.replace(` ${imageToken(gone.n)}`, "").replace(imageToken(gone.n), "");
+  };
 
   // Capture pasted images into the composer instead of the OS clipboard round
   // trip. If the clipboard also has text, let that paste normally; only
@@ -880,13 +965,24 @@ export default memo(function ChatView({
   // session reported it's actually on (init message / assistant replies).
   const activeModel = model ?? pickerIdFor(store.model);
   const hiddenCount = Math.max(0, store.messages.length - tailCap);
-  const visible = hiddenCount ? store.messages.slice(hiddenCount) : store.messages;
-  const groups = groupMessages(visible);
+  const visibleMessages = hiddenCount ? store.messages.slice(hiddenCount) : store.messages;
+  const groups = groupMessages(visibleMessages);
 
   // Live background work: sub-agents and background shells still running.
   const activity = [...store.activity.values()].filter((a) => !a.done);
   const runningAgents = activity.filter((a) => a.kind === "agent");
   const runningShells = activity.filter((a) => a.kind === "shell");
+
+  // Mirror this pane's activity into the app-level registry (Background
+  // Tasks rail). Runs after every render; the registry diffs and only
+  // notifies when something actually started or finished.
+  useEffect(() => {
+    if (trackTasks) reportChatActivity(id, cwd, store.activity);
+  });
+  useEffect(() => {
+    if (!trackTasks) return;
+    return () => removeChatPane(id);
+  }, [id, trackTasks]);
 
   // Jump to (and flash) the tool card an activity chip points at; page the
   // tail cap out first if the card is behind "Show earlier".
@@ -924,7 +1020,7 @@ export default memo(function ChatView({
         (last.kind === "tool" && !last.tool.done) ||
         last.role === "user"));
   // The hooks bracket the turn exactly; trust them once they've reported.
-  const working = turnActive ?? looksWorking;
+  const working = !readOnly && ((agent === "Codex" ? store.turnActive : turnActive) ?? looksWorking);
   workingRef.current = working;
 
   // nothing to show yet: the list becomes a centered welcome panel instead
@@ -953,7 +1049,7 @@ export default memo(function ChatView({
         if (ev.key === "Escape" && working) stop();
       }}
     >
-      <div className="chat-list" ref={listRef} onScroll={onScroll}>
+      <div className="chat-list" ref={listRef} onScroll={onScroll} tabIndex={readOnly ? -1 : undefined}>
         <div className={`chat-col${empty ? " empty" : ""}`}>
           <ChatErrorBoundary>
           {watchError && (
@@ -1011,7 +1107,7 @@ export default memo(function ChatView({
                       tool={m.tool}
                       rev={m.rev}
                       paneId={id}
-                      canAnswer={mode === "transcript"}
+                      canAnswer={!readOnly && mode === "transcript"}
                     />
                   </div>
                 ))}
@@ -1028,7 +1124,7 @@ export default memo(function ChatView({
           </ChatErrorBoundary>
         </div>
       </div>
-      <div className="chat-composer">
+      <div className="chat-composer" style={readOnly ? {display:"none"} : undefined}>
         {activity.length > 0 && (
           <div className="chat-activity">
             <button
@@ -1116,7 +1212,7 @@ export default memo(function ChatView({
           {images.length > 0 && (
             <div className="chat-img-tray">
               {images.map((im) => (
-                <div key={im.key} className="chat-img-thumb" title={im.name}>
+                <div key={im.key} className="chat-img-thumb" title={`${imageToken(im.n)} ${im.name}`} data-n={`#${im.n}`}>
                   <img src={im.url} alt={im.name} />
                   <button
                     className="chat-img-remove"
@@ -1140,8 +1236,8 @@ export default memo(function ChatView({
             placeholder={
               placeholder ??
               (mode === "transcript"
-                ? "Message Claude…  ( / for commands · paste or drop an image )"
-                : "Message Claude…  ( / for commands )")
+                ? `Message ${agent}…  ( / for commands · paste or drop an image )`
+                : `Message ${agent}…  ( / for commands )`)
             }
             onPaste={onPaste}
             onKeyDown={(ev) => {
@@ -1213,13 +1309,16 @@ export default memo(function ChatView({
                 dictation.stop();
               }
             }}
+            onFocus={() => publishDraft(true)}
             onBlur={() => {
+              publishDraft(false);
               // A held chord can't deliver its keyup once focus is gone, so
               // the mic would stay open forever; drop the phrase. A tapped
               // session is deliberate and survives clicking away.
               if (dictHoldRef.current && dictation.listening) dictation.cancel();
             }}
             onInput={(ev) => {
+              publishDraft();
               const el = ev.currentTarget;
               el.style.height = "";
               el.style.height = Math.min(el.scrollHeight, 160) + "px";
@@ -1244,7 +1343,7 @@ export default memo(function ChatView({
                       ? "tap send"
                       : "enter to send"}
             </span>
-            <div className="chat-model-wrap">
+            {agent !== "Codex" && <div className="chat-model-wrap">
               {modelMenuOpen && (
                 <div
                   className="chat-model-menu"
@@ -1283,7 +1382,7 @@ export default memo(function ChatView({
                   "Model"}
                 <CaretUp size={8} weight="bold" />
               </button>
-            </div>
+            </div>}
             {allowImages && (
               <>
                 <input

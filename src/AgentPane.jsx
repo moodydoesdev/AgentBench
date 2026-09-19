@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import usePaneDrag from "./usePaneDrag";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { homeDir, join } from "@tauri-apps/api/path";
@@ -16,9 +17,14 @@ import {
   ArrowClockwise,
   Minus,
   Play,
+  Moon,
+  PushPin,
 } from "@phosphor-icons/react";
 import ChatView from "./chat/ChatView";
+import { formatBytes } from "./lib/resourceFormat";
+import { createOutputBatcher } from "./lib/terminalOutput";
 import { pasteAndSubmit } from "./lib/ptyPaste";
+import { isTerminalReport } from "./lib/terminalReports";
 import "@xterm/xterm/css/xterm.css";
 import "@wterm/dom/css";
 
@@ -140,7 +146,9 @@ const IS_WINDOWS = navigator.userAgent.includes("Windows");
 const FILE_PATH_RE =
   /(?:~|\.{1,2})?[\w.@%+-]*(?:\/[\w.@%+-]*[\w@%+-])+(?::\d+(?::\d+)?)?/;
 
-function XtermInner({
+// Also mounted by TerminalDock — dock tabs are the same terminal, minus the
+// grid chrome.
+export function XtermInner({
   id,
   cwd,
   initialData,
@@ -149,7 +157,20 @@ function XtermInner({
   onTitle,
   termTheme,
   copyOnSelect = true,
+  visible = true,
+  scrollback = 2000,
 }) {
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const outputRef = useRef(null);
+  const gpuToggleRef = useRef(null);
+  useEffect(() => {
+    gpuToggleRef.current?.(visible);
+    if (visible) outputRef.current?.flush();
+  }, [visible]);
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.scrollback = Math.max(500, Math.min(8000, scrollback));
+  }, [scrollback]);
   const containerRef = useRef(null);
   const termRef = useRef(null);
   const termThemeRef = useRef(termTheme);
@@ -175,7 +196,7 @@ function XtermInner({
       allowTransparency: true,
       cursorBlink: true,
       cursorInactiveStyle: "none",
-      scrollback: 8000,
+      scrollback: Math.max(500, Math.min(8000, scrollback)),
       macOptionIsMeta: true,
     });
     const fit = new FitAddon();
@@ -306,6 +327,26 @@ function XtermInner({
     // keydown with stopPropagation), so no custom key handler is needed here.
     term.open(containerRef.current);
 
+    // GPU renderer — must load after open(). Without it xterm falls back to
+    // its DOM renderer (blurry subpixel snapping, slow TUI repaints). On
+    // context loss (driver reset, too many live contexts) dispose and let
+    // xterm fall back to the DOM renderer on its own.
+    let webgl = null;
+    gpuToggleRef.current = (shown) => {
+      term.options.cursorBlink = shown;
+      if (!shown) { webgl?.dispose(); webgl = null; return; }
+      if (webgl) return;
+      try {
+        const addon = new WebglAddon();
+        addon.onContextLoss(() => { addon.dispose(); if (webgl === addon) webgl = null; });
+        term.loadAddon(addon);
+        webgl = addon;
+      } catch { /* DOM renderer remains available */ }
+    };
+    gpuToggleRef.current(visibleRef.current);
+    const output = createOutputBatcher((bytes) => term.write(bytes), () => visibleRef.current);
+    outputRef.current = output;
+
     // Size the grid before replaying scrollback — otherwise initialData
     // reflows at xterm's default 80x24 and restores garbled.
     try {
@@ -394,7 +435,7 @@ function XtermInner({
     ro.observe(containerRef.current);
 
     const unlisten = listen("pane-output", (e) => {
-      if (e.payload.id === id) term.write(b64ToBytes(e.payload.data));
+      if (e.payload.id === id) output.push(b64ToBytes(e.payload.data));
     });
 
     register({ focus: () => term.focus(), write: (d) => term.write(d) });
@@ -407,6 +448,9 @@ function XtermInner({
       ro.disconnect();
       containerEl.removeEventListener("contextmenu", onCtxMenu, true);
       unlisten.then((f) => f());
+      output.dispose();
+      outputRef.current = null;
+      gpuToggleRef.current = null;
       termRef.current = null;
       term.dispose();
     };
@@ -426,11 +470,16 @@ function WtermInner({
   id,
   ghostty,
   focused,
+  visible = true,
   initialData,
   register,
   sendData,
   onTitle,
 }) {
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const outputRef = useRef(null);
+  useEffect(() => { if (visible) outputRef.current?.flush(); }, [visible]);
   const [core, setCore] = useState(null);
   const termRef = useRef(null);
   const readyRef = useRef(false);
@@ -472,7 +521,9 @@ function WtermInner({
       if (readyRef.current && termRef.current) termRef.current.write(bytes);
       else queueRef.current.push(bytes);
     };
-    const filter = createSyncFilter(write);
+    const output = createOutputBatcher(write, () => visibleRef.current);
+    outputRef.current = output;
+    const filter = createSyncFilter((bytes) => output.push(bytes));
 
     const scanFocusMode = (bytes) => {
       let s = scanTailRef.current;
@@ -497,7 +548,7 @@ function WtermInner({
         filter(bytes);
       }
     });
-    return () => unlisten.then((f) => f());
+    return () => { output.dispose(); outputRef.current = null; unlisten.then((f) => f()); };
   }, [id]);
 
   // wterm swallows Ctrl+V and waits for a browser paste event that macOS
@@ -551,7 +602,6 @@ function WtermInner({
   );
 }
 
-const MAX_ROW_SPAN = 4;
 
 export default memo(function AgentPane({
   id,
@@ -559,6 +609,16 @@ export default memo(function AgentPane({
   cwd,
   kind, // "run" = project run-command pane; "chat" = headless Claude; undefined = agent pane
   sigintGuard = false, // swallow rapid repeat Ctrl+C (Claude panes only)
+  visible = true,
+  scrollback = 2000,
+  hibernated = false,
+  team, // saved team name when this agent was started as part of one
+  teamTabs, // focus-layout team: [{id, role, status}] for every member sharing this cell
+  onTeamTab,
+  resource,
+  resourceBusy,
+  onResourceAction,
+  codex = false,
   claude = false, // Claude harness — enables the Term ⇄ Chat view toggle
   view = "term", // "term" | "chat" (read-along transcript view)
   onViewChange,
@@ -593,31 +653,23 @@ export default memo(function AgentPane({
   const { dragging, onHeadPointerDown } = usePaneDrag(sectionRef, id, onReorder);
 
   const w = Math.min(size?.w ?? 1, gridCols);
-  const h = Math.min(size?.h ?? 1, MAX_ROW_SPAN);
+  // Every pane occupies one equal-height workspace row, including saved layouts.
+  const h = 1;
 
-  // Drag a grip: snap spans to grid cells based on drag distance. Rows are
-  // fluid (1fr stretches to fill the viewport), so absolute-position math
-  // can put the next row boundary offscreen — deltas keep it reachable.
-  const startResize = (ev, dirs) => {
+  // Horizontal resizing keeps every pane in a single equal-height row.
+  const startResize = (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
     const grip = ev.currentTarget;
     const grid = sectionRef.current.parentElement;
     const cellW = grid.clientWidth / gridCols;
-    const ROW_UNIT = 340; // matches grid-auto-rows min in styles.css
     const x0 = ev.clientX;
-    const y0 = ev.clientY;
     const w0 = w;
-    const h0 = h;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
     const onMove = (e) => {
       onResize(id, {
-        w: dirs.includes("e")
-          ? clamp(w0 + Math.round((e.clientX - x0) / cellW), 1, gridCols)
-          : w0,
-        h: dirs.includes("s")
-          ? clamp(h0 + Math.round((e.clientY - y0) / ROW_UNIT), 1, MAX_ROW_SPAN)
-          : h0,
+        w: clamp(w0 + Math.round((e.clientX - x0) / cellW), 1, gridCols),
+        h: 1,
       });
     };
     const onUp = (e) => {
@@ -637,8 +689,7 @@ export default memo(function AgentPane({
     grip.addEventListener("pointermove", onMove);
     grip.addEventListener("pointerup", onUp);
     grip.addEventListener("pointercancel", onUp);
-    document.body.style.cursor =
-      dirs === "se" ? "nwse-resize" : dirs === "e" ? "col-resize" : "row-resize";
+    document.body.style.cursor = "col-resize";
   };
 
   // 1× → half → full width, then back around.
@@ -656,7 +707,8 @@ export default memo(function AgentPane({
       if (now - lastSigintRef.current < SIGINT_GUARD_MS) return;
       lastSigintRef.current = now;
     }
-    callbacksRef.current.onActivity(id);
+    // a blurred terminal's focus-out report must not re-focus this pane
+    if (!isTerminalReport(data)) callbacksRef.current.onActivity(id);
     invoke("write_pane", { id, data }).catch(() => {});
   };
 
@@ -785,9 +837,16 @@ export default memo(function AgentPane({
   const Inner = isWterm ? WtermInner : XtermInner;
   const isRun = kind === "run";
   const isChat = kind === "chat"; // headless — no pty, no terminal view
-  const showToggle = claude && !isRun && !isChat;
-  const chatVisible = isChat || (showToggle && view === "chat");
+  const showToggle = (claude || codex) && !isRun && !isChat && !hibernated;
+  const chatVisible = hibernated || isChat || (showToggle && view === "chat");
   chatVisibleRef.current = chatVisible;
+  useEffect(() => {
+    if (!focused) return;
+    const frame = requestAnimationFrame(() => {
+      (chatVisible ? chatHandleRef.current : termHandleRef.current)?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [chatVisible, focused]);
   // once opened, chat stays mounted (hidden) across toggles — unmounting
   // would drop its store, losing pending echoes and scroll position
   const chatOpenedRef = useRef(false);
@@ -838,11 +897,43 @@ export default memo(function AgentPane({
           }
           title={AGENT_COLORS[agentColor] ? `/color ${agentColor}` : undefined}
         />
-        <span className="pane-title" title={name}>
-          {isRun && <Play size={10} weight="fill" className="pane-run-glyph" />}
-          {name}
-        </span>
-        <span className="pane-status">{STATUS_LABEL[status]}</span>
+        {teamTabs ? (
+          <div className="pane-team-tabs" role="tablist">
+            {teamTabs.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={t.id === id}
+                className={`pane-team-tab${t.id === id ? " active" : ""} status-${t.status}`}
+                title={t.role}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (t.id !== id) onTeamTab?.(t.id);
+                }}
+              >
+                {t.id !== id && <span className={`dot ${t.status}`} />}
+                {t.role}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <span className="pane-title" title={name}>
+            {isRun && <Play size={10} weight="fill" className="pane-run-glyph" />}
+            {name}
+          </span>
+        )}
+        {team && <span className="pane-team" title={`Team: ${team}`}>{team}</span>}
+        <span className="pane-status">{hibernated ? "hibernated" : STATUS_LABEL[status]}</span>
+        {resource && !hibernated && <span className="pane-resource" title={`${resource.processes} processes · resident RAM; CPU is whole-machine share`}>
+          {formatBytes(resource.resident_bytes)} · {(resource.cpu_percent ?? 0).toFixed(1)}%
+        </span>}
+        {resource && <button className={`pane-size${resource.pinned ? " pinned" : ""}`} title={resource.pinned ? "Unpin agent" : "Pin agent — keep alive"}
+          aria-label="Keep agent alive" aria-pressed={!!resource.pinned} disabled={!!resourceBusy}
+          onClick={(e) => { e.stopPropagation(); onResourceAction?.("pin", !resource.pinned); }}><PushPin size={14}/></button>}
+        {resource && !hibernated && <button className="pane-size" title={resource.reason || "Hibernate agent — save session and stop its processes"}
+          aria-label="Hibernate agent" disabled={!resource.eligible || !!resourceBusy}
+          onClick={(e) => { e.stopPropagation(); onResourceAction?.("hibernate"); }}><Moon size={14}/></button>}
         <span className="pane-cwd" title={command ?? cwd}>
           {command ?? cwd}
         </span>
@@ -870,10 +961,15 @@ export default memo(function AgentPane({
             </button>
           </div>
         )}
-        {isRun && status === "exited" && (
+        {onRestart && (
           <button
             className="pane-size"
-            title="Restart command"
+            aria-label={isRun ? "Restart command" : "Restart agent"}
+            title={!isRun ? "Restart agent — starts a fresh session" :
+              status === "exited"
+                ? "Restart command"
+                : "Restart command — kills the process and relaunches it"
+            }
             onClick={(ev) => {
               ev.stopPropagation();
               onRestart?.();
@@ -915,11 +1011,19 @@ export default memo(function AgentPane({
           <X size={13} weight="bold" />
         </button>
       </header>
-      {isChat ? (
+      {hibernated ? (
+        <>
+          <div className="pane-sleep-banner"><span>{resource?.can_resume === false ? "Session saved · recovery needs attention" : "Session saved · agent hibernated"}</span>
+            <button className="btn-sm" disabled={!!resourceBusy || resource?.can_resume === false} title={resource?.reason || undefined}
+              onClick={() => onResourceAction?.("resume")}>{resourceBusy || "Resume agent"}</button></div>
+          <ChatView key={`sleep-${id}`} id={id} cwd={cwd} mode="transcript" readOnly visible={visible}/>
+        </>
+      ) : isChat ? (
         <ChatView
           id={id}
           cwd={cwd}
           mode="stream"
+          visible={visible}
           initialLines={initialLines}
           onSend={sendChatToStream}
           onStop={(resubmit) =>
@@ -933,6 +1037,7 @@ export default memo(function AgentPane({
           allowImages
           status={status}
           register={registerChat}
+          trackTasks
         />
       ) : (
         <>
@@ -944,6 +1049,8 @@ export default memo(function AgentPane({
               id={id}
               cwd={cwd}
               ghostty={engine === "wterm-ghostty"}
+              visible={visible && !chatVisible}
+              scrollback={scrollback}
               focused={focused}
               termTheme={termTheme}
               copyOnSelect={copyOnSelect}
@@ -959,6 +1066,8 @@ export default memo(function AgentPane({
                 id={id}
                 cwd={cwd}
                 mode="transcript"
+                agent={codex ? "Codex" : "Claude"}
+                visible={visible && chatVisible}
                 onSend={sendChatToPty}
                 onStop={(resubmit) =>
             invoke("interrupt_pane", { id, resubmit: !!resubmit }).catch((err) =>
@@ -966,9 +1075,10 @@ export default memo(function AgentPane({
             )
           }
                 onNeedsTerm={() => onViewChange?.(id, "term")}
-                onResume={onResumeRequest}
+                onResume={codex ? undefined : onResumeRequest}
                 status={status}
                 register={registerChat}
+                trackTasks
               />
             </div>
           )}
@@ -977,19 +1087,7 @@ export default memo(function AgentPane({
       <div
         className="pane-grip e"
         title="Drag to resize · double-click to reset"
-        onPointerDown={(ev) => startResize(ev, "e")}
-        onDoubleClick={() => onResize(id, { w: 1, h: 1 })}
-      />
-      <div
-        className="pane-grip s"
-        title="Drag to resize · double-click to reset"
-        onPointerDown={(ev) => startResize(ev, "s")}
-        onDoubleClick={() => onResize(id, { w: 1, h: 1 })}
-      />
-      <div
-        className="pane-grip se"
-        title="Drag to resize · double-click to reset"
-        onPointerDown={(ev) => startResize(ev, "se")}
+        onPointerDown={startResize}
         onDoubleClick={() => onResize(id, { w: 1, h: 1 })}
       />
     </section>

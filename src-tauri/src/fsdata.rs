@@ -77,6 +77,40 @@ pub fn list_plans(project: &str) -> Value {
     json!(out)
 }
 
+fn teams_file(project: &str) -> PathBuf {
+    Path::new(project).join(".agentbench").join("teams.json")
+}
+
+/// A project's saved agent teams (.agentbench/teams.json). A missing file is
+/// an empty list; an unreadable one is an error, so a save can never clobber
+/// a file the user is hand-editing.
+pub fn read_teams(project: &str) -> Result<Value, String> {
+    let path = teams_file(project);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({ "version": 1, "teams": [] }))
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Replace the teams file. Written to a temp file and renamed so a crash
+/// mid-write leaves the old file intact — this file is meant to be committed.
+pub fn write_teams(project: &str, teams: &Value) -> Result<(), String> {
+    if !Path::new(project).is_dir() {
+        return Err(format!("{project} is not a folder"));
+    }
+    let path = teams_file(project);
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut text = serde_json::to_string_pretty(teams).map_err(|e| e.to_string())?;
+    text.push('\n');
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
 /// description: from SKILL.md / command frontmatter, first match wins
 fn frontmatter_desc(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -700,4 +734,24 @@ pub fn search_sessions(project: &str, query: &str) -> Vec<Value> {
     out.sort_by(|a, b| b.0.cmp(&a.0));
     out.truncate(60);
     out.into_iter().map(|(_, v)| v).collect()
+}
+
+#[cfg(test)]
+mod teams_tests {
+    use super::*;
+
+    #[test]
+    fn teams_round_trip_and_bad_file() {
+        let dir = std::env::temp_dir().join(format!("ab-teams-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.to_str().unwrap();
+        assert_eq!(read_teams(project).unwrap()["teams"], json!([]));
+        let v = json!({"version":1,"teams":[{"name":"Hexa","agents":[{"role":"Manager"}]}]});
+        write_teams(project, &v).unwrap();
+        assert_eq!(read_teams(project).unwrap(), v);
+        std::fs::write(teams_file(project), "{oops").unwrap();
+        assert!(read_teams(project).is_err());
+        assert!(write_teams(dir.join("missing").to_str().unwrap(), &v).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

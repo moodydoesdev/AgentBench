@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -11,6 +11,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import AgentPane from "./AgentPane";
+import ResourcePanel from "./resources/ResourcePanel";
 import RemotePane from "./RemotePane";
 import RemotePreviewPopover from "./RemotePreviewPopover";
 import { groupPanes, loadGateways, saveGateways, useFleet } from "./lib/fleet";
@@ -37,7 +38,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
-import { Bell, CalendarCheck, CaretDown, GearSix, Play, Plus, FileText, Tray, X } from "@phosphor-icons/react";
+import { Cpu, Bell, CalendarCheck, CaretDown, GearSix, Play, Plus, FileText, Pulse, TerminalWindow, Tray, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
 import {
   DropdownMenu,
@@ -47,13 +48,20 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import RunCommandsDialog from "./RunCommandsDialog";
+import TeamsDialog from "./teams/TeamsDialog";
+import { missingSeats, normalizeTeams, seatFor } from "./teams/teams";
 import SessionsDialog from "./SessionsDialog";
 import SchedulesDialog from "./SchedulesDialog";
+import TerminalDock from "./dock/TerminalDock";
+import TaskRail from "./tasks/TaskRail";
+import { setSchedules as feedTaskSchedules, setTaskResources, useTasks } from "./tasks/taskRegistry";
 import notifyWav from "./assets/notify.wav";
 import Logo, { LogoMark } from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
 import PlanComposer from "./PlanComposer";
 import { matchesHotkey } from "./lib/hotkey";
+import { applyUiScale, resolveUiScale, SCALE_STEPS } from "./lib/uiScale";
+import { autoCols, packSpans, resetPaneWidths } from "./lib/gridLayout";
 import { pasteAndSubmit } from "./lib/ptyPaste";
 import { THEMES } from "./themes";
 
@@ -80,6 +88,12 @@ function loadJSON(key, fallback) {
   } catch {
     return fallback;
   }
+}
+
+// A harness spec carrying a team seat (see src/teams/teams.js seatFor); the
+// broker turns the seat into --name/--model/--append-system-prompt.
+function withSeat(harness, seat) {
+  return seat ? { ...harness, team: seat } : harness;
 }
 
 function baseName(path) {
@@ -117,6 +131,9 @@ export default function App() {
   ); // id -> "term" | "chat" (Claude panes' read-along toggle)
   const [chatLines, setChatLines] = useState({}); // id -> replayed stream-json lines
   const [settings, setSettings] = useState(loadSettings);
+  useEffect(() => {
+    if (loadSettings().cols) setPaneSizes((sizes) => resetPaneWidths(sizes));
+  }, []);
   const [focusedId, setFocusedId] = useState(null);
   const [renaming, setRenaming] = useState(null); // project path being renamed
   const [showPlans, setShowPlans] = useState(
@@ -132,9 +149,32 @@ export default function App() {
   // Persisted so finished work survives an app restart.
   const [inbox, setInbox] = useState(() => loadJSON("agentbench.inbox", []));
   const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
+  const [teamsDialog, setTeamsDialog] = useState(null); // project path whose teams are being edited
+  const [projectTeams, setProjectTeams] = useState({}); // project path → saved teams (.agentbench/teams.json)
   const [sessionsOpen, setSessionsOpen] = useState(false); // resume-session picker
   const [schedulesOpen, setSchedulesOpen] = useState(false); // scheduled prompts
+  // Terminal dock: tabbed plain shells along the bottom, per project —
+  // shells stop burning grid cells. Dock panes are ordinary broker panes
+  // (harness "terminal") carrying a `dock: true` flag that routes them out
+  // of the grid.
+  const [dockOpen, setDockOpen] = useState(
+    () => localStorage.getItem("agentbench.dockOpen") === "true",
+  );
+  const [dockHeight, setDockHeight] = useState(
+    () => Number(localStorage.getItem("agentbench.dockHeight")) || 260,
+  );
+  const [dockExpanded, setDockExpanded] = useState(false);
+  const [dockTabs, setDockTabs] = useState(() =>
+    loadJSON("agentbench.dockTabs", {}),
+  ); // projectPath -> active dock pane id
+  const [tasksOpen, setTasksOpen] = useState(
+    () => localStorage.getItem("agentbench.showTasks") === "true",
+  ); // background-tasks rail
   const renameInputRef = useRef(null);
+
+  // App-level background work (sub-agents, background shells, scheduled
+  // runs) for the topbar badge + tasks rail.
+  const { running: runningTasks } = useTasks();
 
   // Linked benches: other AgentBench installs this machine holds tokens for.
   // Same storage and fleet hook as the phone shell — the sidebar below the
@@ -256,6 +296,35 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("agentbench.paneViews", JSON.stringify(paneViews));
   }, [paneViews]);
+
+  const savedDockIds = useRef(new Set(loadJSON("agentbench.dockPanes", [])));
+
+  // Dock persistence. Membership is a plain id list — pane ids are stable
+  // for the life of a broker run (the broker outlives frontend reloads), so
+  // dock tabs survive an app relaunch; after a broker restart the saved-pane
+  // restore path re-docks terminal-harness panes instead.
+  useEffect(() => {
+    localStorage.setItem(
+      "agentbench.dockPanes",
+      JSON.stringify(panes.filter((p) => p.dock).map((p) => p.id)),
+    );
+  }, [panes]);
+  useEffect(() => {
+    localStorage.setItem("agentbench.dockOpen", String(dockOpen));
+  }, [dockOpen]);
+  useEffect(() => {
+    localStorage.setItem("agentbench.dockHeight", String(dockHeight));
+  }, [dockHeight]);
+  useEffect(() => {
+    localStorage.setItem("agentbench.dockTabs", JSON.stringify(dockTabs));
+  }, [dockTabs]);
+  useEffect(() => {
+    localStorage.setItem("agentbench.showTasks", String(tasksOpen));
+  }, [tasksOpen]);
+  const dockOpenRef = useRef(dockOpen);
+  dockOpenRef.current = dockOpen;
+  const dockTabsRef = useRef(dockTabs);
+  dockTabsRef.current = dockTabs;
 
   const setPaneView = (id, view) =>
     setPaneViews((v) => (v[id] === view ? v : { ...v, [id]: view }));
@@ -401,6 +470,9 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        // dock membership from the previous frontend run (same broker, so
+        // pane ids still match)
+        const dockIds = savedDockIds.current;
         const live = await invoke("list_panes");
         if (live.length) {
           setInitialData(Object.fromEntries(live.map((p) => [p.id, p.buffer])));
@@ -424,6 +496,7 @@ export default function App() {
                     projectPath: p.cwd,
                     label: p.harness.slice(4) || "run",
                     kind: "run",
+                    dock: true,
                   }
                 : p.kind === "chat"
                   ? {
@@ -431,16 +504,22 @@ export default function App() {
                       projectPath: p.cwd,
                       label: `Claude Chat ${p.id}`,
                       kind: "chat",
+                      hibernated: !!p.hibernated,
                     }
                   : {
                       id: p.id,
                       projectPath: p.cwd,
-                      label: `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
+                      label: p.team?.role ?? `${getHarness(settingsRef.current, p.harness ?? "claude").name} ${p.id}`,
+                      hibernated: !!p.hibernated,
                       claude: !!getHarness(settingsRef.current, p.harness ?? "claude").claude,
+                      harness: withSeat(getHarness(settingsRef.current, p.harness ?? "claude"), p.team),
+                      team: p.team ?? undefined,
+                      // reattached dock shells go back to the dock
+                      dock: p.harness === "terminal" || dockIds.has(p.id) || undefined,
                     },
             ),
           );
-          setStatuses(Object.fromEntries(live.map((p) => [p.id, "working"])));
+          setStatuses(Object.fromEntries(live.map((p) => [p.id, p.hibernated ? "hibernated" : "working"])));
         }
 
         const saved = await invoke("saved_panes");
@@ -456,6 +535,7 @@ export default function App() {
                 resume: s.session_id ?? null,
                 shell: settingsRef.current.shell?.trim() || null,
               });
+              if (s.pinned) await invoke("resource_pin", { id, pinned: true });
               restored.push({
                 id,
                 projectPath: s.cwd,
@@ -466,7 +546,7 @@ export default function App() {
             }
             // resolve against current settings; a deleted custom harness
             // falls back to Claude
-            const harness = getHarness(settingsRef.current, s.harness ?? "claude");
+            const harness = withSeat(getHarness(settingsRef.current, s.harness ?? "claude"), s.team);
             const id = await invoke("create_pane", {
               cwd: s.cwd,
               cols: 100,
@@ -478,11 +558,17 @@ export default function App() {
               harness,
               shell: settingsRef.current.shell?.trim() || null,
             });
+            if (s.pinned) await invoke("resource_pin", { id, pinned: true });
             restored.push({
               id,
               projectPath: s.cwd,
-              label: `${harness.name} ${id}`,
+              label: s.team?.role ?? `${harness.name} ${id}`,
               claude: !!harness.claude,
+              harness,
+              team: s.team ?? undefined,
+              // after a broker restart the old dock ids mean nothing; plain
+              // shells belong in the dock, not the agent grid
+              dock: harness.id === "terminal" || undefined,
             });
           } catch (err) {
             console.error("failed to restore pane in", s.cwd, err);
@@ -626,8 +712,15 @@ export default function App() {
     });
 
     const unExit = listen("pane-exit", (e) => {
+      // a dock shell whose process exits just closes its tab — no exited
+      // corpse to clean up, matching how terminal apps behave
+      if (panesRef.current.some((p) => p.id === e.payload.id && p.dock && p.kind !== "run")) {
+        setPanes((ps) => ps.filter((p) => p.id !== e.payload.id));
+        setStatuses(({ [e.payload.id]: _gone, ...rest }) => rest);
+        return;
+      }
       setStatuses((s) =>
-        e.payload.id in s ? { ...s, [e.payload.id]: "exited" } : s,
+        e.payload.id in s && s[e.payload.id] !== "hibernated" ? { ...s, [e.payload.id]: "exited" } : s,
       );
       // a run pane that dies while hidden surfaces its crash logs instead of
       // staying invisible behind a green dot
@@ -664,6 +757,9 @@ export default function App() {
     // The settings window persists to localStorage and broadcasts the full
     // settings object; adopt it so the grid re-themes live.
     const unSettings = listen("settings-changed", (e) => {
+      if (e.payload.cols && e.payload.cols !== settingsRef.current.cols) {
+        setPaneSizes((sizes) => resetPaneWidths(sizes));
+      }
       setSettings(e.payload);
     });
 
@@ -673,7 +769,15 @@ export default function App() {
       setBenches(loadGateways());
     });
 
+    // Feed the background-tasks registry: full scheduler state now, then on
+    // every broker push (the broker broadcasts, UIs never poll).
+    invoke("schedules")
+      .then((s) => feedTaskSchedules(s))
+      .catch(() => {});
+    const unSchedState = listen("schedules", (e) => feedTaskSchedules(e.payload));
+
     return () => {
+      unSchedState.then((f) => f());
       unEvent.then((f) => f());
       unPlan.then((f) => f());
       unExit.then((f) => f());
@@ -779,25 +883,115 @@ export default function App() {
   const updateProject = (path, patch) =>
     setProjects((ps) => ps.map((p) => (p.path === path ? { ...p, ...patch } : p)));
 
+  // Hiding only tucks a project into the sidebar's "Hidden" group — its panes
+  // keep running. Hiding the active one hops to the next visible project.
+  const setProjectHidden = (path, hidden) => {
+    setProjects((ps) => {
+      const next = ps.map((p) => (p.path === path ? { ...p, hidden: hidden || undefined } : p));
+      if (hidden && path === activePath) {
+        const fallback = next.find((p) => !p.hidden);
+        if (fallback) setActivePath(fallback.path);
+      }
+      return next;
+    });
+    if (!hidden) {
+      setActivePath(path);
+      setRemoteSel(null);
+    }
+  };
+
+  // Move `from` so it lands just before/after `to` in the stored order.
+  const moveProject = (from, to, after) => {
+    if (from === to) return;
+    setProjects((ps) => {
+      const item = ps.find((p) => p.path === from);
+      if (!item) return ps;
+      const rest = ps.filter((p) => p.path !== from);
+      const idx = rest.findIndex((p) => p.path === to);
+      if (idx < 0) return ps;
+      rest.splice(after ? idx + 1 : idx, 0, item);
+      return rest;
+    });
+  };
+
+  // Pointer-driven sidebar reorder (HTML5 DnD is unreliable in the webview
+  // with native file drops enabled — same reasoning as usePaneDrag).
+  const [projDrag, setProjDrag] = useState(null); // {path, over, after}
+  const projDragClickGuard = useRef(false);
+  const onProjectPointerDown = (ev, path) => {
+    if (ev.button !== 0 || renaming === path) return;
+    const y0 = ev.clientY;
+    const x0 = ev.clientX;
+    let started = false;
+    let drop = null;
+    const onMove = (e) => {
+      if (!started) {
+        if (Math.hypot(e.clientX - x0, e.clientY - y0) < 5) return;
+        started = true;
+        document.body.style.cursor = "grabbing";
+      }
+      const row = document
+        .elementsFromPoint(e.clientX, e.clientY)
+        .map((n) => n.closest?.("[data-project-path]"))
+        .find(Boolean);
+      if (row) {
+        const r = row.getBoundingClientRect();
+        drop = {
+          over: row.dataset.projectPath,
+          after: e.clientY > r.top + r.height / 2,
+        };
+      }
+      setProjDrag({ path, ...(drop ?? {}) });
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      if (!started) return;
+      document.body.style.cursor = "";
+      setProjDrag(null);
+      // swallow the click that follows the drag's pointerup
+      projDragClickGuard.current = true;
+      setTimeout(() => (projDragClickGuard.current = false), 0);
+      if (drop && drop.over !== path) moveProject(path, drop.over, drop.after);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+  const [showHiddenProjects, setShowHiddenProjects] = useState(
+    () => localStorage.getItem("agentbench.showHiddenProjects") === "1",
+  );
+  useEffect(() => {
+    localStorage.setItem("agentbench.showHiddenProjects", showHiddenProjects ? "1" : "0");
+  }, [showHiddenProjects]);
+
   // Run a project command (Settings-free: commands live on the project entry).
   // A run pane is just a pane with an ad-hoc harness spec — the broker already
   // launches arbitrary command lines through the login shell, so logs, exit
   // tracking and kill-on-close all reuse the agent pipeline.
-  const runCommand = async (project, cmd) => {
+  const runCommand = async (project, cmd, { restart = false } = {}) => {
     if (!cmd?.command?.trim()) return;
     const existing = panesRef.current.find(
       (p) =>
         p.kind === "run" && p.projectPath === project.path && p.label === cmd.name,
     );
     if (existing && statuses[existing.id] !== "exited") {
-      // already running — unhide + focus instead of racing a second server
-      if (existing.hidden) {
-        setPanes((ps) =>
-          ps.map((x) => (x.id === existing.id ? { ...x, hidden: false } : x)),
-        );
+      if (!restart) {
+        // Already running: reveal its terminal tab.
+        setDockOpen(true);
+        setDockTabs((tabs) => ({ ...tabs, [project.path]: existing.id }));
+        if (existing.hidden) {
+          setPanes((ps) =>
+            ps.map((x) => (x.id === existing.id ? { ...x, hidden: false } : x)),
+          );
+        }
+        setTimeout(() => focusAgent(existing), existing.hidden ? 50 : 0);
+        return;
       }
-      setTimeout(() => focusAgent(existing), existing.hidden ? 50 : 0);
-      return;
+      // restart of a live pane: kill first so the relaunch doesn't fight the
+      // old process for ports/locks (kill_pane tears the pty down with it)
+      await invoke("kill_pane", { id: existing.id }).catch(() => {});
     }
     try {
       const id = await invoke("create_pane", {
@@ -817,6 +1011,7 @@ export default function App() {
         projectPath: project.path,
         label: cmd.name,
         kind: "run",
+        dock: true,
         command: cmd.command,
       };
       setPanes((ps) =>
@@ -828,7 +1023,9 @@ export default function App() {
         if (existing) delete next[existing.id];
         return next;
       });
-      focusAgent(pane);
+      setDockOpen(true);
+      setDockTabs((tabs) => ({ ...tabs, [project.path]: id }));
+      setTimeout(() => focusAgent(pane), 30);
     } catch (err) {
       console.error("failed to run command", err);
     }
@@ -848,7 +1045,117 @@ export default function App() {
       setRunDialog(pane.projectPath);
       return;
     }
-    runCommand({ path: pane.projectPath }, { name: pane.label, command });
+    runCommand(
+      { path: pane.projectPath },
+      { name: pane.label, command },
+      { restart: true },
+    );
+  };
+
+  const [resources, setResources] = useState(null);
+  const [resourcesOpen, setResourcesOpen] = useState(false);
+  const [resourceError, setResourceError] = useState(null);
+  const [resourceBusy, setResourceBusy] = useState({});
+  const resourceBusyRef = useRef(new Set());
+  const [pageVisible, setPageVisible] = useState(document.visibilityState !== "hidden");
+  useEffect(() => {
+    const change = () => setPageVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", change);
+    return () => document.removeEventListener("visibilitychange", change);
+  }, []);
+  const applyHibernated = (id) => {
+    setPanes((ps) => ps.map((p) => p.id === id ? { ...p, hibernated: true } : p));
+    setStatuses((s) => ({ ...s, [id]: "hibernated" }));
+  };
+  const applyResumed = async ({ old_id, id }) => {
+    // Install replay data before mounting the replacement terminal/chat.
+    try {
+      const ps = await invoke("list_panes");
+      const p = ps.find((p) => p.id === id);
+      if (p) {
+        setInitialData((d) => ({ ...d, [id]: p.buffer }));
+        setChatLines((d) => ({ ...d, [id]: p.lines ?? [] }));
+      }
+    } catch { /* live output still attaches if replay is unavailable */ }
+    setPanes((ps) => ps.map((p) => p.id === old_id ? { ...p, id, hibernated: false } : p));
+    const move = (state) => {
+      if (!(old_id in state)) return state;
+      const { [old_id]: value, ...rest } = state;
+      return { ...rest, [id]: value };
+    };
+    setPaneSizes(move); setPaneViews(move); setTitles(move);
+    setStatuses((s) => { const { [old_id]: _, ...rest } = s; return { ...rest, [id]: "working" }; });
+    setFocusedId((focused) => focused === old_id ? id : focused);
+  };
+  useEffect(() => {
+    let alive = true;
+    const subscriptions = [
+      listen("resources", (e) => { if (alive) { setResources(e.payload.state); setTaskResources(e.payload.state); } }),
+      listen("pane-hibernated", (e) => { if (alive) applyHibernated(e.payload.id); }),
+      listen("pane-resumed", (e) => { if (alive) applyResumed(e.payload); }),
+      listen("resource-error", (e) => { if (alive) setResourceError(e.payload.message); }),
+      listen("open-resources", () => { if (alive) setResourcesOpen(true); }),
+    ];
+    Promise.all(subscriptions).then(() => invoke("resource_state"))
+      .then((s) => { if (alive) { setResources(s); setTaskResources(s); } })
+      .catch(() => { if (alive) setResourceError("Resource management needs the updated broker. Rebuild and restart the broker to enable it."); });
+    return () => { alive = false; subscriptions.forEach((s) => s.then((off) => off())); };
+  }, []);
+  const resourceAction = async (action, id, pinned) => {
+    if (resourceBusyRef.current.has(id)) return;
+    resourceBusyRef.current.add(id);
+    setResourceBusy((s) => ({ ...s, [id]: action === "resume" ? "Resuming…" : action === "hibernate" ? "Hibernating…" : "Saving…" }));
+    setResourceError(null);
+    try {
+      if (action === "pin") {
+        await invoke("resource_pin", { id, pinned });
+        setResources((s) => s && ({ ...s, panes: s.panes.map((p) => p.id === id ? { ...p, pinned } : p) }));
+      } else {
+        const result = await invoke(action === "resume" ? "resume_hibernated" : "hibernate_pane", { id });
+        // Events synchronize other windows; the response also covers a lost event.
+        if (action === "resume") await applyResumed(result); else applyHibernated(id);
+      }
+    } catch (err) { setResourceError(String(err)); setResourcesOpen(true); }
+    finally {
+      resourceBusyRef.current.delete(id);
+      setResourceBusy(({ [id]: _, ...rest }) => rest);
+    }
+  };
+  const saveResourcePolicy = async (policy) => {
+    await invoke("resource_policy", { policy });
+    setResources((s) => ({ ...s, policy }));
+  };
+
+  const restartingAgents = useRef(new Set());
+  const restartAgent = async (pane) => {
+    if (restartingAgents.current.has(pane.id)) return;
+    restartingAgents.current.add(pane.id);
+    try {
+      const harness = pane.harness ?? getHarness(settingsRef.current, "claude");
+      await invoke("kill_pane", { id: pane.id });
+      const shell = settingsRef.current.shell?.trim() || null;
+      const id = pane.kind === "chat"
+        ? await invoke("create_chat_pane", { cwd: pane.projectPath, resume: null, shell })
+        : await invoke("create_pane", {
+            cwd: pane.projectPath, cols: 100, rows: 30, resume: null, shell, harness,
+            theme: harness.claude ? getTheme(settingsRef.current.theme).claudeTheme ?? null : null,
+          });
+      setPanes((ps) => ps.map((p) => p.id === pane.id
+        ? { ...p, id, label: pane.team?.role ?? `${pane.kind === "chat" ? "Claude Chat" : harness.name} ${id}` } : p));
+      const move = (state) => {
+        const { [pane.id]: value, ...rest } = state;
+        return value === undefined ? rest : { ...rest, [id]: value };
+      };
+      setPaneSizes(move);
+      setPaneViews(move);
+      setStatuses((s) => ({ ...s, [id]: "working" }));
+      setFocusedId(id);
+    } catch (err) {
+      console.error("agent restart failed", err);
+      window.alert(`Could not restart agent: ${err}`);
+    } finally {
+      restartingAgents.current.delete(pane.id);
+    }
   };
 
   // Which harness binaries exist on PATH (Set of bin names); null = unprobed.
@@ -885,6 +1192,7 @@ export default function App() {
       // harness so a non-Claude default doesn't get a --resume it can't use
       resume ? "claude" : harnessId ?? settingsRef.current.defaultHarness,
     );
+    if (harness.id === "terminal") return spawnDockTerm();
     // missing binary would exec into "command not found" and the pane dies —
     // route to Settings → Agents instead
     if (harnessMissing(harness)) {
@@ -908,12 +1216,15 @@ export default function App() {
       projectPath: activePath,
       label: `${harness.name} ${id}`,
       claude: !!harness.claude,
+      harness,
     };
     setPanes((p) => {
-      const inProject = p.filter((x) => x.projectPath === activePath);
+      const inProject = p.filter(
+        (x) => x.projectPath === activePath && !x.dock,
+      );
       const pos = inProject.findIndex((x) => x.id === focusedRef.current);
       if (!dir || pos === -1) return [...p, pane];
-      const cols = settingsRef.current.cols;
+      const cols = effColsRef.current;
       // Inserting at/before `pos` shifts the anchor to pos+1, hence the
       // +1 in `up` so the new pane sits directly above where it ends up.
       const want = {
@@ -935,6 +1246,94 @@ export default function App() {
     if (dir) focusAgent(pane);
   };
   const addAgent = () => spawnAgent();
+
+  const loadTeams = (path) =>
+    invoke("list_teams", { project: path })
+      .then((raw) => setProjectTeams((t) => ({ ...t, [path]: normalizeTeams(raw) })))
+      .catch(() => setProjectTeams((t) => ({ ...t, [path]: [] })));
+  useEffect(() => {
+    if (activePath) loadTeams(activePath);
+  }, [activePath]);
+
+  // Start every role of a saved team that isn't already running in the
+  // project. Each agent is its own pane; the seat gives it its name, model
+  // and team prompt at launch.
+  const launchingTeams = useRef(new Set());
+  const launchTeam = async (projectPath, team) => {
+    const key = `${projectPath}\0${team.id}`;
+    if (launchingTeams.current.has(key)) return;
+    launchingTeams.current.add(key);
+    const inProject = panesRef.current.filter((p) => p.projectPath === projectPath);
+    const todo = missingSeats(team, inProject);
+    const nameOf = (id) => getHarness(settingsRef.current, id).name;
+    const started = [];
+    const failed = [];
+    try {
+      for (const agent of todo) {
+        const base = getHarness(settingsRef.current, agent.harness);
+        if (base.id !== agent.harness) {
+          failed.push(`${agent.role}: agent type "${agent.harness}" isn't set up`);
+          continue;
+        }
+        if (harnessMissing(base)) {
+          failed.push(`${agent.role}: ${base.name} isn't installed`);
+          continue;
+        }
+        const seat = seatFor(team, agent, nameOf);
+        const harness = withSeat(base, seat);
+        try {
+          const id = await invoke("create_pane", {
+            cwd: projectPath,
+            cols: 100,
+            rows: 30,
+            resume: null,
+            theme: harness.claude ? getTheme(settingsRef.current.theme).claudeTheme ?? null : null,
+            harness,
+            shell: settingsRef.current.shell?.trim() || null,
+          });
+          started.push({ id, projectPath, label: agent.role, claude: !!harness.claude, harness, team: seat });
+        } catch (err) {
+          failed.push(`${agent.role}: ${err}`);
+        }
+      }
+    } finally {
+      launchingTeams.current.delete(key);
+    }
+    if (started.length) {
+      // keep teammates next to each other: after the team's running panes,
+      // else at the end
+      setPanes((ps) => {
+        let at = -1;
+        ps.forEach((p, i) => { if (p.projectPath === projectPath && p.team?.team_id === team.id) at = i; });
+        if (at === -1) return [...ps, ...started];
+        return [...ps.slice(0, at + 1), ...started, ...ps.slice(at + 1)];
+      });
+      setStatuses((st) => ({ ...st, ...Object.fromEntries(started.map((p) => [p.id, "working"])) }));
+      setActivePath(projectPath);
+    }
+    if (failed.length) window.alert(`Some agents in "${team.name}" didn't start:\n\n${failed.join("\n")}`);
+    else if (!todo.length) {
+      const first = inProject.find((p) => p.team?.team_id === team.id);
+      if (first) { setActivePath(projectPath); focusAgent(first); }
+    }
+  };
+
+  // "focus" teams share one grid cell: the selected member shows, the rest
+  // ride along as header tabs. Remember the selection per team, and follow
+  // focus so a notification/hotkey jump to a tucked member brings it up.
+  const [teamFocus, setTeamFocus] = useState({}); // `${projectPath}\0${teamId}` -> pane id
+  useEffect(() => {
+    const p = panesRef.current.find((x) => x.id === focusedId);
+    if (!p?.team) return;
+    const key = `${p.projectPath}\0${p.team.team_id}`;
+    setTeamFocus((m) => (m[key] === p.id ? m : { ...m, [key]: p.id }));
+  }, [focusedId]);
+
+  const stopTeam = (projectPath, teamId) => {
+    for (const p of panesRef.current) {
+      if (p.projectPath === projectPath && p.team?.team_id === teamId) onClose(p.id);
+    }
+  };
 
   // Headless Claude pane: stream-json over pipes, rendered as chat — no
   // terminal at all. Suits fire-and-forget workers; interactive affordances
@@ -1077,9 +1476,11 @@ export default function App() {
   };
 
   // Aggregate a project's pane statuses for its sidebar dot. input > done > working.
+  // Dock shells are excluded — an idle shell reports "working" forever and
+  // would pin every project dot green.
   const projectStatus = (path) => {
     const ss = panesRef.current
-      .filter((p) => p.projectPath === path)
+      .filter((p) => p.projectPath === path && !p.dock)
       .map((p) => statuses[p.id]);
     if (ss.includes("input")) return "input";
     if (ss.includes("done")) return "done";
@@ -1092,9 +1493,17 @@ export default function App() {
     focusedRef.current = pane.id;
     setFocusedId(pane.id);
     markNotifsRead(pane.id);
-    const handle = termRefs.current.get(pane.id);
-    handle?.focus();
-    handle?.scrollIntoView?.();
+    const reveal = () => {
+      const handle = termRefs.current.get(pane.id);
+      handle?.focus();
+      handle?.scrollIntoView?.();
+    };
+    if (pane.team) {
+      // a tucked focus-team member must be swapped in before it can take focus
+      const key = `${pane.projectPath}\0${pane.team.team_id}`;
+      setTeamFocus((m) => (m[key] === pane.id ? m : { ...m, [key]: pane.id }));
+      requestAnimationFrame(reveal);
+    } else reveal();
   };
 
   // Open a scheduled run: focus its pane while it still exists, otherwise
@@ -1132,6 +1541,92 @@ export default function App() {
     }
   };
 
+  // ── terminal dock ─────────────────────────────────────────────────────
+  const spawnDockTerm = async () => {
+    const path = activePathRef.current;
+    if (!path) return;
+    try {
+      const harness = getHarness(settingsRef.current, "terminal");
+      const id = await invoke("create_pane", {
+        cwd: path,
+        cols: 100,
+        rows: 30,
+        resume: null,
+        theme: null,
+        harness,
+        shell: settingsRef.current.shell?.trim() || null,
+      });
+      const n =
+        panesRef.current.filter((p) => p.dock && p.projectPath === path).length + 1;
+      const pane = { id, projectPath: path, label: `Terminal ${n}`, dock: true };
+      setPanes((p) => [...p, pane]);
+      setStatuses((s) => ({ ...s, [id]: "working" }));
+      setDockTabs((t) => ({ ...t, [path]: id }));
+      setDockOpen(true);
+      setTimeout(() => focusAgent(pane), 60);
+    } catch (err) {
+      console.error("failed to open dock terminal", err);
+    }
+  };
+
+  const closeDockTerm = (id) => {
+    const path = panesRef.current.find((p) => p.id === id)?.projectPath;
+    const next = panesRef.current.filter(
+      (p) => p.dock && p.projectPath === path && p.id !== id,
+    );
+    onClose(id);
+    if (path) {
+      setDockTabs((t) => ({ ...t, [path]: next[next.length - 1]?.id }));
+      if (next.length) setTimeout(() => focusAgent(next[next.length - 1]), 30);
+    }
+  };
+
+  const selectDockTab = (path, id) => {
+    setDockTabs((t) => (t[path] === id ? t : { ...t, [path]: id }));
+    const pane = panesRef.current.find((p) => p.id === id);
+    if (pane) setTimeout(() => focusAgent(pane), 30);
+  };
+
+  // Ctrl+T / Ctrl+` / topbar button. Opening with no shells yet spawns the first one.
+  const toggleDock = () => {
+    if (dockOpenRef.current) {
+      setDockOpen(false);
+      return;
+    }
+    const path = activePathRef.current;
+    if (!path) return;
+    const tabs = panesRef.current.filter((p) => p.dock && p.projectPath === path);
+    if (!tabs.length) {
+      spawnDockTerm(); // opens the dock itself
+      return;
+    }
+    setDockOpen(true);
+    const target =
+      tabs.find((p) => p.id === dockTabsRef.current[path]) ?? tabs[0];
+    setTimeout(() => focusAgent(target), 60);
+  };
+
+  // Background-tasks rail row → the thing that owns the work.
+  const openTask = (row) => {
+    if (row.kind === "schedule" && row.run) {
+      openScheduleRun(row.run, row.schedule);
+      return;
+    }
+    const pane = panesRef.current.find((p) => p.id === row.paneId);
+    if (!pane) return;
+    setRemoteSel(null);
+    if (pane.dock) {
+      setDockOpen(true);
+      setDockTabs((t) => ({ ...t, [pane.projectPath]: pane.id }));
+    }
+    if (pane.projectPath !== activePathRef.current) {
+      setActivePath(pane.projectPath);
+      setTimeout(() => focusAgent(pane), 50);
+    } else {
+      focusAgent(pane);
+    }
+  };
+
   const openNotification = (n) => {
     const pane = panesRef.current.find((p) => p.id === n.paneId);
     if (!pane) return; // agent closed since
@@ -1159,11 +1654,83 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, []);
 
+  // Auto grid columns track the real content-area width (so the sidebar,
+  // plans pane, and webview zoom are all naturally accounted for).
+  // settings.cols = 0 means auto; a nonzero value pins the count.
+  const contentRef = useRef(null);
+  const [gridW, setGridW] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setGridW(el.clientWidth));
+    ro.observe(el);
+    setGridW(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+  const effCols = settings.cols || autoCols(gridW);
+  const effColsRef = useRef(effCols);
+  effColsRef.current = effCols;
+
+  // UI scale (webview zoom). Re-applied on resize because dragging a
+  // maximized window to another display resizes it — that's the moment the
+  // auto scale should re-evaluate against the new screen.
+  useEffect(() => {
+    applyUiScale(settings.uiScale);
+    const onResize = () => applyUiScale(settingsRef.current.uiScale);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [settings.uiScale]);
+
+  // ⌘/Ctrl +/− nudge the scale, ⌘/Ctrl 0 back to auto. Capture phase so
+  // the terminals never see the keystroke.
+  useEffect(() => {
+    const onKey = (e) => {
+      const mod = navigator.platform.includes("Mac") ? e.metaKey : e.ctrlKey;
+      if (!mod || e.shiftKey || e.altKey) return;
+      if (!["=", "+", "-", "0"].includes(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const s = settingsRef.current;
+      let uiScale = 0;
+      if (e.key !== "0") {
+        const cur = resolveUiScale(s.uiScale);
+        let i = SCALE_STEPS.reduce(
+          (best, v, idx) =>
+            Math.abs(v - cur) < Math.abs(SCALE_STEPS[best] - cur) ? idx : best,
+          0,
+        );
+        i += e.key === "-" ? -1 : 1;
+        uiScale = SCALE_STEPS[Math.max(0, Math.min(SCALE_STEPS.length - 1, i))];
+      }
+      const next = { ...s, uiScale };
+      setSettings(next);
+      // settings window keeps live state while preloaded — let it adopt
+      emit("settings-changed", next).catch(() => {});
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+
   // ⌘1-9 focus agent N in active project · ⌘⇧1-9 switch project · ⌘` cycle agents
   useEffect(() => {
     const onKey = (e) => {
+      // Ctrl+T toggles the bottom terminal dock; keep Ctrl+` as an alias.
+      // Capture before terminal widgets and the agent-cycle shortcut.
+      if (
+        (e.key.toLowerCase() === "t" || e.code === "Backquote") &&
+        e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!e.repeat) toggleDock();
+        return;
+      }
+      // dock shells are outside the grid — ⌘1-9 / arrows / ⌘` skip them
       const inProject = panesRef.current.filter(
-        (p) => p.projectPath === activePath,
+        (p) => p.projectPath === activePath && !p.dock,
       );
 
       // Pane navigation: user-chosen modifier + arrows (Settings), plus
@@ -1194,7 +1761,7 @@ export default function App() {
           focusAgent(inProject[0]);
           return;
         }
-        const gridCols = settingsRef.current.cols;
+        const gridCols = effColsRef.current;
         const step = {
           ArrowLeft: -1,
           ArrowRight: 1,
@@ -1211,8 +1778,9 @@ export default function App() {
         e.preventDefault();
         e.stopPropagation();
         if (e.shiftKey) {
-          if (projects[digit - 1]) {
-            setActivePath(projects[digit - 1].path);
+          const shown = projects.filter((p) => !p.hidden);
+          if (shown[digit - 1]) {
+            setActivePath(shown[digit - 1].path);
             setRemoteSel(null);
           }
         } else {
@@ -1257,7 +1825,10 @@ export default function App() {
   }, [renaming]);
 
   const activeProject = projects.find((p) => p.path === activePath);
-  const activePanes = panes.filter((p) => p.projectPath === activePath);
+  // grid panes only — dock shells live in the TerminalDock below the grid
+  const activePanes = panes.filter(
+    (p) => p.projectPath === activePath && !p.dock,
+  );
 
   // Flat action list for the command menu; rebuilt on open so it always
   // reflects the current projects/agents/plans.
@@ -1308,6 +1879,18 @@ export default function App() {
         action: () => setShowPlans((s) => !s),
       });
       cmds.push({
+        id: "new-terminal",
+        label: "New terminal",
+        hint: "shell tab in the dock",
+        action: spawnDockTerm,
+      });
+      cmds.push({
+        id: "toggle-dock",
+        label: dockOpen ? "Hide terminal dock" : "Show terminal dock",
+        hint: "Ctrl+T",
+        action: toggleDock,
+      });
+      cmds.push({
         id: "new-plan",
         label: "New plan…",
         action: () => setComposerOpen(true),
@@ -1326,6 +1909,32 @@ export default function App() {
         label: "Run commands…",
         action: () => setRunDialog(activePath),
       });
+      cmds.push({
+        id: "edit-teams",
+        label: "Teams…",
+        hint: "saved agent setups for this project",
+        action: () => setTeamsDialog(activePath),
+      });
+      for (const t of projectTeams[activePath] ?? []) {
+        const running = activePanes.filter((p) => p.team?.team_id === t.id).length;
+        const missing = missingSeats(t, activePanes).length;
+        cmds.push({
+          id: `team-start-${t.id}`,
+          group: "Teams",
+          label: running ? `Start missing: ${t.name}` : `Start team: ${t.name}`,
+          hint: missing ? `${missing} of ${t.agents.length} agents` : "all running — focus",
+          action: () => launchTeam(activePath, t),
+        });
+        if (running) {
+          cmds.push({
+            id: `team-stop-${t.id}`,
+            group: "Teams",
+            label: `Stop team: ${t.name}`,
+            hint: `kills ${running} agent${running === 1 ? "" : "s"}`,
+            action: () => stopTeam(activePath, t.id),
+          });
+        }
+      }
     }
     cmds.push({ id: "add-project", label: "Add project…", action: addProject });
     cmds.push({ id: "settings", label: "Open Settings", action: openSettings });
@@ -1343,13 +1952,13 @@ export default function App() {
         relaunch().catch(() => {});
       },
     });
-    projects.forEach((p, i) => {
+    projects.filter((p) => !p.hidden).concat(projects.filter((p) => p.hidden)).forEach((p, i) => {
       if (p.path === activePath) return;
       cmds.push({
         id: `project-${p.path}`,
         group: "Project",
-        label: p.name,
-        hint: i < 9 ? `⌘⇧${i + 1}` : undefined,
+        label: p.hidden ? `${p.name} (hidden)` : p.name,
+        hint: i < 9 && !p.hidden ? `⌘⇧${i + 1}` : undefined,
         action: () => {
           setActivePath(p.path);
           setRemoteSel(null);
@@ -1388,8 +1997,14 @@ export default function App() {
       hint: "recurring prompts with reviewable runs",
       action: () => setSchedulesOpen(true),
     });
+    cmds.push({
+      id: "toggle-tasks",
+      label: tasksOpen ? "Hide background tasks" : "Show background tasks",
+      hint: "agents · shells · scheduled runs",
+      action: () => setTasksOpen((o) => !o),
+    });
     return cmds;
-  }, [cmdMenuOpen, activeProject, activePath, projects, activePanes, titles, projectPlans, showPlans, settings.theme, settings.defaultHarness, settings.customHarnesses]);
+  }, [cmdMenuOpen, activeProject, activePath, projects, activePanes, titles, projectPlans, projectTeams, showPlans, dockOpen, tasksOpen, settings.theme, settings.defaultHarness, settings.customHarnesses]);
 
   return (
     <div className="app">
@@ -1422,6 +2037,28 @@ export default function App() {
             onClick={() => setSchedulesOpen(true)}
           >
             <CalendarCheck size={15} />
+          </button>
+          <button className={`btn-icon${resourcesOpen ? " active" : ""}`} title="Agent resources" onClick={() => setResourcesOpen((open) => !open)}><Cpu size={15}/></button>
+          {activeProject && !remoteSel && (
+            <button
+              className={`btn-icon${dockOpen ? " active" : ""}`}
+              title="Terminal dock (Ctrl+T)"
+              onClick={toggleDock}
+            >
+              <TerminalWindow size={15} />
+            </button>
+          )}
+          <button
+            className={`btn-icon task-btn${tasksOpen ? " active" : ""}`}
+            title="Background tasks — agents, shells and scheduled runs"
+            onClick={() => setTasksOpen((o) => !o)}
+          >
+            <Pulse size={15} />
+            {runningTasks.length > 0 && (
+              <span className="notif-badge task-badge">
+                {runningTasks.length > 9 ? "9+" : runningTasks.length}
+              </span>
+            )}
           </button>
           <Popover.Root
             open={notifOpen}
@@ -1677,7 +2314,13 @@ export default function App() {
               pushed to the sidebar's bottom by a stretched project list */}
           <div className="sidebar-scroll">
           <nav className="project-list">
-            {projects.map((p, i) => {
+            {(() => {
+            const shownProjects = projects.filter((p) => !p.hidden);
+            const hiddenProjects = projects.filter((p) => p.hidden);
+            const hiddenAttn = hiddenProjects
+              .map((p) => projectStatus(p.path))
+              .find((st) => st === "input" || st === "done");
+            const renderProject = (p, i) => {
               const st = projectStatus(p.path);
               const count = panes.filter(
                 (pane) => pane.projectPath === p.path,
@@ -1686,10 +2329,13 @@ export default function App() {
                 <ContextMenu key={p.path}>
                   <ContextMenuTrigger asChild>
                     <div
-                      className={`project ${p.path === activePath ? "active" : ""} attn-${st} ${p.color ? "colored" : ""}`}
+                      className={`project ${p.path === activePath ? "active" : ""} attn-${st} ${p.color ? "colored" : ""} ${p.hidden ? "is-hidden" : ""} ${projDrag?.path === p.path ? "dragging" : ""} ${projDrag?.over === p.path && projDrag.path !== p.path ? (projDrag.after ? "drop-after" : "drop-before") : ""}`}
                       style={p.color ? { "--proj-color": p.color } : undefined}
                       title={p.path}
+                      data-project-path={p.path}
+                      onPointerDown={(ev) => onProjectPointerDown(ev, p.path)}
                       onClick={() => {
+                        if (projDragClickGuard.current) return;
                         setActivePath(p.path);
                         setRemoteSel(null);
                       }}
@@ -1716,7 +2362,7 @@ export default function App() {
                       {count > 0 && (
                         <span className="project-count">{count}</span>
                       )}
-                      {i < 9 && (
+                      {!p.hidden && i < 9 && (
                         <span className="project-key">⌘⇧{i + 1}</span>
                       )}
                     </div>
@@ -1741,6 +2387,9 @@ export default function App() {
                     </ContextMenuItem>
                     <ContextMenuItem onSelect={() => setRunDialog(p.path)}>
                       Run commands…
+                    </ContextMenuItem>
+                    <ContextMenuItem onSelect={() => setTeamsDialog(p.path)}>
+                      Teams…
                     </ContextMenuItem>
                     <ContextMenuSub>
                       <ContextMenuSubTrigger>Color</ContextMenuSubTrigger>
@@ -1777,6 +2426,11 @@ export default function App() {
                     </ContextMenuSub>
                     <ContextMenuSeparator />
                     <ContextMenuItem
+                      onSelect={() => setProjectHidden(p.path, !p.hidden)}
+                    >
+                      {p.hidden ? "Show in sidebar" : "Hide from sidebar"}
+                    </ContextMenuItem>
+                    <ContextMenuItem
                       variant="destructive"
                       onSelect={() => removeProject(p.path)}
                     >
@@ -1785,7 +2439,30 @@ export default function App() {
                   </ContextMenuContent>
                 </ContextMenu>
               );
-            })}
+            };
+            return (
+              <>
+                {shownProjects.map(renderProject)}
+                {hiddenProjects.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      className={`hidden-projects-toggle ${showHiddenProjects ? "open" : ""}`}
+                      onClick={() => setShowHiddenProjects((v) => !v)}
+                      title={showHiddenProjects ? "Collapse hidden projects" : "Show hidden projects"}
+                    >
+                      <CaretDown size={10} weight="bold" className="hidden-projects-caret" />
+                      Hidden · {hiddenProjects.length}
+                      {!showHiddenProjects && hiddenAttn && (
+                        <span className={`dot ${hiddenAttn}`} />
+                      )}
+                    </button>
+                    {showHiddenProjects && hiddenProjects.map(renderProject)}
+                  </>
+                )}
+              </>
+            );
+            })()}
           </nav>
 
           {/* Linked benches: one section per machine, its projects grouped
@@ -1833,7 +2510,16 @@ export default function App() {
           </button>
         </aside>
 
-        <div className="content">
+        <div className="content" ref={contentRef}>
+          {resources && ["warning", "critical"].includes(resources.pressure) && (
+            <div className="resource-pressure" role="status">
+              Memory pressure is {resources.pressure}.
+              <button className="btn-sm" onClick={() => setResourcesOpen(true)}>Review idle agents</button>
+            </div>
+          )}
+          {resourcesOpen && <ResourcePanel state={resources} panes={panes} titles={titles}
+            error={resourceError} busy={resourceBusy} onAction={resourceAction} onPolicy={saveResourcePolicy}
+            onClose={() => setResourcesOpen(false)} onFocus={(p) => { if (p) { setActivePath(p.projectPath); focusAgent(p); } }}/>}
           {remoteSel ? null : !activeProject ? (
             <div className="empty">
               <div className="empty-inner">
@@ -1864,8 +2550,46 @@ export default function App() {
           {/* All panes stay mounted so terminals and ptys survive project
               switches; inactive projects are just hidden. */}
           {projects.map((proj) => {
-            const projPanes = panes.filter((p) => p.projectPath === proj.path);
+            const projPanes = panes.filter(
+              (p) => p.projectPath === proj.path && !p.dock,
+            );
             if (projPanes.length === 0) return null;
+            // Group "focus"-layout team members: only the selected one takes
+            // a cell, the others stay mounted but tucked behind its tabs.
+            const teamGroups = {};
+            for (const p of projPanes) {
+              if (!p.team?.team_id) continue;
+              const saved = projectTeams[proj.path]?.find((t) => t.id === p.team.team_id);
+              if ((saved?.layout ?? "focus") !== "focus") continue;
+              (teamGroups[p.team.team_id] ??= { saved, members: [] }).members.push(p);
+            }
+            const tucked = new Set();
+            const tabsFor = {};
+            for (const [teamId, { saved, members }] of Object.entries(teamGroups)) {
+              if (members.length < 2) continue;
+              const picked = teamFocus[`${proj.path}\0${teamId}`];
+              const shown =
+                members.find((m) => m.id === picked) ??
+                members.find((m) => m.team.role === saved?.defaultTarget) ??
+                members.find((m) => /manager|lead/i.test(m.team.role)) ??
+                members[0];
+              const tabs = members.map((m) => ({
+                id: m.id,
+                role: m.team.role,
+                status: statuses[m.id] || "working",
+              }));
+              for (const m of members) {
+                if (m.id !== shown.id) tucked.add(m.id);
+                tabsFor[m.id] = tabs;
+              }
+            }
+            const isHidden = (p) => p.hidden || tucked.has(p.id);
+            // hidden panes take no grid cell, so pack only the visible ones
+            const packed = packSpans(
+              projPanes.filter((p) => !isHidden(p)),
+              paneSizes,
+              effCols,
+            );
             return (
               <main
                 key={proj.path}
@@ -1873,7 +2597,7 @@ export default function App() {
                 style={{
                   display:
                     proj.path === activePath && !remoteSel ? undefined : "none",
-                  gridTemplateColumns: `repeat(${settings.cols}, minmax(0, 1fr))`,
+                  gridTemplateColumns: `repeat(${effCols}, minmax(0, 1fr))`,
                 }}
               >
                 {projPanes.map((p) => (
@@ -1881,17 +2605,30 @@ export default function App() {
                     key={p.id}
                     id={p.id}
                     kind={p.kind}
+                    hibernated={!!p.hibernated}
+                    visible={pageVisible && proj.path === activePath && !remoteSel && !isHidden(p)}
+                    scrollback={settings.terminalScrollback ?? 2000}
+                    resource={resources?.panes?.find((r) => r.id === p.id)}
+                    resourceBusy={resourceBusy[p.id]}
+                    onResourceAction={(action, pinned) => resourceAction(action, p.id, pinned)}
                     sigintGuard={!!p.harness?.claude || !!p.claude}
                     claude={!!p.claude}
+                    codex={p.harness?.id === "codex"}
                     view={paneViews[p.id] ?? settings.defaultPaneView ?? "chat"}
                     onViewChange={setPaneView}
                     initialLines={chatLines[p.id]}
-                    hidden={p.hidden}
+                    hidden={isHidden(p)}
+                    teamTabs={tabsFor[p.id]}
+                    onTeamTab={(tabId) => {
+                      const target = panesRef.current.find((x) => x.id === tabId);
+                      if (target) focusAgent(target);
+                    }}
                     command={p.command}
                     onHide={hideRun}
-                    onRestart={() => restartRun(p)}
+                    onRestart={p.hibernated ? undefined : () => p.kind === "run" ? restartRun(p) : restartAgent(p)}
                     onResumeRequest={() => setSessionsOpen(true)}
-                    name={titles[p.id] || p.label}
+                    name={p.team?.role ?? (titles[p.id] || p.label)}
+                    team={p.team?.team}
                     cwd={p.projectPath}
                     status={statuses[p.id] || "working"}
                     focused={focusedId === p.id}
@@ -1901,8 +2638,8 @@ export default function App() {
                     wordMod={settings.wordMod ?? "ctrl"}
                     copyOnSelect={settings.copyOnSelect !== false}
                     initialData={initialData[p.id]}
-                    size={paneSizes[p.id]}
-                    gridCols={settings.cols}
+                    size={{ h: 1, w: packed[p.id] ?? 1 }}
+                    gridCols={effCols}
                     onResize={resizePane}
                     onReorder={reorderPane}
                     onRegister={registerTerm}
@@ -1999,19 +2736,24 @@ export default function App() {
                   <main
                     className="grid remote-grid"
                     style={{
-                      gridTemplateColumns: `repeat(${settings.cols}, minmax(0, 1fr))`,
+                      gridTemplateColumns: `repeat(${effCols}, minmax(0, 1fr))`,
                     }}
                   >
-                    {(group?.panes ?? []).map((p) => (
-                      <RemotePane
-                        key={`${m.url}:${p.id}`}
-                        machine={m}
-                        pane={p}
-                        status={p.status}
-                        termTheme={termTheme}
-                        defaultView={settings.defaultPaneView ?? "chat"}
-                      />
-                    ))}
+                    {(() => {
+                      const rp = group?.panes ?? [];
+                      const rPacked = packSpans(rp, {}, effCols);
+                      return rp.map((p) => (
+                        <RemotePane
+                          key={`${m.url}:${p.id}`}
+                          machine={m}
+                          pane={p}
+                          status={p.status}
+                          termTheme={termTheme}
+                          defaultView={settings.defaultPaneView ?? "chat"}
+                          span={rPacked[p.id] ?? 1}
+                        />
+                      ));
+                    })()}
                   </main>
                   {(group?.panes ?? []).length === 0 && (
                     <div className="empty">
@@ -2034,6 +2776,36 @@ export default function App() {
                 </div>
               );
             })()}
+
+          {/* Terminal dock — always mounted so its shells' terminals and
+              ptys survive project switches and dock toggles; hidden with
+              display:none like everything else that must stay alive. */}
+          <TerminalDock
+            panes={panes.filter((p) => p.dock)}
+            activePath={activePath}
+            visible={!remoteSel && !!activeProject}
+            open={dockOpen}
+            height={dockHeight}
+            expanded={dockExpanded}
+            activeTabs={dockTabs}
+            focusedId={focusedId}
+            titles={titles}
+            statuses={statuses}
+            termTheme={termTheme}
+            copyOnSelect={settings.copyOnSelect !== false}
+            initialData={initialData}
+            onSelectTab={selectDockTab}
+            onNewTerm={spawnDockTerm}
+            onCloseTerm={closeDockTerm}
+            scrollback={settings.terminalScrollback ?? 2000}
+            pageVisible={pageVisible}
+            onRestart={restartRun}
+            onToggleExpand={() => setDockExpanded((x) => !x)}
+            onHeightChange={setDockHeight}
+            onRegister={registerTerm}
+            onActivity={onActivity}
+            onTitle={onTitle}
+          />
 
           {/* scoped to its project: switching projects hides the overlay,
               switching back restores it */}
@@ -2106,6 +2878,15 @@ export default function App() {
             </div>
           </aside>
         )}
+
+        {tasksOpen && (
+          <TaskRail
+            panes={panes}
+            titles={titles}
+            onOpenTask={openTask}
+            onClose={() => setTasksOpen(false)}
+          />
+        )}
       </div>
 
       <CommandMenu
@@ -2122,6 +2903,19 @@ export default function App() {
             updateProject(runDialog, { commands });
             setRunDialog(null);
           }}
+        />
+      )}
+
+      {teamsDialog && projects.some((p) => p.path === teamsDialog) && (
+        <TeamsDialog
+          project={projects.find((p) => p.path === teamsDialog)}
+          panes={panes.filter((p) => p.projectPath === teamsDialog)}
+          titles={titles}
+          harnesses={getHarnesses(settings).filter((h) => h.id !== "terminal")}
+          onClose={() => setTeamsDialog(null)}
+          onSaved={() => loadTeams(teamsDialog)}
+          onLaunch={(team) => launchTeam(teamsDialog, team)}
+          onStop={(team) => stopTeam(teamsDialog, team.id)}
         />
       )}
 

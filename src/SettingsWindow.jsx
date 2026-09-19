@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { emit, listen } from "@tauri-apps/api/event";
+import { applyUiScale } from "./lib/uiScale";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -660,6 +661,19 @@ export default function SettingsWindow() {
     emit("settings-changed", next).catch(() => {});
   };
 
+  // The main window also edits settings (⌘+/⌘− UI scale); adopt its
+  // broadcasts so this preloaded window doesn't write stale state back.
+  // Adopting never re-emits, so the echo of our own emit is a no-op.
+  useEffect(() => {
+    const un = listen("settings-changed", (e) => setSettings(e.payload));
+    return () => un.then((f) => f());
+  }, []);
+
+  // This window is its own webview — scale it like the workspace.
+  useEffect(() => {
+    applyUiScale(settings.uiScale);
+  }, [settings.uiScale]);
+
   const probeHarnesses = () => {
     const bins = [
       ...new Set(
@@ -870,6 +884,24 @@ export default function SettingsWindow() {
                 ))}
               </div>
             </Card>
+            <Card title="Interface scale">
+              <Row
+                title="UI size"
+                sub="Auto is compact on MacBook-size screens, 100% on wide displays. ⌘+ / ⌘− / ⌘0 in the workspace."
+              >
+                <Segmented
+                  value={String(settings.uiScale ?? 0)}
+                  options={[
+                    ["0", "Auto"],
+                    ["0.85", "85%"],
+                    ["0.9", "90%"],
+                    ["1", "100%"],
+                    ["1.1", "110%"],
+                  ]}
+                  onChange={(v) => set({ uiScale: Number(v) })}
+                />
+              </Row>
+            </Card>
             <Card title="Background">
               <Row
                 title="Background image"
@@ -948,15 +980,30 @@ export default function SettingsWindow() {
           <section className="settings-section">
             <h2>Workspace</h2>
             <Card title="Layout">
-              <Row title="Agents per row" sub="Grid columns in the workspace">
+              <Row
+                title="Agents per row"
+                sub="Auto picks the column count from the window width; rows always pack full"
+              >
                 <Segmented
-                  value={settings.cols}
-                  options={[1, 2, 3, 4].map((n) => [n, String(n)])}
+                  value={settings.cols ?? 0}
+                  options={[
+                    [0, "Auto"],
+                    ...[1, 2, 3, 4].map((n) => [n, String(n)]),
+                  ]}
                   onChange={(n) => set({ cols: n })}
                 />
               </Row>
             </Card>
+            <Card title="Agent resources">
+              <Row title="Memory and idle cleanup" sub="See per-agent CPU and memory, pin agents, or configure optional hibernation.">
+                <button className="btn-sm" onClick={() => emit("open-resources")}>Open resource manager</button>
+              </Row>
+            </Card>
             <Card title="Terminal">
+              <Row title="Terminal scrollback" sub="Maximum retained lines per terminal. Reducing this frees interface memory; session transcripts remain on disk.">
+                <Segmented value={settings.terminalScrollback ?? 2000} options={[[500,"500"],[2000,"2,000"],[8000,"8,000"]]}
+                  onChange={(n) => set({terminalScrollback:n})}/>
+              </Row>
               <Row
                 title="Engine"
                 sub="xterm.js is battle-tested; the wterm engines are experimental"
