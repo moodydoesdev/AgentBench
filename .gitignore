@@ -28,3 +28,8 @@ dist-ssr
 
 # agent-native local plan bridge tokens
 .plan-url
+
+# bun lockfile: CI (tauri-action) picks its package manager from the
+# lockfile present, and the runners only have npm. Keep package-lock.json
+# the single source of truth.
+bun.lock
