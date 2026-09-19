@@ -66,3 +66,75 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Standalone Linux daemons for the SSH remote-host flow: the desktop app
+  # downloads one of these onto a VM and runs it there, the way VS Code drops
+  # its server in over SSH. Built with --no-default-features so neither Tauri
+  # nor webkit comes along. `cross` is used for both arches because its images
+  # link against an old glibc, so one tarball runs on far more distros than a
+  # native ubuntu-22.04 build would.
+  daemons:
+    # The release is created by tauri-action in `build`; uploading into it
+    # before that exists would fail.
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: daemons-${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+
+      # The gateway serves the mobile PWA out of a dist directory beside it.
+      - name: Build web assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build daemons
+        working-directory: src-tauri
+        run: |
+          cross build --release --target ${{ matrix.target }} \
+            --no-default-features \
+            --bin agentbench-broker --bin agentbench-gateway
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          out="agentbench-daemons-${{ matrix.arch }}-linux"
+          mkdir -p "$out"
+          cp "src-tauri/target/${{ matrix.target }}/release/agentbench-broker"  "$out/"
+          cp "src-tauri/target/${{ matrix.target }}/release/agentbench-gateway" "$out/"
+          chmod +x "$out"/agentbench-*
+          cp -r dist "$out/dist"
+          tar -czf "$out.tar.gz" "$out"
+          sha256sum "$out.tar.gz" | tee "$out.tar.gz.sha256"
+
+      - name: Attach to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "agentbench-daemons-${{ matrix.arch }}-linux.tar.gz" \
+            "agentbench-daemons-${{ matrix.arch }}-linux.tar.gz.sha256" \
+            --clobber

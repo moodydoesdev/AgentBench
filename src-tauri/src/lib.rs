@@ -1,6 +1,7 @@
 pub mod broker;
 pub mod fsdata;
 pub mod gateway;
+pub mod remote;
 
 // The daemons above are Tauri-free, and the helper binaries only ever reach
 // for those three modules. Everything desktop-side lives behind `gui` so

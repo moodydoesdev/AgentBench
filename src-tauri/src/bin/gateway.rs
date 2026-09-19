@@ -28,17 +28,21 @@ const USAGE: &str = "\
 agentbench-gateway — serves the mobile PWA and bridges paired devices to the broker
 
 USAGE:
-    agentbench-gateway [--port PORT] [--url URL]
-    agentbench-gateway pair [--force]
+    agentbench-gateway [--bind ADDR] [--port PORT] [--url URL]
+    agentbench-gateway pair [--force] [--json]
     agentbench-gateway status
 
 COMMANDS:
     pair      Mint a pairing code from the running gateway and print it.
               This is the headless equivalent of Settings -> Mobile access,
               for a VM with no desktop UI to press the button in.
+              --json prints one machine-readable line.
     status    Print the running gateway's advertised port, pid and machine.
 
 OPTIONS:
+    --bind ADDR  Address to listen on. Default 0.0.0.0. Pass 127.0.0.1 when
+                 an SSH tunnel is the only way in.
+                 Env: AGENTBENCH_GATEWAY_BIND
     --port PORT  Public listen port. Default 8473.
                  Env: AGENTBENCH_GATEWAY_PORT
     --url URL    Address to advertise in pairing payloads, when detection
@@ -48,8 +52,9 @@ OPTIONS:
     -V, --version Print version
 
 SECURITY:
-    Serves on 0.0.0.0 over plain HTTP. A device token is full code execution
-    as you. Keep it on a tailnet; never port-forward it to the internet.
+    Plain HTTP, no TLS, and by default it listens on every interface. A device
+    token is full code execution as you. Keep it on a tailnet, or bind
+    127.0.0.1 and reach it through an SSH tunnel. Never port-forward it.
 ";
 
 /// One-shot loopback request to the running gateway's control port. Kept on
@@ -79,10 +84,20 @@ fn control_request(method: &str, path: &str, body: Option<&str>) -> Option<Value
     serde_json::from_str(payload.trim()).ok()
 }
 
-fn cmd_pair(force: bool) -> ! {
+fn cmd_pair(force: bool, as_json: bool) -> ! {
     let body = format!("{{\"force\":{force}}}");
     match control_request("POST", "/local/code", Some(&body)) {
         Some(v) => {
+            // --json is what the desktop's SSH remote-host flow reads: it runs
+            // this over the SSH session and pairs itself, so nobody ever sees
+            // a code. Print only the fields it needs, on one line.
+            if as_json {
+                println!(
+                    "{}",
+                    json!({ "code": v["code"], "url": v["url"], "expiresIn": v["expiresIn"] })
+                );
+                std::process::exit(0)
+            }
             let code = v["code"].as_str().unwrap_or("?");
             let url = v["url"].as_str().unwrap_or("");
             println!("pairing code: {code}");
@@ -121,8 +136,17 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
+    // Default stays 0.0.0.0 so an existing install keeps working. The SSH
+    // remote-host flow passes 127.0.0.1, because there the tunnel is the only
+    // way in and a public listener would be pure exposure.
+    let mut bind: std::net::IpAddr = std::env::var("AGENTBENCH_GATEWAY_BIND")
+        .ok()
+        .and_then(|b| b.parse().ok())
+        .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+
     let mut args = std::env::args().skip(1).peekable();
     let mut force = false;
+    let mut as_json = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -134,16 +158,26 @@ async fn main() {
                 return;
             }
             "--force" => force = true,
+            "--json" => as_json = true,
             "pair" => {
-                // consume a trailing --force either side of the verb
+                // flags may sit either side of the verb
                 for rest in args.by_ref() {
-                    if rest == "--force" {
-                        force = true;
+                    match rest.as_str() {
+                        "--force" => force = true,
+                        "--json" => as_json = true,
+                        _ => {}
                     }
                 }
-                cmd_pair(force)
+                cmd_pair(force, as_json)
             }
             "status" => cmd_status(),
+            "--bind" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(b) => bind = b,
+                None => {
+                    eprintln!("--bind needs an IP address, e.g. 127.0.0.1");
+                    std::process::exit(2);
+                }
+            },
             "--port" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(p) => port = p,
                 None => {
@@ -171,12 +205,11 @@ async fn main() {
 
     // Bind the public listener first: if the port is taken, another gateway is
     // already running and this process must not clobber its gateway.json.
-    let public_listener = match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
-        .await
+    let public_listener = match tokio::net::TcpListener::bind(SocketAddr::from((bind, port))).await
     {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("agentbench-gateway: cannot bind port {port}: {e}");
+            eprintln!("agentbench-gateway: cannot bind {bind}:{port}: {e}");
             std::process::exit(1);
         }
     };
