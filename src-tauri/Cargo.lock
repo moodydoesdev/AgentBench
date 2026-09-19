@@ -102,6 +102,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "libc",
  "objc2",
  "objc2-avf-audio",
  "objc2-foundation",

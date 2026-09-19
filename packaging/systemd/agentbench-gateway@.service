@@ -1,0 +1,29 @@
+[Unit]
+Description=AgentBench gateway (authenticated bridge to the broker)
+Documentation=https://github.com/moodydoesdev/AgentBench
+# The gateway reconnects on its own, but starting it after the broker avoids
+# a pointless retry loop on boot.
+After=network-online.target agentbench-broker@%i.service
+Wants=network-online.target
+BindsTo=agentbench-broker@%i.service
+
+[Service]
+Type=simple
+User=%i
+Environment=HOME=/home/%i
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/%i/.local/bin
+# machine_name() reads HOSTNAME, which systemd does not export. Without this
+# the VM advertises itself to paired devices as "workstation".
+Environment=HOSTNAME=%H
+# Where the PWA was installed. Override if you unpacked it elsewhere.
+Environment=AGENTBENCH_PWA_DIR=/usr/local/share/agentbench/dist
+
+ExecStart=/usr/local/bin/agentbench-gateway --port 8473
+
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -24,12 +24,146 @@ use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
+const USAGE: &str = "\
+agentbench-gateway — serves the mobile PWA and bridges paired devices to the broker
+
+USAGE:
+    agentbench-gateway [--port PORT] [--url URL]
+    agentbench-gateway pair [--force]
+    agentbench-gateway status
+
+COMMANDS:
+    pair      Mint a pairing code from the running gateway and print it.
+              This is the headless equivalent of Settings -> Mobile access,
+              for a VM with no desktop UI to press the button in.
+    status    Print the running gateway's advertised port, pid and machine.
+
+OPTIONS:
+    --port PORT  Public listen port. Default 8473.
+                 Env: AGENTBENCH_GATEWAY_PORT
+    --url URL    Address to advertise in pairing payloads, when detection
+                 guesses wrong (behind Tailscale Serve, a reverse proxy).
+                 Env: AGENTBENCH_GATEWAY_URL
+    -h, --help   Print this help
+    -V, --version Print version
+
+SECURITY:
+    Serves on 0.0.0.0 over plain HTTP. A device token is full code execution
+    as you. Keep it on a tailnet; never port-forward it to the internet.
+";
+
+/// One-shot loopback request to the running gateway's control port. Kept on
+/// raw TCP to match `live_gateway` — the control plane is unauthenticated and
+/// loopback-only, and pulling in an HTTP client for two calls is not worth it.
+fn control_request(method: &str, path: &str, body: Option<&str>) -> Option<Value> {
+    use std::io::{Read, Write};
+    let text = std::fs::read_to_string(gateway::gateway_file()).ok()?;
+    let info: Value = serde_json::from_str(&text).ok()?;
+    let control = info["controlPort"].as_u64()? as u16;
+    let addr = SocketAddr::from(([127, 0, 0, 1], control));
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    let body = body.unwrap_or("");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    let (_, payload) = raw.split_once("\r\n\r\n")?;
+    serde_json::from_str(payload.trim()).ok()
+}
+
+fn cmd_pair(force: bool) -> ! {
+    let body = format!("{{\"force\":{force}}}");
+    match control_request("POST", "/local/code", Some(&body)) {
+        Some(v) => {
+            let code = v["code"].as_str().unwrap_or("?");
+            let url = v["url"].as_str().unwrap_or("");
+            println!("pairing code: {code}");
+            if !url.is_empty() {
+                println!("address:      {url}");
+            }
+            println!("expires in:   10 minutes (single use)");
+            println!();
+            println!("On the other bench: Settings -> Linked benches -> enter that address and code.");
+            std::process::exit(0)
+        }
+        None => {
+            eprintln!("agentbench-gateway: no running gateway to pair with (start it first)");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn cmd_status() -> ! {
+    match control_request("GET", "/local/status", None) {
+        Some(v) => {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            std::process::exit(0)
+        }
+        None => {
+            eprintln!("agentbench-gateway: not running");
+            std::process::exit(1)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("AGENTBENCH_GATEWAY_PORT")
+    let mut port: u16 = std::env::var("AGENTBENCH_GATEWAY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
+
+    let mut args = std::env::args().skip(1).peekable();
+    let mut force = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return;
+            }
+            "-V" | "--version" => {
+                println!("agentbench-gateway {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--force" => force = true,
+            "pair" => {
+                // consume a trailing --force either side of the verb
+                for rest in args.by_ref() {
+                    if rest == "--force" {
+                        force = true;
+                    }
+                }
+                cmd_pair(force)
+            }
+            "status" => cmd_status(),
+            "--port" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(p) => port = p,
+                None => {
+                    eprintln!("--port needs a number");
+                    std::process::exit(2);
+                }
+            },
+            "--url" => match args.next() {
+                Some(u) => std::env::set_var("AGENTBENCH_GATEWAY_URL", u),
+                None => {
+                    eprintln!("--url needs a value");
+                    std::process::exit(2);
+                }
+            },
+            other => {
+                eprintln!("unknown argument: {other}\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     let broker = BrokerLink::new();
     broker.spawn_connect_loop();

@@ -21,8 +21,11 @@ pub const IDENTIFIER: &str = "com.connor.agentbench";
 const SCROLLBACK_CAP: usize = 512 * 1024;
 
 pub fn config_dir() -> PathBuf {
+    // dirs reads XDG_CONFIG_HOME then HOME; a systemd unit with neither set
+    // (DynamicUser=yes does this) would otherwise panic on an opaque message
+    // before the broker even binds.
     dirs::config_dir()
-        .expect("no config dir")
+        .expect("cannot locate a config directory — set HOME or XDG_CONFIG_HOME (systemd: Environment=HOME=/home/you)")
         .join(IDENTIFIER)
 }
 
@@ -208,7 +211,8 @@ impl Core {
             runs: Mutex::new(Vec::new()),
             ready: Mutex::new(HashSet::new()),
             config_dir,
-            home_dir: dirs::home_dir().expect("no home dir"),
+            home_dir: dirs::home_dir()
+                .expect("cannot locate a home directory — set HOME (systemd: Environment=HOME=/home/you)"),
         });
         *core.schedules.lock().unwrap() = schedules::load_schedules(&core);
         // A broker restart orphans any run that was mid-flight — its pane died
@@ -435,7 +439,22 @@ pub fn resolve_shell(pref: Option<&str>) -> String {
     }
     #[cfg(unix)]
     {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+        if let Some(s) = std::env::var_os("SHELL")
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return s;
+        }
+        // $SHELL is reliably set for a GUI login on macOS but routinely unset
+        // under systemd, which is exactly where the broker runs headless. A
+        // hardcoded /bin/zsh does not exist on a stock Linux VM, and every
+        // pane spawn would fail. Take the first shell that is actually here.
+        for cand in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+            if std::path::Path::new(cand).is_file() {
+                return cand.to_string();
+            }
+        }
+        "/bin/sh".to_string()
     }
     #[cfg(windows)]
     {

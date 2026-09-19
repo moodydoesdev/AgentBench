@@ -15,5 +15,10 @@ fn main() {
             println!("cargo:rerun-if-changed={dir}/{plist}");
         }
     }
-    tauri_build::build()
+    // Without `gui` there is no webview to build for: tauri_build wants
+    // ../dist to exist and regenerates gen/schemas, both pointless when all
+    // we are producing is the broker or gateway binary on a headless box.
+    if std::env::var_os("CARGO_FEATURE_GUI").is_some() {
+        tauri_build::build()
+    }
 }

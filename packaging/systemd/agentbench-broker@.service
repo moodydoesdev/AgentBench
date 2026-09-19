@@ -1,0 +1,32 @@
+[Unit]
+Description=AgentBench broker (owns the agent ptys)
+Documentation=https://github.com/moodydoesdev/AgentBench
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+# HOME is not set for a systemd service, and the broker resolves its config
+# dir and transcript paths from it. Without this it panics before it binds.
+Environment=HOME=/home/%i
+# $SHELL is likewise unset here. The broker falls back to the first shell that
+# exists, but setting it explicitly is what you actually want in a pane.
+Environment=SHELL=/bin/bash
+# Agents are launched through a login shell, but a unit starts from a much
+# thinner environment than a desktop session. claude/node/git must be findable.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/%i/.local/bin:/home/%i/.nvm/versions/node/current/bin
+
+# Loopback on purpose. The protocol is unauthenticated and the `create` op
+# runs a command line, so anything that reaches this port has a shell here.
+# Remote access is the gateway's job, over a tailnet or `ssh -L`.
+ExecStart=/usr/local/bin/agentbench-broker --listen 127.0.0.1:8317
+
+Restart=on-failure
+RestartSec=2
+# The broker traps SIGTERM, kills its panes and removes broker.json.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
