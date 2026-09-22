@@ -100,6 +100,7 @@ function paneOpen(machine, pane) {
     label: title || `${pane.harness ?? "agent"} ${pane.id}`,
     subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
     kind: pane.kind,
+    harness: pane.harness ?? null,
     chat: isChatPane(pane),
     session: pane.session ?? null,
     machine: machine.machine ?? machine.name,
@@ -241,14 +242,18 @@ function ago(ts) {
 }
 
 /**
- * Only Claude panes keep a transcript, which is what the chat view reads.
- * Everything else — project run commands, and harnesses like codex or gemini —
- * is a terminal, so it belongs in a log rather than being dressed up as a
- * conversation it never had.
+ * Only Claude and Codex panes keep a transcript (Codex's rollout file), which
+ * is what the chat view reads. Everything else — project run commands, and
+ * harnesses like gemini or opencode — is a terminal, so it belongs in a log
+ * rather than being dressed up as a conversation it never had.
  */
 function isChatPane(pane) {
   if (pane.kind === "run") return false;
-  return pane.harness === "claude" || pane.harness === "claude-chat";
+  return (
+    pane.harness === "claude" ||
+    pane.harness === "claude-chat" ||
+    pane.harness === "codex"
+  );
 }
 
 /** A pairing QR opens the app with #pair=<base64 handshake>. */
@@ -1579,6 +1584,7 @@ function SchedulesSheet({ project, machine, onClose, onOpen }) {
  */
 function ChatBody({ machine, pane, status }) {
   const headless = pane.kind === "chat";
+  const agent = pane.harness === "codex" ? "Codex" : "Claude";
   const [lines, setLines] = useState(headless ? null : []);
   useEffect(() => {
     if (!headless) return;
@@ -1598,11 +1604,12 @@ function ChatBody({ machine, pane, status }) {
       id={pane.paneId}
       cwd={pane.cwd}
       mode={headless ? "stream" : "transcript"}
+      agent={agent}
       initialLines={lines}
       // headless panes ingest images the same way — the gateway writes the
       // photo to a temp file and Claude reads it by path
       allowImages
-      placeholder="Message Claude…"
+      placeholder={`Message ${agent}…`}
       // A question posed while the phone was asleep only exists in the
       // fleet snapshot; without this the agent looks idle rather than
       // blocked on an answer.
@@ -1701,7 +1708,9 @@ function ChatScreen({ machine, pane, closing, onBack }) {
         {[
           ["chat", chat ? "Chat" : "Log"],
           ["changes", "Changes"],
-          ...(chat ? [["plan", "Plan"], ["usage", "Usage"]] : []),
+          ...(chat ? [["plan", "Plan"]] : []),
+          // session_stats sums a Claude transcript; Codex rollouts differ
+          ...(chat && pane.harness !== "codex" ? [["usage", "Usage"]] : []),
         ].map(([id, label]) => (
           <button
             key={id}
