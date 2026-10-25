@@ -82,6 +82,13 @@ impl Project {
         let dir = dir
             .canonicalize()
             .map_err(|e| format!("{}: {e}", dir.display()))?;
+        // Windows canonical paths carry the \\?\ verbatim prefix, which most
+        // tools (and people) reading our output do not expect.
+        #[cfg(windows)]
+        let dir = match dir.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(plain) if !plain.starts_with("UNC\\") => PathBuf::from(plain),
+            _ => dir,
+        };
         let root = dir
             .ancestors()
             .find(|d| d.join(".agentbench").join("build.json").is_file())
