@@ -1,0 +1,131 @@
+name: Build host (Windows) test
+
+# Exercises the Windows build-host kit (abkit.ps1) for real. The runner is
+# both ends: the agentbench-build CLI runs as a Windows client, and a stand-in
+# ssh.exe hands each remote command to `cmd.exe /c` in the home directory —
+# exactly what Windows OpenSSH's sshd does with its default shell — so the
+# encoded PowerShell calls, tar streams and quoting all go through the same
+# path they take against a real Windows host. Screenshots are uploaded.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "windows-build/**"
+    paths:
+      - "src-tauri/src/buildhost/**"
+      - "src-tauri/src/remote.rs"
+      - ".github/workflows/buildhost-windows-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  kit:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: buildhost-test
+
+      - name: Build the CLI
+        working-directory: src-tauri
+        run: cargo build --no-default-features --bin agentbench-gateway
+
+      - name: Stand-in ssh
+        run: |
+          $src = @'
+          using System;
+          using System.Diagnostics;
+          class Ssh {
+            static int Main(string[] a) {
+              int i = 0;
+              while (i < a.Length) {
+                string x = a[i];
+                if (x == "-o" || x == "-L" || x == "-p" || x == "-i") { i += 2; continue; }
+                if (x.StartsWith("-")) { i++; continue; }
+                break;
+              }
+              i++; // the host
+              string cmd = String.Join(" ", a, i, a.Length - i);
+              var psi = new ProcessStartInfo("cmd.exe", "/d /c " + cmd);
+              psi.UseShellExecute = false;
+              psi.WorkingDirectory = Environment.GetEnvironmentVariable("USERPROFILE");
+              var p = Process.Start(psi);
+              p.WaitForExit();
+              return p.ExitCode;
+            }
+          }
+          '@
+          New-Item -ItemType Directory -Force fakessh | Out-Null
+          Add-Type -TypeDefinition $src -OutputAssembly fakessh\ssh.exe -OutputType ConsoleApplication
+          "$PWD\fakessh" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Sync, run, pull
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $G = "$env:GITHUB_WORKSPACE\src-tauri\target\debug\agentbench-gateway.exe"
+          $P = "$env:RUNNER_TEMP\proj"
+          New-Item -ItemType Directory -Force "$P\src", "$P\.agentbench", "$P\node_modules\x" | Out-Null
+          git -C $P init -q
+          Set-Content "$P\src\app.txt" 'v1'
+          Set-Content "$P\node_modules\x\junk.txt" 'never sent'
+          Set-Content "$P\.env" 'SECRET=never sent'
+          Set-Content "$P\.gitignore" "node_modules/`nout/"
+          Set-Content "$P\.agentbench\build.json" '{ "host": "winbox", "artifacts": ["out/**"], "env": { "GREETING": "hello" } }'
+
+          & $G build where -C $P
+          if ($LASTEXITCODE -ne 0) { throw 'where failed' }
+
+          & $G build run -C $P -- 'echo it''s "quoted" %GREETING% & mkdir out & copy src\app.txt out\ > nul & echo built> out\built.txt'
+          if ($LASTEXITCODE -ne 0) { throw "run failed: $LASTEXITCODE" }
+
+          $remote = "$env:USERPROFILE\.agentbench\builds\projects"
+          Get-ChildItem -Recurse -File $remote | ForEach-Object { $_.FullName }
+          if (Get-ChildItem -Recurse $remote -Filter junk.txt) { throw 'gitignored file was synced' }
+          if (Get-ChildItem -Recurse -Force $remote -Filter .env) { throw '.env was synced' }
+          if (-not (Get-ChildItem -Recurse "$P\.agentbench\artifacts" -Filter built.txt)) { throw 'artifact not copied back' }
+
+          & $G build run -C $P --no-artifacts -- 'exit 3'
+          if ($LASTEXITCODE -ne 3) { throw "exit code not preserved: $LASTEXITCODE" }
+
+          Set-Content "$P\src\app.txt" 'v2'
+          Remove-Item "$P\.gitignore"
+          Set-Content "$P\.gitignore" "node_modules/"
+          & $G build run -C $P --no-artifacts -- 'type src\app.txt'
+          if ($LASTEXITCODE -ne 0) { throw 'second run failed' }
+
+          & $G build pull -C $P 'src/*.txt'
+          if ($LASTEXITCODE -ne 0) { throw 'pull failed' }
+
+      - name: Provision windows + web kits
+        run: |
+          $G = "$env:GITHUB_WORKSPACE\src-tauri\target\debug\agentbench-gateway.exe"
+          & $G build provision -C "$env:RUNNER_TEMP\proj" --kits windows,web
+          & $G build hosts
+
+      - name: Capture a desktop app on a private desktop
+        run: |
+          $G = "$env:GITHUB_WORKSPACE\src-tauri\target\debug\agentbench-gateway.exe"
+          & $G build shot -C "$env:RUNNER_TEMP\proj" --windows notepad.exe --size 900x600 --name notepad --do 'type:hello from a hidden desktop'
+          if ($LASTEXITCODE -ne 0) { throw 'desktop capture failed' }
+
+      - name: Capture a web page
+        run: |
+          $G = "$env:GITHUB_WORKSPACE\src-tauri\target\debug\agentbench-gateway.exe"
+          & $G build shot -C "$env:RUNNER_TEMP\proj" --web https://example.com --name example
+          if ($LASTEXITCODE -ne 0) { throw 'web capture failed' }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: buildhost-windows-shots
+          path: ${{ runner.temp }}/proj/.agentbench/shots/
+          if-no-files-found: warn

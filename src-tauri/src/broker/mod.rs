@@ -1532,9 +1532,6 @@ pub fn create_chat_pane(
         cmd = std::process::Command::new(shell);
         cmd.arg("-lc").arg(format!("exec {line}"));
     }
-    for k in CLAUDE_SESSION_ENV {
-        cmd.env_remove(k);
-    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1545,6 +1542,9 @@ pub fn create_chat_pane(
         }
         cmd.arg(&line);
         cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    for k in CLAUDE_SESSION_ENV {
+        cmd.env_remove(k);
     }
     cmd.current_dir(&cwd)
         .env("AGENTBENCH_PANE_ID", id.to_string())

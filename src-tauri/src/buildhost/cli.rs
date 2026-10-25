@@ -15,9 +15,11 @@ usage: agentbench-build <command> [--host H] [-C DIR] [options]
   add <user@host>             check a host over SSH and save it
   remove <host>               forget a host (nothing on it is deleted)
   provision [--kits a,b]      install mise, this project's tools and packages,
-                              and capture kits: web, linux, android, ios, mac
+                              and capture kits: web, linux, windows, android,
+                              ios, mac
   sync                        send changed files (runs before run/shot anyway)
-  run [--no-sync] -- <cmd>    run <cmd> in the project on the host; output
+  run [--no-sync] -- <cmd>    run <cmd> in the project on the host (cmd.exe
+                              syntax on Windows hosts); output
                               streams back, exit code is preserved, and
                               build.json \"artifacts\" are copied back after
                               a successful run
@@ -25,6 +27,7 @@ usage: agentbench-build <command> [--host H] [-C DIR] [options]
                               on the host's screen; prints the local PNG path
       --web <url>             headless browser
       --linux <cmd>           Linux desktop app on a private virtual display
+      --windows <cmd>         Windows program on a private, never-shown desktop
       --ios <app|url>         iOS simulator (macOS host)
       --android <apk|pkg|url> Android emulator
       --mac <app>             macOS app inside a VM (Apple Silicon host)
@@ -249,18 +252,19 @@ fn dispatch(argv: &[String]) -> Result<i32, String> {
                 ("--ios", ShotMode::Ios),
                 ("--android", ShotMode::Android),
                 ("--mac", ShotMode::Mac),
+                ("--windows", ShotMode::Windows),
             ];
             let mut picked = None;
             for (flag, mode) in modes {
                 if let Some(v) = a.value(flag)? {
                     if picked.is_some() {
-                        return Err("pick one of --web, --linux, --ios, --android, --mac".into());
+                        return Err("pick one of --web, --linux, --windows, --ios, --android, --mac".into());
                     }
                     picked = Some((mode, v));
                 }
             }
             let (mode, target) = picked.ok_or(
-                "shot needs a target: --web URL, --linux CMD, --ios APP|URL, --android APK|PKG|URL or --mac APP",
+                "shot needs a target: --web URL, --linux CMD, --windows CMD, --ios APP|URL, --android APK|PKG|URL or --mac APP",
             )?;
             let o = ShotOptions {
                 target,

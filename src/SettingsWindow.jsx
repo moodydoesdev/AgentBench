@@ -860,6 +860,7 @@ function RemoteHosts() {
 const BUILD_KITS = [
   { id: "web", name: "Web pages", sub: "Headless Chromium via Playwright" },
   { id: "linux", name: "Linux apps", sub: "Private Xvfb display" },
+  { id: "windows", name: "Windows apps", sub: "Private desktop, never shown" },
   { id: "android", name: "Android", sub: "Windowless emulator" },
   { id: "ios", name: "iOS", sub: "Simulator, macOS hosts" },
   { id: "mac", name: "macOS apps", sub: "Tart VM, Apple Silicon hosts" },
@@ -944,7 +945,7 @@ function BuildHosts() {
       <Card title="Add a build machine over SSH">
         <Row
           title="Host"
-          sub="user@host, or a Host alias from ~/.ssh/config. Linux or macOS. Agents sync the project there, build it, and take screenshots in headless browsers, virtual displays, simulators and VMs — nothing appears on that machine's screen."
+          sub="user@host, or a Host alias from ~/.ssh/config. Linux, macOS, or Windows with OpenSSH Server. Agents sync the project there, build it, and take screenshots in headless browsers, virtual displays, simulators and VMs — nothing appears on that machine's screen."
           stack
         >
           <div className="bench-link-form">

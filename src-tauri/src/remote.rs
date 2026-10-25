@@ -154,7 +154,7 @@ pub(crate) fn ssh_script(host: &str, script: &str, timeout: Duration) -> Result<
 
 /// Turn ssh's stderr into something a person can act on. The raw text is
 /// included either way, but the common failures deserve a sentence.
-fn explain_ssh_failure(stderr: &str, stdout: &str) -> String {
+pub(crate) fn explain_ssh_failure(stderr: &str, stdout: &str) -> String {
     let lower = stderr.to_lowercase();
     let hint = if lower.contains("permission denied") {
         "SSH refused the key. AgentBench only uses key or agent auth, never a \

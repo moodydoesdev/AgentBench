@@ -46,6 +46,13 @@ commands that use `&&`, pipes or redirects. After a successful run, any
 `.agentbench/artifacts/<host>/<time>/`, and the paths are printed. For
 anything else, use `$B pull 'dist/**'`.
 
+## Windows hosts
+
+`$B hosts` shows the OS. On a Windows host:
+- `run` commands use cmd.exe syntax: `npm run build && dir`, and `\` in paths.
+- `packages` are winget IDs, e.g. `Microsoft.VisualStudio.2022.BuildTools`.
+- Captures are `--web`, `--windows` and `--android`.
+
 ## Toolchains
 
 Put what the build needs in `.agentbench/build.json` (create it if missing):
@@ -88,6 +95,9 @@ $B shot --web http://localhost:5173/login --serve 'npm run dev' \
 # Linux desktop app (Tauri, Electron, GTK, Qt) on a virtual display
 $B shot --linux ./src-tauri/target/release/myapp --wait 'My App' --size 1280x800
 
+# Windows program on a private desktop that is never shown (Windows host)
+$B shot --windows 'src-tauri\target\release\myapp.exe' --wait 'My App'
+
 # iOS simulator (macOS host): a simulator .app build, or a URL in Safari
 $B shot --ios build/Build/Products/Debug-iphonesimulator/App.app --device 'iPhone 16'
 $B shot --ios http://localhost:3000 --serve 'npm run dev'
@@ -107,6 +117,8 @@ title>`, `--delay <ms>`, `--appearance dark|light`, `--device <name>`,
 - web: `click:SEL`, `type:SEL=TEXT`, `press:Enter`, `hover:SEL`, `wait:SEL`,
   `goto:/path`, `scroll:800`, `sleep:500`
 - Linux: `click:X,Y`, `type:TEXT`, `key:ctrl+s`, `window:TITLE`, `sleep:MS`
+- Windows: `click:X,Y` (inside the window), `type:TEXT`, `key:enter|tab|esc`,
+  `sleep:MS`
 - Android: `tap:X,Y`, `type:TEXT`, `key:KEYCODE_BACK`, `sleep:MS`
 
 Web captures also print the HTTP status, console errors and uncaught

@@ -22,7 +22,7 @@
 
 pub mod cli;
 
-use crate::remote::{last_json, shell_quote, ssh_base, ssh_script, ssh_with};
+use crate::remote::{last_json, shell_quote, ssh_base, ssh_with, wait_with_timeout};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -32,10 +32,12 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const KIT_SH: &str = include_str!("abkit.sh");
+const KIT_PS1: &str = include_str!("abkit.ps1");
 const SHOT_MJS: &str = include_str!("shot.mjs");
 
-/// Every kit the provisioner knows. Matches the `kit_*` functions in abkit.sh.
-pub const KITS: &[&str] = &["web", "linux", "android", "ios", "mac"];
+/// Every kit the provisioner knows. Matches the `kit_*` functions in abkit.sh
+/// and abkit.ps1; each host reports which ones it can support.
+pub const KITS: &[&str] = &["web", "linux", "android", "ios", "mac", "windows"];
 
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -242,42 +244,187 @@ fn pick_host(explicit: Option<&str>, project: &Project) -> Result<String, String
 
 // ---------------------------------------------------------------- remote kit
 
-/// Remote command line that runs abkit.sh with `args`, each one quoted.
-fn kit(args: &[String]) -> String {
-    let mut line = String::from(r#"bash "$HOME/.agentbench/builds/bin/abkit.sh""#);
-    for a in args {
-        line.push(' ');
-        line.push_str(&shell_quote(a));
+/// Which kit a host runs. Windows OpenSSH starts commands in cmd.exe or
+/// PowerShell, never bash, so Windows hosts get abkit.ps1 instead of abkit.sh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Unix,
+    Windows,
+}
+
+static FAMILIES: std::sync::Mutex<Option<HashMap<String, Family>>> = std::sync::Mutex::new(None);
+
+/// The host's family: remembered for this process, else from the saved
+/// entry, else asked over SSH.
+fn family(host: &str) -> Result<Family, String> {
+    if let Some(f) = FAMILIES.lock().unwrap().as_ref().and_then(|m| m.get(host).copied()) {
+        return Ok(f);
     }
-    line
+    let f = match list_hosts().into_iter().find(|h| h.host == host) {
+        Some(h) if !h.os.is_empty() => {
+            if h.os == "Windows" {
+                Family::Windows
+            } else {
+                Family::Unix
+            }
+        }
+        _ => detect_family(host)?,
+    };
+    FAMILIES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(host.to_string(), f);
+    Ok(f)
+}
+
+/// `echo %OS%` prints Windows_NT under cmd.exe and the literal text under any
+/// POSIX shell. A Windows host whose SSH default shell is PowerShell prints
+/// the literal too, so that case is asked again in PowerShell's own terms.
+fn detect_family(host: &str) -> Result<Family, String> {
+    let out = ssh_run(host, "echo %OS%", None, EXEC_TIMEOUT)?;
+    if out.contains("Windows_NT") {
+        return Ok(Family::Windows);
+    }
+    let ps = ssh_base(host)
+        .arg("powershell -NoProfile -Command [Environment]::OSVersion.Platform")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match ps {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("Win32NT") => Ok(Family::Windows),
+        _ => Ok(Family::Unix),
+    }
+}
+
+/// Run one remote command line, optionally feeding it `stdin`, and return its
+/// stdout. Unlike `remote::ssh_script` this assumes no particular shell.
+fn ssh_run(host: &str, command: &str, stdin: Option<&[u8]>, timeout: Duration) -> Result<String, String> {
+    let mut child = ssh_base(host)
+        .arg(command)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run ssh: {e}"))?;
+    if let Some(bytes) = stdin {
+        let mut pipe = child.stdin.take().ok_or("no stdin on ssh")?;
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
+    let out = wait_with_timeout(child, timeout)?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if out.status.success() {
+        Ok(stdout)
+    } else {
+        Err(crate::remote::explain_ssh_failure(
+            &String::from_utf8_lossy(&out.stderr),
+            &stdout,
+        ))
+    }
+}
+
+/// A PowerShell script as one shell-proof command line. -EncodedCommand is
+/// base64 of UTF-16LE, which survives cmd.exe and PowerShell alike as the SSH
+/// default shell: there is nothing left in it for either to interpret.
+fn ps_command(script: &str) -> String {
+    use base64::Engine;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    format!(
+        "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+        base64::engine::general_purpose::STANDARD.encode(utf16)
+    )
+}
+
+/// PowerShell single-quoted string: only `'` is special, and it doubles.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Remote command line that runs the host's kit with `args`, each one quoted
+/// for that host's shell.
+fn kit(fam: Family, args: &[String]) -> String {
+    match fam {
+        Family::Unix => {
+            let mut line = String::from(r#"bash "$HOME/.agentbench/builds/bin/abkit.sh""#);
+            for a in args {
+                line.push(' ');
+                line.push_str(&shell_quote(a));
+            }
+            line
+        }
+        Family::Windows => {
+            let quoted: Vec<String> = args.iter().map(|a| ps_quote(a)).collect();
+            ps_command(&format!(
+                "& (Join-Path $env:USERPROFILE '.agentbench\\builds\\bin\\abkit.ps1') {}; exit $LASTEXITCODE",
+                quoted.join(" ")
+            ))
+        }
+    }
+}
+
+/// Path of a project folder relative to the SSH session's starting directory,
+/// which is the home directory on every OpenSSH, Windows included. Raw `tar`
+/// commands use it so they need no shell variables at all.
+fn project_rel(slug: &str, sub: &str) -> String {
+    format!(".agentbench/builds/projects/{slug}/{sub}")
 }
 
 fn kit_version() -> String {
-    crate::gateway::tokens::hash(&format!("{KIT_SH}\0{SHOT_MJS}"))[..16].to_string()
+    crate::gateway::tokens::hash(&format!("{KIT_SH}\0{KIT_PS1}\0{SHOT_MJS}"))[..16].to_string()
 }
 
-/// Upload abkit.sh and shot.mjs unless the host already has this version.
+/// Upload the kit and shot.mjs unless the host already has this version.
 /// One round trip when they are current.
 pub fn ensure_kit(host: &str) -> Result<(), String> {
     let want = kit_version();
-    let check = format!(
-        r#"set -u
-v="$(cat "$HOME/.agentbench/builds/bin/.kit" 2>/dev/null || true)"
-printf '{{"current":%s}}\n' "$([ "$v" = "{want}" ] && echo true || echo false)""#
-    );
-    if last_json(&ssh_script(host, &check, EXEC_TIMEOUT)?)?["current"] == json!(true) {
-        return Ok(());
+    match family(host)? {
+        Family::Unix => {
+            let check = format!(
+                r#"v="$(cat "$HOME/.agentbench/builds/bin/.kit" 2>/dev/null || true)"; [ "$v" = "{want}" ] && echo '{{"current":true}}' || echo '{{"current":false}}'"#
+            );
+            if last_json(&ssh_run(host, &check, None, EXEC_TIMEOUT)?)?["current"] == json!(true) {
+                return Ok(());
+            }
+            // Quoted heredoc delimiters: nothing inside is expanded by the
+            // remote shell, so the files land byte for byte.
+            let upload = format!(
+                "set -eu\nd=\"$HOME/.agentbench/builds/bin\"\nmkdir -p \"$d\"\n\
+                 cat > \"$d/abkit.sh.new\" <<'ABKIT_EOF_7c1f'\n{KIT_SH}\nABKIT_EOF_7c1f\n\
+                 cat > \"$d/shot.mjs.new\" <<'ABKIT_EOF_7c1f'\n{SHOT_MJS}\nABKIT_EOF_7c1f\n\
+                 mv \"$d/abkit.sh.new\" \"$d/abkit.sh\"\nmv \"$d/shot.mjs.new\" \"$d/shot.mjs\"\n\
+                 chmod +x \"$d/abkit.sh\"\nprintf '%s' '{want}' > \"$d/.kit\"\nprintf '{{\"ok\":true}}\\n'\n"
+            );
+            last_json(&ssh_run(host, "bash -s", Some(upload.as_bytes()), EXEC_TIMEOUT)?).map(|_| ())
+        }
+        Family::Windows => {
+            let check = ps_command(&format!(
+                "$v = Get-Content (Join-Path $env:USERPROFILE '.agentbench\\builds\\bin\\.kit') -ErrorAction SilentlyContinue; \
+                 if ($v -eq '{want}') {{ '{{\"current\":true}}' }} else {{ '{{\"current\":false}}' }}"
+            ));
+            if last_json(&ssh_run(host, &check, None, EXEC_TIMEOUT)?)?["current"] == json!(true) {
+                return Ok(());
+            }
+            // Both files travel as base64 lines on stdin: PowerShell would
+            // re-encode raw text read from the console.
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let payload = format!("{}\n{}\n", b64.encode(KIT_PS1), b64.encode(SHOT_MJS));
+            let upload = ps_command(&format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 $d = Join-Path $env:USERPROFILE '.agentbench\\builds\\bin'; \
+                 New-Item -ItemType Directory -Force -Path $d | Out-Null; \
+                 $l = [Console]::In.ReadToEnd() -split \"`n\" | Where-Object {{ $_.Trim() }}; \
+                 [IO.File]::WriteAllBytes((Join-Path $d 'abkit.ps1'), [Convert]::FromBase64String($l[0].Trim())); \
+                 [IO.File]::WriteAllBytes((Join-Path $d 'shot.mjs'), [Convert]::FromBase64String($l[1].Trim())); \
+                 Set-Content -Path (Join-Path $d '.kit') -Value '{want}' -NoNewline; \
+                 '{{\"ok\":true}}'"
+            ));
+            last_json(&ssh_run(host, &upload, Some(payload.as_bytes()), EXEC_TIMEOUT)?).map(|_| ())
+        }
     }
-    // Quoted heredoc delimiters: nothing inside is expanded by the remote
-    // shell, so the files land byte for byte.
-    let upload = format!(
-        "set -eu\nd=\"$HOME/.agentbench/builds/bin\"\nmkdir -p \"$d\"\n\
-         cat > \"$d/abkit.sh.new\" <<'ABKIT_EOF_7c1f'\n{KIT_SH}\nABKIT_EOF_7c1f\n\
-         cat > \"$d/shot.mjs.new\" <<'ABKIT_EOF_7c1f'\n{SHOT_MJS}\nABKIT_EOF_7c1f\n\
-         mv \"$d/abkit.sh.new\" \"$d/abkit.sh\"\nmv \"$d/shot.mjs.new\" \"$d/shot.mjs\"\n\
-         chmod +x \"$d/abkit.sh\"\nprintf '%s' '{want}' > \"$d/.kit\"\nprintf '{{\"ok\":true}}\\n'\n"
-    );
-    last_json(&ssh_script(host, &upload, EXEC_TIMEOUT)?).map(|_| ())
 }
 
 /// Run a kit subcommand and return its last JSON line. stderr (download
@@ -289,7 +436,7 @@ fn kit_json(
     mut on_line: impl FnMut(&str, bool),
 ) -> Result<Value, String> {
     let mut child = ssh_base(host)
-        .arg(kit(args))
+        .arg(kit(family(host)?, args))
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -345,8 +492,8 @@ pub fn probe(host: &str) -> Result<BuildHost, String> {
     ensure_kit(host)?;
     let v = kit_json(host, &["probe".into()], None, |_, _| {})?;
     let os = v["os"].as_str().unwrap_or_default().to_string();
-    if os != "Linux" && os != "Darwin" {
-        return Err(format!("{host} runs {os}; build hosts are Linux or macOS"));
+    if !matches!(os.as_str(), "Linux" | "Darwin" | "Windows") {
+        return Err(format!("{host} runs {os}; build hosts are Linux, macOS or Windows"));
     }
     Ok(BuildHost {
         host: host.to_string(),
@@ -567,9 +714,10 @@ pub struct SyncStats {
 /// survive between runs and builds stay incremental.
 pub fn sync(host: &str, project: &Project) -> Result<SyncStats, String> {
     ensure_kit(host)?;
+    let fam = family(host)?;
     let local = project_files(project)?;
     let remote_raw = ssh_base(host)
-        .arg(kit(&["manifest".into(), project.slug.clone()]))
+        .arg(kit(fam, &["manifest".into(), project.slug.clone()]))
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()
@@ -577,8 +725,18 @@ pub fn sync(host: &str, project: &Project) -> Result<SyncStats, String> {
     if !remote_raw.status.success() {
         return Err(String::from_utf8_lossy(&remote_raw.stderr).trim().to_string());
     }
+    // The Windows kit returns it base64: PowerShell re-encodes raw stdout.
+    let manifest_bytes = match fam {
+        Family::Unix => remote_raw.stdout,
+        Family::Windows => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(String::from_utf8_lossy(&remote_raw.stdout).trim())
+                .unwrap_or_default()
+        }
+    };
     let remote: HashMap<String, Stamp> =
-        serde_json::from_slice(&remote_raw.stdout).unwrap_or_default();
+        serde_json::from_slice(&manifest_bytes).unwrap_or_default();
 
     let changed: Vec<&String> = local
         .iter()
@@ -614,10 +772,19 @@ pub fn sync(host: &str, project: &Project) -> Result<SyncStats, String> {
     Ok(stats)
 }
 
-/// A kit subcommand fed `stdin`, ignoring its stdout.
+/// A kit subcommand fed `stdin`, ignoring its stdout. The Windows kit reads
+/// its stdin as base64 text, since PowerShell re-encodes raw console input.
 fn kit_json_raw(host: &str, args: &[String], stdin: Vec<u8>) -> Result<(), String> {
+    let fam = family(host)?;
+    let stdin = match fam {
+        Family::Unix => stdin,
+        Family::Windows => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(stdin).into_bytes()
+        }
+    };
     let mut child = ssh_base(host)
-        .arg(kit(args))
+        .arg(kit(fam, args))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -652,8 +819,17 @@ fn send_tar(host: &str, project: &Project, files: &[&String]) -> Result<(), Stri
         .spawn()
         .map_err(|e| format!("cannot run tar: {e}"))?;
     let tar_out = tar.stdout.take().ok_or("no stdout on tar")?;
+    // Windows: tar.exe reads the stream directly. Through PowerShell it would
+    // be re-encoded, so the folder is made first and tar is the whole command.
+    let unpack = match family(host)? {
+        Family::Unix => kit(Family::Unix, &["unpack".into(), project.slug.clone()]),
+        Family::Windows => {
+            kit_json(host, &["prepare".into(), project.slug.clone()], None, |_, _| {})?;
+            format!("tar -xzf - -C \"{}\"", project_rel(&project.slug, "src"))
+        }
+    };
     let ssh = ssh_base(host)
-        .arg(kit(&["unpack".into(), project.slug.clone()]))
+        .arg(unpack)
         .stdin(Stdio::from(tar_out))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -704,7 +880,7 @@ pub fn run(host: &str, project: &Project, command: &str, tty: bool) -> Result<i3
     args.push(command.to_string());
     let flags: &[&str] = if tty { &["-tt"] } else { &[] };
     let status = ssh_with(host, flags)
-        .arg(kit(&args))
+        .arg(kit(family(host)?, &args))
         .stdin(if tty { Stdio::inherit() } else { Stdio::null() })
         .status()
         .map_err(|e| format!("cannot run ssh: {e}"))?;
@@ -719,8 +895,43 @@ pub fn run(host: &str, project: &Project, command: &str, tty: bool) -> Result<i3
 /// extracted. Absolute paths, `..` and links of any kind are refused outright,
 /// so a compromised build host cannot write outside `dest`.
 pub fn pull(host: &str, project: &Project, patterns: &[String], dest: &Path) -> Result<Vec<String>, String> {
-    let mut args = vec!["pack".to_string(), project.slug.clone()];
-    args.extend(patterns.iter().cloned());
+    let command = match family(host)? {
+        Family::Unix => {
+            let mut args = vec!["pack".to_string(), project.slug.clone()];
+            args.extend(patterns.iter().cloned());
+            kit(Family::Unix, &args)
+        }
+        // The kit writes the matching list; tar.exe then streams the files
+        // itself, so the archive never passes through PowerShell.
+        Family::Windows => {
+            let mut args = vec!["pack-list".to_string(), project.slug.clone()];
+            args.extend(patterns.iter().cloned());
+            let v = kit_json(host, &args, None, |_, _| {})?;
+            if v["count"].as_u64().unwrap_or(0) == 0 {
+                eprintln!("no files matched: {}", patterns.join(" "));
+                return Ok(Vec::new());
+            }
+            let list = windows_path(&v["list"])?;
+            let src = windows_path(&v["src"])?;
+            format!("tar -cf - -C \"{src}\" -T \"{list}\"")
+        }
+    };
+    untar_from(host, &command, dest)
+}
+
+/// A path the Windows kit reported, safe to put in double quotes on a cmd or
+/// PowerShell command line.
+fn windows_path(v: &Value) -> Result<String, String> {
+    let p = v.as_str().unwrap_or_default();
+    if p.is_empty() || p.contains(['"', '%', '`', '$', '\n', '\r']) {
+        return Err(format!("unexpected path from the build host: {p:?}"));
+    }
+    Ok(p.to_string())
+}
+
+/// Run `command` on the host, which writes a tar to stdout, and unpack it
+/// under `dest` after checking every entry.
+fn untar_from(host: &str, command: &str, dest: &Path) -> Result<Vec<String>, String> {
     let staging = std::env::temp_dir().join(format!(
         "agentbench-pull-{}-{}.tar",
         std::process::id(),
@@ -728,7 +939,7 @@ pub fn pull(host: &str, project: &Project, patterns: &[String], dest: &Path) -> 
     ));
     let file = std::fs::File::create(&staging).map_err(|e| e.to_string())?;
     let ssh = ssh_base(host)
-        .arg(kit(&args))
+        .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::piped())
@@ -823,13 +1034,15 @@ pub enum ShotMode {
     Android,
     /// A macOS .app inside a Tart VM. Apple Silicon hosts.
     Mac,
+    /// A Windows program on a private, never-shown desktop. Windows hosts.
+    Windows,
 }
 
 impl ShotMode {
     fn sub(self) -> &'static str {
         match self {
             ShotMode::Web => "shot-web",
-            ShotMode::Linux => "shot-app",
+            ShotMode::Linux | ShotMode::Windows => "shot-app",
             ShotMode::Ios => "shot-ios",
             ShotMode::Android => "shot-android",
             ShotMode::Mac => "shot-mac",
@@ -887,7 +1100,7 @@ pub fn shot(host: &str, project: &Project, mode: ShotMode, o: &ShotOptions) -> R
     let t = o.target.clone();
     match mode {
         ShotMode::Web => args.extend(["--url".into(), t]),
-        ShotMode::Linux | ShotMode::Mac => args.extend(["--app".into(), t]),
+        ShotMode::Linux | ShotMode::Mac | ShotMode::Windows => args.extend(["--app".into(), t]),
         ShotMode::Ios => {
             if t.contains("://") {
                 args.extend(["--url".into(), t]);
@@ -947,7 +1160,26 @@ pub fn shot(host: &str, project: &Project, mode: ShotMode, o: &ShotOptions) -> R
     let dir = project.root.join(".agentbench").join("shots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let local = dir.join(&file);
-    fetch(host, remote_path, &local)?;
+    match family(host)? {
+        Family::Unix => fetch(host, remote_path, &local)?,
+        // tar.exe streams the PNG so PowerShell never touches the bytes.
+        Family::Windows => {
+            let tmp = std::env::temp_dir().join(format!(
+                "agentbench-shot-{}-{}",
+                std::process::id(),
+                chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            let cmd = format!("tar -cf - -C \"{}\" \"{file}\"", project_rel(&project.slug, "shots"));
+            let got = untar_from(host, &cmd, &tmp);
+            let moved = got.and_then(|_| {
+                std::fs::copy(tmp.join(&file), &local)
+                    .map(|_| ())
+                    .map_err(|e| format!("could not copy the screenshot back: {e}"))
+            });
+            let _ = std::fs::remove_dir_all(&tmp);
+            moved?;
+        }
+    }
     Ok(Shot {
         path: local,
         notes: v["notes"].as_str().unwrap_or_default().to_string(),
@@ -1079,8 +1311,29 @@ mod tests {
     }
 
     #[test]
+    fn windows_kit_lines_are_encoded() {
+        use base64::Engine;
+        let line = kit(Family::Windows, &["run".into(), "--".into(), "echo it's \"ok\" & dir".into()]);
+        let b64 = line.rsplit(' ').next().unwrap();
+        assert!(line.starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "));
+        // nothing a shell could interpret survives on the command line
+        assert!(b64.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)));
+        let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let utf16: Vec<u16> = raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let script = String::from_utf16(&utf16).unwrap();
+        assert!(script.contains("abkit.ps1') 'run' '--' 'echo it''s \"ok\" & dir'; exit $LASTEXITCODE"), "{script}");
+    }
+
+    #[test]
+    fn windows_paths_from_the_host_are_checked() {
+        assert!(windows_path(&json!("C:/Users/me/.agentbench/builds/projects/a/run/pack.list")).is_ok());
+        assert!(windows_path(&json!("C:/x\" & calc & \"")).is_err());
+        assert!(windows_path(&json!("%TEMP%/x")).is_err());
+    }
+
+    #[test]
     fn kit_args_are_quoted() {
-        let line = kit(&["run".into(), "--".into(), "npm run build && echo 'done'".into()]);
+        let line = kit(Family::Unix, &["run".into(), "--".into(), "npm run build && echo 'done'".into()]);
         assert_eq!(
             line,
             r#"bash "$HOME/.agentbench/builds/bin/abkit.sh" 'run' '--' 'npm run build && echo '\''done'\'''"#

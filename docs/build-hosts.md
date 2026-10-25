@@ -5,7 +5,8 @@ projects. Agents use one through `agentbench-build`. Run commands can target
 one too, and their output streams into a normal run pane.
 
 It is only an SSH target. Unlike a [remote host](linux-vm.md), it runs no
-AgentBench daemons, so it can be Linux or a Mac.
+AgentBench daemons, so it can be Linux, a Mac, or Windows with OpenSSH
+Server.
 
 ## Setup
 
@@ -17,12 +18,14 @@ with an **Install** button:
 | ----------- | ------------------------------------ | --------------------- |
 | Web pages   | any URL, in headless Chromium/WebKit | Linux or macOS        |
 | Linux apps  | Tauri, Electron, GTK, Qt windows     | Linux                 |
+| Windows apps| any Win32, WebView2 or Electron app  | Windows               |
 | Android     | an .apk, package or URL              | Linux (with KVM), Mac |
 | iOS         | a simulator .app build, or a URL     | macOS with Xcode      |
 | macOS apps  | an .app, inside a Tart VM            | Apple Silicon Mac     |
 
-The host needs key or agent SSH auth (no password prompt), `curl`, `tar` and
-`bash`. Use a dedicated user account: agents run builds there without asking
+A Linux or macOS host needs key or agent SSH auth (no password prompt),
+`curl`, `tar` and `bash`. Windows hosts are covered under
+[Windows hosts](#windows-hosts). Use a dedicated user account: agents run builds there without asking
 first, so give them an account with nothing else in it.
 
 ## Nothing shows on the host's screen
@@ -35,6 +38,10 @@ Every capture runs somewhere nobody is looking:
 - **iOS:** a simulator in AgentBench's own device set. It boots with
   `simctl` and Simulator.app is never opened, so there is no window, and your
   own simulators are never touched.
+- **Windows apps:** a desktop created for the capture and never switched to.
+  Windows lays the app out there and PrintWindow draws it into a bitmap.
+  Clicks and typing go to the window as messages, never through the real
+  mouse and keyboard.
 - **Android:** an emulator started with `-no-window`.
 - **macOS apps:** a Tart VM run with `--no-graphics`. The app opens inside the
   VM, never on the host's desktop.
@@ -110,6 +117,39 @@ write outside that folder.
 Nothing is written outside that folder, except system packages and Xcode's
 own simulator runtimes. To remove everything, delete `~/.agentbench/builds`.
 
+## Windows hosts
+
+Windows 10/11 or Server 2019+ with the built-in OpenSSH Server. In an
+administrator PowerShell on that machine:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Set-Service sshd -StartupType Automatic; Start-Service sshd
+```
+
+Then add your Mac's public key:
+- **Administrator account:** `C:\ProgramData\ssh\administrators_authorized_keys`
+- **Standard account:** `%USERPROFILE%\.ssh\authorized_keys`
+
+Check `ssh user@pc` works from the Mac without a password, then add
+`user@pc` in Settings → Build hosts.
+
+What is different on Windows:
+
+- The kit is PowerShell (`abkit.ps1`), and every call is sent with
+  `-EncodedCommand`. That works whether the SSH default shell is cmd.exe or
+  PowerShell. Files still travel as tar streams, through the `tar.exe` built
+  into Windows.
+- `run` commands are cmd.exe syntax: `npm run build && dir`.
+- `packages` in build.json are winget IDs
+  (`Microsoft.VisualStudio.2022.BuildTools`). Installs that need elevation
+  only work when the SSH account is an administrator.
+- Capture kits: web, windows and android. The Android emulator needs the
+  Windows Hypervisor Platform feature enabled.
+- **Windows app capture is the least proven path.** Some apps,
+  GPU-composited ones especially, may draw blank on a desktop that is never
+  shown. If they do, a Hyper-V VM is the fallback, as Tart is on macOS.
+
 ## The CLI
 
 `agentbench-build --help` lists every command. The ones agents use most:
@@ -144,4 +184,6 @@ happens to be newest: mise `v2026.10.1` (SHA256-checked), Playwright
   Cirrus Labs images include. The first clone is a download of about 25 GB.
 - **Android on Linux** needs `/dev/kvm`. Without it the emulator is too slow
   to use, and `provision` says so.
-- **No Windows build hosts yet.**
+- **Windows hosts** are tested on GitHub's Windows runners (see
+  `.github/workflows/buildhost-windows-test.yml`), not yet against a real PC
+  over SSH.
