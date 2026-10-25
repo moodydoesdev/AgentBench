@@ -102,6 +102,14 @@ function Release-All { foreach ($d in $script:Locks) { Remove-Item -Recurse -For
 
 function Kill-Tree([int]$id) { & taskkill.exe /T /F /PID $id 2>&1 | Out-Null }
 
+# .NET rather than Get-FileHash: a module cmdlet can be missing when the
+# module path is unusual.
+function Sha256([string]$path) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $fs = [IO.File]::OpenRead($path)
+  try { -join ($sha.ComputeHash($fs) | ForEach-Object { $_.ToString('x2') }) } finally { $fs.Dispose() }
+}
+
 function Download([string]$url, [string]$out) {
   Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $out
 }
@@ -123,7 +131,7 @@ function Install-Mise {
   $line = Select-String -Path "$tmp\sums" -Pattern ([regex]::Escape($asset) + '$') | Select-Object -First 1
   $expect = ''
   if ($line) { $expect = ($line.Line -split '\s+')[0].ToLower() }
-  $got = (Get-FileHash -Algorithm SHA256 "$tmp\$asset").Hash.ToLower()
+  $got = Sha256 "$tmp\$asset"
   if (-not $expect -or $expect -ne $got) { Remove-Item -Recurse -Force $tmp; Fail "mise checksum mismatch (expected $expect, got $got)" }
   Move-Item -Force "$tmp\$asset" "$B\bin\mise.exe"
   Set-Content -Path "$B\bin\.mise-version" -Value $want -NoNewline
@@ -474,6 +482,7 @@ public static class AbWin {
   [StructLayout(LayoutKind.Sequential)]
   struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   delegate bool EnumProc(IntPtr h, IntPtr l);
 
   [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -490,6 +499,12 @@ public static class AbWin {
   [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] static extern IntPtr ChildWindowFromPointEx(IntPtr h, POINT p, uint flags);
+  [DllImport("user32.dll")] static extern int MapWindowPoints(IntPtr from, IntPtr to, ref POINT p, int n);
+
+  // The control the last click landed on; typing goes there.
+  static IntPtr lastTarget = IntPtr.Zero;
 
   public static IntPtr Desktop(string name) {
     // GENERIC_ALL. The desktop is never passed to SwitchDesktop, so it is
@@ -548,16 +563,47 @@ public static class AbWin {
   }
 
   // Input goes to the window as messages, not through the real mouse and
-  // keyboard, which belong to the person at the machine.
-  public static void Click(IntPtr h, int x, int y) {
-    IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-    PostMessage(h, 0x0201, (IntPtr)1, lp);
-    PostMessage(h, 0x0202, IntPtr.Zero, lp);
+  // keyboard, which belong to the person at the machine. Messages go to the
+  // innermost control under the point, the way a real click would land.
+  // x,y are relative to the window's top-left corner, as in the screenshot.
+  public static void Click(IntPtr top, int x, int y) {
+    RECT r; GetWindowRect(top, out r);
+    POINT screen = new POINT { X = r.L + x, Y = r.T + y };
+    IntPtr target = top;
+    for (int depth = 0; depth < 32; depth++) {
+      POINT c = screen; MapWindowPoints(IntPtr.Zero, target, ref c, 1);
+      // CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT
+      IntPtr child = ChildWindowFromPointEx(target, c, 0x1 | 0x4);
+      if (child == IntPtr.Zero || child == target) break;
+      target = child;
+    }
+    POINT cp = screen; MapWindowPoints(IntPtr.Zero, target, ref cp, 1);
+    IntPtr lp = (IntPtr)((cp.Y << 16) | (cp.X & 0xFFFF));
+    PostMessage(target, 0x0201, (IntPtr)1, lp);
+    PostMessage(target, 0x0202, IntPtr.Zero, lp);
+    lastTarget = target;
   }
-  public static void Type(IntPtr h, string text) {
+
+  // Where keystrokes go: the last clicked control, else the largest visible
+  // child (the editor or web view in most apps), else the window itself.
+  static IntPtr KeyTarget(IntPtr top) {
+    if (lastTarget != IntPtr.Zero) return lastTarget;
+    IntPtr best = top; long bestArea = 0;
+    EnumChildWindows(top, (h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      RECT r; GetWindowRect(h, out r);
+      long area = (long)(r.R - r.L) * (r.B - r.T);
+      if (area > bestArea) { bestArea = area; best = h; }
+      return true;
+    }, IntPtr.Zero);
+    return best;
+  }
+  public static void Type(IntPtr top, string text) {
+    IntPtr h = KeyTarget(top);
     foreach (char c in text) PostMessage(h, 0x0102, (IntPtr)c, IntPtr.Zero);
   }
-  public static void Key(IntPtr h, int vk) {
+  public static void Key(IntPtr top, int vk) {
+    IntPtr h = KeyTarget(top);
     PostMessage(h, 0x0100, (IntPtr)vk, IntPtr.Zero);
     PostMessage(h, 0x0101, (IntPtr)vk, IntPtr.Zero);
   }

@@ -329,11 +329,21 @@ fn ssh_run(host: &str, command: &str, stdin: Option<&[u8]>, timeout: Duration) -
 /// A PowerShell script as one shell-proof command line. -EncodedCommand is
 /// base64 of UTF-16LE, which survives cmd.exe and PowerShell alike as the SSH
 /// default shell: there is nothing left in it for either to interpret.
+///
+/// The preamble pins Windows PowerShell's own module path, since one
+/// inherited from a PowerShell 7 parent hides built-in cmdlets, and silences
+/// progress records. -OutputFormat Text keeps errors readable instead of
+/// CLIXML.
 fn ps_command(script: &str) -> String {
     use base64::Engine;
+    let script = format!(
+        "$ProgressPreference = 'SilentlyContinue'; \
+         $env:PSModulePath = \"$env:ProgramFiles\\WindowsPowerShell\\Modules;$env:SystemRoot\\system32\\WindowsPowerShell\\v1.0\\Modules\"; \
+         {script}"
+    );
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     format!(
-        "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+        "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand {}",
         base64::engine::general_purpose::STANDARD.encode(utf16)
     )
 }
@@ -1315,7 +1325,7 @@ mod tests {
         use base64::Engine;
         let line = kit(Family::Windows, &["run".into(), "--".into(), "echo it's \"ok\" & dir".into()]);
         let b64 = line.rsplit(' ').next().unwrap();
-        assert!(line.starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "));
+        assert!(line.starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand "));
         // nothing a shell could interpret survives on the command line
         assert!(b64.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)));
         let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();

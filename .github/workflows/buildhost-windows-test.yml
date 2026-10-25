@@ -111,12 +111,13 @@ jobs:
         run: |
           $G = "$env:GITHUB_WORKSPACE\src-tauri\target\debug\agentbench-gateway.exe"
           & $G build provision -C "$env:RUNNER_TEMP\proj" --kits windows,web
+          if ($LASTEXITCODE -ne 0) { throw "provision failed: $LASTEXITCODE" }
           & $G build hosts
 
       - name: Capture a desktop app on a private desktop
         run: |
           $G = "$env:GITHUB_WORKSPACE\src-tauri\target\debug\agentbench-gateway.exe"
-          & $G build shot -C "$env:RUNNER_TEMP\proj" --windows notepad.exe --size 900x600 --name notepad --do 'type:hello from a hidden desktop'
+          & $G build shot -C "$env:RUNNER_TEMP\proj" --windows notepad.exe --size 900x600 --name notepad --do 'click:300,200' --do 'type:hello from a hidden desktop'
           if ($LASTEXITCODE -ne 0) { throw 'desktop capture failed' }
 
       - name: Capture a web page
