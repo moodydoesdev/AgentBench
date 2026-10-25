@@ -39,7 +39,9 @@ jobs:
         working-directory: src-tauri
         run: cargo build --no-default-features --bin agentbench-gateway
 
+      # Windows PowerShell 5.1: pwsh's Add-Type cannot emit an .exe.
       - name: Stand-in ssh
+        shell: powershell
         run: |
           $src = @'
           using System;
