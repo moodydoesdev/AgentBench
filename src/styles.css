@@ -1984,7 +1984,7 @@ body.bg-image .pane-term.wterm-host .wterm {
 
 /* compact variant of the composer modal for the command editor */
 .composer.runcmd {
-  width: min(620px, calc(100vw - 96px));
+  width: min(760px, calc(100vw - 96px));
   height: auto;
   max-height: 80vh;
 }
@@ -2219,6 +2219,17 @@ body.bg-image .pane-term.wterm-host .wterm {
 
 .runcmd-row .btn-icon {
   flex: none;
+}
+
+.runcmd-host {
+  flex: 0 0 140px;
+  min-width: 0;
+}
+
+.runcmd-labels .runcmd-where-label {
+  flex: 0 0 140px;
+  margin-left: auto;
+  margin-right: 92px; /* past the default badge and delete button */
 }
 
 .runcmd-add {
@@ -5692,6 +5703,40 @@ button.chat-question-opt.choice.on {
   gap: 6px;
   width: 100%;
   margin-top: 6px;
+}
+
+/* Build hosts: one line per capture kit, its install button at the end and
+   anything a person must run on the host spelled out underneath. */
+.build-kits {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  margin: 4px 0 8px;
+}
+
+.build-kit {
+  display: grid;
+  grid-template-columns: auto 110px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+}
+
+.build-kit-name {
+  font-size: 12px;
+}
+
+.build-kit .settings-row-sub {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.build-kit-need {
+  grid-column: 2 / -1;
+  max-height: 90px;
 }
 
 /* ── web mode: login gate + in-page settings modal ─────────────── */

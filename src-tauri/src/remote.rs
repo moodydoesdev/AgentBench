@@ -77,8 +77,15 @@ impl Drop for Tunnel {
 /// `BatchMode=yes` is the important one: it makes a host that would prompt for
 /// a password fail immediately instead of hanging on a prompt nobody can see.
 /// Key or agent auth only, and the error says so.
-fn ssh_base(host: &str) -> Command {
+pub(crate) fn ssh_base(host: &str) -> Command {
+    ssh_with(host, &[])
+}
+
+/// `ssh_base` plus flags that must precede the host, e.g. `-tt` to give a
+/// remote build a terminal so its colours and Ctrl-C work.
+pub(crate) fn ssh_with(host: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
+    cmd.args(extra);
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
@@ -120,7 +127,7 @@ fn control_path() -> String {
 ///
 /// The script goes in on stdin rather than as an argument so quoting is not a
 /// problem: no shell on either side gets a chance to mangle it.
-fn ssh_script(host: &str, script: &str, timeout: Duration) -> Result<String, String> {
+pub(crate) fn ssh_script(host: &str, script: &str, timeout: Duration) -> Result<String, String> {
     let mut child = ssh_base(host)
         .arg("bash -s")
         .stdin(Stdio::piped())
@@ -182,7 +189,7 @@ fn explain_ssh_failure(stderr: &str, stdout: &str) -> String {
 
 /// `Child::wait_with_output` has no timeout, and a wedged ssh would hang the
 /// command forever. Poll instead and kill on expiry.
-fn wait_with_timeout(
+pub(crate) fn wait_with_timeout(
     mut child: Child,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
@@ -211,7 +218,7 @@ fn wait_with_timeout(
 
 /// Last JSON object printed by a script, so `set -x` noise or a chatty profile
 /// cannot break parsing. Remote shells print MOTDs and all sorts.
-fn last_json(out: &str) -> Result<Value, String> {
+pub(crate) fn last_json(out: &str) -> Result<Value, String> {
     out.lines()
         .rev()
         .map(str::trim)
@@ -304,7 +311,7 @@ printf '{{"ok":true}}\n'
 
 /// Single-quote for POSIX sh: wrap in quotes and turn each embedded quote
 /// into '\''. Nothing inside can then be interpreted by the remote shell.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

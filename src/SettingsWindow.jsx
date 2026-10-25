@@ -15,6 +15,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   BellSimple,
   DeviceMobile,
+  Hammer,
   Keyboard,
   Play,
   SpeakerHigh,
@@ -855,6 +856,187 @@ function RemoteHosts() {
   );
 }
 
+// Capture kits a build host can provision. Mirrors KITS in buildhost/mod.rs.
+const BUILD_KITS = [
+  { id: "web", name: "Web pages", sub: "Headless Chromium via Playwright" },
+  { id: "linux", name: "Linux apps", sub: "Private Xvfb display" },
+  { id: "android", name: "Android", sub: "Windowless emulator" },
+  { id: "ios", name: "iOS", sub: "Simulator, macOS hosts" },
+  { id: "mac", name: "macOS apps", sub: "Tart VM, Apple Silicon hosts" },
+];
+
+// Build hosts: SSH machines agents build, run and screenshot on through
+// `agentbench-build`. No daemons needed there, so Macs qualify too.
+function BuildHosts() {
+  const [host, setHost] = useState("");
+  const [hosts, setHosts] = useState([]);
+  const [busy, setBusy] = useState(null); // host being added or provisioned
+  const [lines, setLines] = useState([]); // provision progress for `busy`
+  const [error, setError] = useState(null);
+
+  const refresh = () =>
+    invoke("build_hosts")
+      .then((list) => setHosts(Array.isArray(list) ? list : []))
+      .catch(() => {});
+
+  useEffect(() => {
+    refresh();
+    const un = listen("build-progress", (e) => {
+      const { line, log } = e.payload || {};
+      if (!line) return;
+      let text = line;
+      if (!log) {
+        try {
+          const r = JSON.parse(line);
+          if (!r.kit) return;
+          const mark = { ok: "✓", needs: "!", unsupported: "–" }[r.status] || "✗";
+          text = `${mark} ${r.kit}: ${r.detail}`;
+        } catch {
+          return;
+        }
+      }
+      setLines((cur) => [...cur.slice(-40), text]);
+    });
+    return () => un.then((f) => f());
+  }, []);
+
+  const add = async () => {
+    const name = host.trim();
+    if (!name) return;
+    setBusy(name);
+    setError(null);
+    setLines([`${name}: checking over SSH`]);
+    try {
+      await invoke("build_host_add", { host: name });
+      setHost("");
+      setLines([]);
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const provision = async (name, kits) => {
+    setBusy(name);
+    setError(null);
+    setLines([`${name}: installing ${kits.join(", ")} — browsers and SDKs can take a few minutes`]);
+    try {
+      await invoke("build_host_provision", { host: name, kits });
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (name) => {
+    await invoke("build_host_remove", { host: name }).catch(() => {});
+    refresh();
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Build hosts</h2>
+
+      <Card title="Add a build machine over SSH">
+        <Row
+          title="Host"
+          sub="user@host, or a Host alias from ~/.ssh/config. Linux or macOS. Agents sync the project there, build it, and take screenshots in headless browsers, virtual displays, simulators and VMs — nothing appears on that machine's screen."
+          stack
+        >
+          <div className="bench-link-form">
+            <input
+              className="harness-input cmd"
+              placeholder="build@10.0.0.20"
+              value={host}
+              spellCheck={false}
+              onChange={(e) => setHost(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && add()}
+            />
+            <button className="btn-sm" disabled={!!busy || !host.trim()} onClick={add}>
+              {busy && busy === host.trim() ? "Checking…" : "Add"}
+            </button>
+          </div>
+        </Row>
+        {lines.length > 0 && (
+          <Row title="Progress" stack>
+            <pre className="remote-steps">{lines.join("\n")}</pre>
+          </Row>
+        )}
+        {error && (
+          <Row title="Failed" stack>
+            <pre className="remote-error">{error}</pre>
+          </Row>
+        )}
+        <Row
+          title="Everything stays in one folder"
+          sub="Projects, toolchains and caches live under ~/.agentbench/builds on the host. A dedicated user account there is best: agents run builds without asking. Files travel over your SSH connection only; .env files and keys are never sent, and anything copied back is checked before it is unpacked."
+        />
+      </Card>
+
+      {hosts.length > 0 && (
+        <Card title="Build hosts">
+          {hosts.map((h) => {
+            const kits = BUILD_KITS.filter((k) => (h.kits?.[k.id] ?? "unsupported") !== "unsupported");
+            const missing = kits.filter((k) => h.kits?.[k.id] !== "ready").map((k) => k.id);
+            return (
+              <Row
+                key={h.host}
+                title={h.host}
+                sub={`${h.os === "Darwin" ? "macOS" : h.os} ${h.arch} · ${h.cores} cores · ${Math.round(
+                  (h.memMb || 0) / 1024,
+                )} GB${h.sudo ? " · passwordless sudo" : ""}`}
+                stack
+              >
+                <div className="build-kits">
+                  {kits.map((k) => {
+                    const ready = h.kits?.[k.id] === "ready";
+                    return (
+                      <div key={k.id} className="build-kit">
+                        <span className={`bench-dot${ready ? " on" : ""}`} />
+                        <span className="build-kit-name">{k.name}</span>
+                        <span className="settings-row-sub">{k.sub}</span>
+                        {!ready && (
+                          <button
+                            className="btn-sm"
+                            disabled={!!busy}
+                            onClick={() => provision(h.host, [k.id])}
+                          >
+                            Install
+                          </button>
+                        )}
+                        {h.needs?.[k.id] && (
+                          <pre className="remote-error build-kit-need">{h.needs[k.id]}</pre>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="bench-link-form">
+                  {missing.length > 1 && (
+                    <button className="btn-sm" disabled={!!busy} onClick={() => provision(h.host, missing)}>
+                      Install all
+                    </button>
+                  )}
+                  <button className="btn-sm" disabled={!!busy} onClick={() => provision(h.host, [])}>
+                    {busy === h.host ? "Working…" : "Recheck"}
+                  </button>
+                  <button className="btn-sm danger" disabled={!!busy} onClick={() => remove(h.host)}>
+                    Remove
+                  </button>
+                </div>
+              </Row>
+            );
+          })}
+        </Card>
+      )}
+    </section>
+  );
+}
+
 function LinkedBenches() {
   const [benches, setBenches] = useState(loadGateways);
   const [url, setUrl] = useState("");
@@ -1073,6 +1255,7 @@ const SECTIONS = [
   { id: "agents", label: "Agents", icon: Robot },
   { id: "mobile", label: "Remote access", icon: DeviceMobile },
   { id: "remote", label: "Remote hosts", icon: Laptop },
+  { id: "build", label: "Build hosts", icon: Hammer },
   { id: "benches", label: "Linked benches", icon: Laptop },
   { id: "notifications", label: "Notifications", icon: BellSimple },
   { id: "voice", label: "Voice", icon: SpeakerHigh },
@@ -1910,6 +2093,8 @@ export default function SettingsWindow({ asModal = false, onClose } = {}) {
         {section === "mobile" && <MobileAccess />}
 
         {section === "remote" && <RemoteHosts />}
+
+        {section === "build" && <BuildHosts />}
 
         {section === "benches" && <LinkedBenches />}
 

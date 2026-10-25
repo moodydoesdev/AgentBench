@@ -31,6 +31,7 @@ USAGE:
     agentbench-gateway [--bind ADDR] [--port PORT] [--url URL]
     agentbench-gateway pair [--force] [--json]
     agentbench-gateway status
+    agentbench-gateway build <command> ...
 
 COMMANDS:
     pair      Mint a pairing code from the running gateway and print it.
@@ -38,6 +39,8 @@ COMMANDS:
               for a VM with no desktop UI to press the button in.
               --json prints one machine-readable line.
     status    Print the running gateway's advertised port, pid and machine.
+    build     Build, run and screenshot a project on a build host over SSH.
+              Agents call this as `agentbench-build`; `build --help` for more.
 
 OPTIONS:
     --bind ADDR  Address to listen on. Default 0.0.0.0. Pass 127.0.0.1 when
@@ -131,6 +134,13 @@ fn cmd_status() -> ! {
 
 #[tokio::main]
 async fn main() {
+    // `agentbench-gateway build …` is the build-host CLI agents call as
+    // `agentbench-build`. It never starts the gateway.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("build") {
+        std::process::exit(agentbench_lib::buildhost::cli::main(&argv[1..]));
+    }
+
     let mut port: u16 = std::env::var("AGENTBENCH_GATEWAY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

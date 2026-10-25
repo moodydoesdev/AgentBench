@@ -1108,6 +1108,7 @@ mod tests {
                 panes: Mutex::new(HashMap::new()),
                 next_id: AtomicU32::new(100),
                 hook_port: AtomicU32::new(0),
+                usage: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 claimed: Mutex::new(HashSet::new()),
                 colors: Mutex::new(HashMap::new()),

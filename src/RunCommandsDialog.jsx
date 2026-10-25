@@ -1,8 +1,10 @@
 // Per-project run commands editor: named command lines ("dev" → "bun run
 // dev") that spawn run panes. Pure UI — App owns storage (project entry) and
-// spawning. First row is the default the topbar Run button fires.
-import { useState } from "react";
+// spawning. First row is the default the topbar Run button fires. A row
+// with a `host` runs on that build host through agentbench-build.
+import { useEffect, useState } from "react";
 import { X, Plus, Trash } from "@phosphor-icons/react";
+import { invoke } from "@/lib/ipc";
 
 let nextId = 0;
 const freshRow = () => ({ id: `new-${Date.now()}-${nextId++}`, name: "", command: "" });
@@ -10,11 +12,20 @@ const freshRow = () => ({ id: `new-${Date.now()}-${nextId++}`, name: "", command
 export default function RunCommandsDialog({
   project, // {path, name, commands?}
   onClose,
-  onSave, // (commands: [{id, name, command}]) => void
+  onSave, // (commands: [{id, name, command, host?}]) => void
 }) {
   const [rows, setRows] = useState(() =>
     project?.commands?.length ? project.commands.map((c) => ({ ...c })) : [freshRow()],
   );
+  // Saved build hosts. The "Where" column only appears once there is one (or
+  // a row already targets one), so the dialog is unchanged for most people.
+  const [hosts, setHosts] = useState([]);
+  useEffect(() => {
+    invoke("build_hosts")
+      .then((list) => setHosts(Array.isArray(list) ? list.map((h) => h.host) : []))
+      .catch(() => {});
+  }, []);
+  const showWhere = hosts.length > 0 || rows.some((r) => r.host);
 
   const set = (id, key) => (e) =>
     setRows((rs) => rs.map((r) => (r.id === id ? { ...r, [key]: e.target.value } : r)));
@@ -25,7 +36,12 @@ export default function RunCommandsDialog({
   // drop empty rows; a command without a name gets its command line as name
   const cleaned = rows
     .filter((r) => r.command.trim())
-    .map((r) => ({ ...r, name: r.name.trim() || r.command.trim(), command: r.command.trim() }));
+    .map(({ host, ...r }) => ({
+      ...r,
+      name: r.name.trim() || r.command.trim(),
+      command: r.command.trim(),
+      ...(host ? { host } : {}),
+    }));
 
   const submit = () => onSave(cleaned);
 
@@ -50,6 +66,8 @@ export default function RunCommandsDialog({
               Run in the project folder through your login shell — anything on
               your PATH works. The first command is the default for the Run
               button.
+              {showWhere &&
+                " On a build host, changed files are synced there first and output streams back here."}
             </div>
           </div>
           <button className="btn-icon" title="Close (Esc)" onClick={onClose}>
@@ -60,6 +78,7 @@ export default function RunCommandsDialog({
         <div className="runcmd-labels">
           <label className="composer-label">Name</label>
           <label className="composer-label">Command</label>
+          {showWhere && <label className="composer-label runcmd-where-label">Where</label>}
         </div>
         <div className="runcmd-rows">
           {rows.map((r, i) => (
@@ -78,6 +97,21 @@ export default function RunCommandsDialog({
                 onChange={set(r.id, "command")}
                 spellCheck={false}
               />
+              {showWhere && (
+                <select
+                  className="composer-input runcmd-host"
+                  value={r.host || ""}
+                  title="Where this command runs"
+                  onChange={set(r.id, "host")}
+                >
+                  <option value="">This machine</option>
+                  {[...new Set([...hosts, ...(r.host ? [r.host] : [])])].map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              )}
               <span
                 className="runcmd-default"
                 style={{ visibility: i === 0 ? "visible" : "hidden" }}

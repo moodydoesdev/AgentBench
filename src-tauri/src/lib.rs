@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod buildhost;
 pub mod fsdata;
 pub mod gateway;
 pub mod remote;

@@ -5,7 +5,7 @@
 //! and `agentbench-gateway` can build without Tauri — on Linux that is the
 //! difference between needing webkit2gtk on a headless VM and not.
 
-use crate::{broker, dictation, fsdata, gateway, remote};
+use crate::{broker, buildhost, dictation, fsdata, gateway, remote};
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -1166,7 +1166,7 @@ async fn open_preview_window(app: AppHandle, url: String, title: String) -> Resu
 fn sync_plan_skill() -> Result<(), String> {
     // (skill dir, file within it, contents). agentbench-files teaches agents
     // to send files back as download links in the chat view.
-    let files: [(&str, &str, &str); 3] = [
+    let files: [(&str, &str, &str); 4] = [
         (
             "agentbench-plan",
             "SKILL.md",
@@ -1181,6 +1181,11 @@ fn sync_plan_skill() -> Result<(), String> {
             "agentbench-files",
             "SKILL.md",
             include_str!("../../skills/agentbench-files/SKILL.md"),
+        ),
+        (
+            "agentbench-build",
+            "SKILL.md",
+            include_str!("../../skills/agentbench-build/SKILL.md"),
         ),
     ];
     let skills = dirs::home_dir()
@@ -1197,7 +1202,99 @@ fn sync_plan_skill() -> Result<(), String> {
         }
         std::fs::write(&path, content).map_err(|e| e.to_string())?;
     }
+    write_build_wrapper(&skills.join("agentbench-build").join("agentbench-build"))
+}
+
+/// The gateway binary that carries the `build` subcommand: beside the app's
+/// own executable in a bundle, in cargo's target dir during development.
+fn gateway_binary() -> Result<std::path::PathBuf, String> {
+    let name = format!("agentbench-gateway{}", std::env::consts::EXE_SUFFIX);
+    #[cfg(debug_assertions)]
+    {
+        Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join(name))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or("no exe dir")?
+            .join(name))
+    }
+}
+
+/// `agentbench-build` beside the skill: a two-line script that execs the
+/// bundled gateway's `build` subcommand. Rewritten whenever the app moves or
+/// updates, so agents always reach the binary that matches the app.
+fn write_build_wrapper(path: &std::path::Path) -> Result<(), String> {
+    let bin = gateway_binary()?;
+    let quoted = format!("'{}'", bin.to_string_lossy().replace('\'', r"'\''"));
+    let script = format!("#!/bin/sh\nexec {quoted} build \"$@\"\n");
+    if std::fs::read_to_string(path).ok().as_deref() != Some(script.as_str()) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, &script).map_err(|e| e.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------- build hosts
+//
+// The registry and all the SSH work live in `buildhost`, shared with the
+// `agentbench-build` CLI so Settings and agents see the same hosts.
+
+#[tauri::command]
+fn build_hosts() -> Vec<Value> {
+    buildhost::list_hosts().iter().map(buildhost::describe).collect()
+}
+
+#[tauri::command]
+async fn build_host_add(host: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        buildhost::add_host(&host).map(|h| buildhost::describe(&h))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn build_host_remove(host: String) -> Result<(), String> {
+    buildhost::remove_host(&host)
+}
+
+/// Install capture kits on a host, streaming each line to the Settings pane
+/// as `build-progress` events. Minutes on a cold host (browsers, SDKs).
+#[tauri::command]
+async fn build_host_provision(app: AppHandle, host: String, kits: Vec<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let h = host.clone();
+        buildhost::provision(&host, &kits, &[], &[], |line, is_err| {
+            let _ = app.emit(
+                "build-progress",
+                json!({ "host": h, "line": line, "log": is_err }),
+            );
+        })
+        .map(|h| buildhost::describe(&h))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// What a run pane executes for a build-host command, so the frontend never
+/// has to guess where the binary lives.
+#[tauri::command]
+fn build_cli_path() -> Result<String, String> {
+    gateway_binary().map(|p| p.to_string_lossy().to_string())
 }
 
 
@@ -1612,6 +1709,11 @@ pub fn run() {
             remote_forget,
             remote_install_harness,
             remote_logs,
+            build_hosts,
+            build_host_add,
+            build_host_remove,
+            build_host_provision,
+            build_cli_path,
             dictation::dictation_available,
             dictation::dictation_start,
             dictation::dictation_stop,

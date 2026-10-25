@@ -1220,6 +1220,14 @@ export default function App() {
       await invoke("kill_pane", { id: existing.id }).catch(() => {});
     }
     try {
+      // A build-host command is still a local pane: agentbench-build syncs the
+      // project, runs it over SSH with a terminal, and streams it back here.
+      let line = cmd.command;
+      if (cmd.host) {
+        const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+        const cli = await invoke("build_cli_path");
+        line = `${q(cli)} build run --host ${q(cmd.host)} -- ${q(cmd.command)}`;
+      }
       const id = await invoke("create_pane", {
         cwd: project.path,
         cols: 100,
@@ -1229,7 +1237,7 @@ export default function App() {
         // "run:" prefix marks the pane across broker reattach/persist; the
         // restore path skips these so dev servers never auto-resurrect.
         // interactive: run through -i shell so .zshrc aliases (pa, etc) work
-        harness: { id: `run:${cmd.name}`, command: cmd.command, interactive: true },
+        harness: { id: `run:${cmd.name}`, command: line, interactive: true },
         shell: settingsRef.current.shell?.trim() || null,
       });
       const pane = {
@@ -1239,6 +1247,7 @@ export default function App() {
         kind: "run",
         dock: true,
         command: cmd.command,
+        host: cmd.host || null,
       };
       setPanes((ps) =>
         // restarting an exited run pane replaces it in place (keeps grid slot)
@@ -1277,16 +1286,15 @@ export default function App() {
   const restartRun = (pane) => {
     const project = projects.find((pr) => pr.path === pane.projectPath);
     // reattached panes lose the command line; recover it from the project entry
-    const command =
-      pane.command ??
-      project?.commands?.find((c) => c.name === pane.label)?.command;
+    const saved = project?.commands?.find((c) => c.name === pane.label);
+    const command = pane.command ?? saved?.command;
     if (!command) {
       setRunDialog(pane.projectPath);
       return;
     }
     runCommand(
       { path: pane.projectPath },
-      { name: pane.label, command },
+      { name: pane.label, command, host: pane.command ? pane.host : saved?.host },
       { restart: true },
     );
   };
@@ -2358,7 +2366,7 @@ export default function App() {
           id: `run-${c.id}`,
           group: "Run",
           label: c.name,
-          hint: c.command,
+          hint: c.host ? `${c.command} — on ${c.host}` : c.command,
           action: () => runCommand(activeProject, c),
         });
       }
@@ -2695,7 +2703,9 @@ export default function App() {
                           ? pane.hidden
                             ? "running — show"
                             : "running"
-                          : c.command;
+                          : c.host
+                            ? `${c.command} — on ${c.host}`
+                            : c.command;
                       return (
                         <DropdownMenuItem
                           key={c.id}

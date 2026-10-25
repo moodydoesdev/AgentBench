@@ -69,6 +69,12 @@ miss, and makes everything in between effortless.
   `~/.agentbench`, started on loopback, reached through an SSH tunnel it opens
   itself. No sudo, no systemd, no open ports, and no pairing code to copy. The
   VM's projects join your sidebar and its agents and terminals run there.
+- **Build hosts** — let agents build, run and screenshot your projects on
+  another Linux box or Mac over SSH: web pages in headless browsers, desktop
+  apps on virtual displays, iOS and Android in windowless simulators, macOS
+  apps in a VM. Nothing pops up on that machine's screen, toolchains install
+  themselves, and only changed files travel. See
+  [docs/build-hosts.md](docs/build-hosts.md).
 - **Projects sidebar** — group agents by repository, give each project its own
   accent color, and flip between projects instantly; every pane keeps running
   in the background.

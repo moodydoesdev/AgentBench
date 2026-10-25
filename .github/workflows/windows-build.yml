@@ -1,0 +1,49 @@
+name: Windows build
+
+# A Windows installer of any branch, for trying work before it is released.
+# The result is a workflow artifact only: no tag, no GitHub release and no
+# updater manifest, so installed copies never auto-update to it. Releases stay
+# in release.yml.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "windows-build/**"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # createUpdaterArtifacts needs the signing key even though nothing here
+      # is published; the .sig files are simply not uploaded.
+      - name: Build installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentbench-windows-${{ github.sha }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
