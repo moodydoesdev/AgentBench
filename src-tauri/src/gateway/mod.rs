@@ -8,6 +8,7 @@
 //! never touch the broker at all.
 
 pub mod dictate;
+pub mod exec;
 pub mod speak;
 pub mod links;
 pub mod net;

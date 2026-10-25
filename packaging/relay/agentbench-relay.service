@@ -1,0 +1,21 @@
+# systemd unit for agentbench-relay without Docker.
+#   sudo cp target/release/agentbench-relay /usr/local/bin/
+#   sudo cp packaging/relay/agentbench-relay.service /etc/systemd/system/
+#   sudo systemctl enable --now agentbench-relay
+[Unit]
+Description=AgentBench relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/agentbench-relay --bind 127.0.0.1:8480
+DynamicUser=yes
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

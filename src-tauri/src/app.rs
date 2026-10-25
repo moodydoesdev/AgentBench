@@ -5,7 +5,7 @@
 //! and `agentbench-gateway` can build without Tauri — on Linux that is the
 //! difference between needing webkit2gtk on a headless VM and not.
 
-use crate::{broker, buildhost, dictation, fsdata, gateway, remote};
+use crate::{broker, buildhost, dictation, fsdata, gateway, relay, remote};
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -1578,6 +1578,125 @@ async fn remote_logs(host: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+// ---------------------------------------------------------------- relay
+//
+// Benches on different networks, through an AgentBench relay (see
+// `relay`). This machine can be a host — its gateway listens on the relay —
+// and a client: benches it linked to get a loopback port forwarded through
+// the relay, so they join the fleet at `http://127.0.0.1:<port>` exactly like
+// an SSH remote host does.
+
+/// Live forwards, keyed by peer name.
+#[derive(Default)]
+pub struct RelayState {
+    forwards: Mutex<std::collections::HashMap<String, (u16, tauri::async_runtime::JoinHandle<()>)>>,
+}
+
+/// A gateway control reply, with its `error` field turned into an Err.
+fn control_result(v: Value) -> Result<Value, String> {
+    match v["error"].as_str() {
+        Some(e) if !v["error"].is_null() && v.get("enabled").is_none() => Err(e.to_string()),
+        _ => Ok(v),
+    }
+}
+
+/// This bench as a relay host: listening status and who may connect.
+#[tauri::command]
+fn relay_status() -> Value {
+    gateway_control("GET", "/local/relay", None)
+        .unwrap_or_else(|e| json!({ "enabled": false, "gatewayDown": true, "error": e }))
+}
+
+#[tauri::command]
+async fn relay_set(url: Option<String>, enabled: bool) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_gateway_running()?;
+        control_result(gateway_control(
+            "POST",
+            "/local/relay",
+            Some(json!({ "url": url, "enabled": enabled })),
+        )?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A one-time code another bench pastes to link here.
+#[tauri::command]
+fn relay_link_code() -> Result<String, String> {
+    let v = gateway_control("POST", "/local/relay/link", None)?;
+    v["code"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| v["error"].as_str().unwrap_or("could not make a link code").to_string())
+}
+
+#[tauri::command]
+fn relay_revoke(key: String) -> Result<Value, String> {
+    control_result(gateway_control("POST", "/local/relay/revoke", Some(json!({ "key": key })))?)
+}
+
+async fn relay_forward(state: &RelayState, peer: relay::Peer) -> Result<u16, String> {
+    if let Some((port, task)) = state.forwards.lock().unwrap().get(&peer.name) {
+        if !task.inner().is_finished() {
+            return Ok(*port);
+        }
+    }
+    let name = peer.name.clone();
+    let (port, task) = relay::client::forward_local(peer).await?;
+    state
+        .forwards
+        .lock()
+        .unwrap()
+        .insert(name, (port, tauri::async_runtime::JoinHandle::Tokio(task)));
+    Ok(port)
+}
+
+fn relay_bench(peer: &relay::Peer, port: u16) -> Value {
+    json!({
+        "name": peer.name,
+        "machine": peer.machine,
+        "relay": peer.relay,
+        "url": format!("http://127.0.0.1:{port}"),
+        "token": peer.token,
+        "kind": "relay",
+        "buildHost": format!("bench:{}", peer.name),
+    })
+}
+
+/// Link to another bench with the code it showed. Returns a bench entry for
+/// the fleet; its build-host entry is added separately by the caller.
+#[tauri::command]
+async fn relay_link(state: State<'_, Arc<RelayState>>, code: String) -> Result<Value, String> {
+    let device = format!("{} (bench)", gateway::machine_name());
+    let peer = relay::client::link(&code, &device).await?;
+    let port = relay_forward(state.inner(), peer.clone()).await?;
+    Ok(relay_bench(&peer, port))
+}
+
+/// Linked relay benches, each with a live forwarded address.
+#[tauri::command]
+async fn relay_list(state: State<'_, Arc<RelayState>>) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    for peer in relay::peers() {
+        match relay_forward(state.inner(), peer.clone()).await {
+            Ok(port) => out.push(relay_bench(&peer, port)),
+            Err(e) => out.push(json!({ "name": peer.name, "machine": peer.machine, "relay": peer.relay, "error": e, "kind": "relay" })),
+        }
+    }
+    Ok(out)
+}
+
+/// Unlink a relay bench here (its own Settings can revoke us too).
+#[tauri::command]
+fn relay_forget(state: State<'_, Arc<RelayState>>, name: String) -> Result<(), String> {
+    if let Some((_, task)) = state.forwards.lock().unwrap().remove(&name) {
+        task.abort();
+    }
+    let _ = buildhost::remove_host(&format!("bench:{name}"));
+    relay::forget(&name)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // launched from an agent's shell (`open` passes the caller's environment
@@ -1629,6 +1748,7 @@ pub fn run() {
                 .map_err(|e| format!("broker: {e}"))?;
             app.manage(client);
             app.manage(Arc::new(RemoteState::default()));
+            app.manage(Arc::new(RelayState::default()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1714,6 +1834,13 @@ pub fn run() {
             build_host_remove,
             build_host_provision,
             build_cli_path,
+            relay_status,
+            relay_set,
+            relay_link_code,
+            relay_revoke,
+            relay_link,
+            relay_list,
+            relay_forget,
             dictation::dictation_available,
             dictation::dictation_start,
             dictation::dictation_stop,

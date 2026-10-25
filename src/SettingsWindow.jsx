@@ -1038,6 +1038,218 @@ function BuildHosts() {
   );
 }
 
+// Benches on different networks, through an AgentBench relay both machines
+// dial out to. Either side of a link can be shown here: "this bench" turns
+// listening on and mints link codes; "link to a bench" pastes one.
+function RelayLinks() {
+  const [status, setStatus] = useState(null); // this bench as a relay host
+  const [relayUrl, setRelayUrl] = useState("");
+  const [peers, setPeers] = useState([]); // benches this machine linked to
+  const [linkCode, setLinkCode] = useState(null); // code minted here
+  const [paste, setPaste] = useState("");
+  const [busy, setBusy] = useState(null); // "save" | "code" | "link"
+  const [error, setError] = useState(null);
+  const [note, setNote] = useState(null);
+
+  const refresh = async () => {
+    const s = await invoke("relay_status").catch(() => null);
+    if (s) {
+      setStatus(s);
+      setRelayUrl((cur) => cur || s.url || "");
+    }
+    const list = await invoke("relay_list").catch(() => []);
+    setPeers(Array.isArray(list) ? list : []);
+  };
+
+  useEffect(() => {
+    refresh();
+    // the listening connection comes up a moment after it is switched on
+    const t = setInterval(() => invoke("relay_status").then(setStatus).catch(() => {}), 4000);
+    return () => clearInterval(t);
+  }, []);
+
+  const run = async (what, fn) => {
+    setBusy(what);
+    setError(null);
+    setNote(null);
+    try {
+      await fn();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const setListening = (enabled) =>
+    run("save", async () => {
+      setStatus(await invoke("relay_set", { url: relayUrl.trim() || null, enabled }));
+      if (!enabled) setLinkCode(null);
+    });
+
+  const mintCode = () => run("code", async () => setLinkCode(await invoke("relay_link_code")));
+
+  const linkTo = () =>
+    run("link", async () => {
+      const bench = await invoke("relay_link", { code: paste.trim() });
+      setPaste("");
+      emit("benches-changed").catch(() => {});
+      // Linked benches double as build hosts; a failure here only means the
+      // build kit is not reachable yet, so it is reported, not fatal.
+      try {
+        await invoke("build_host_add", { host: bench.buildHost });
+        setNote(`Linked ${bench.machine}. It is in the sidebar, and agents can build on it as ${bench.buildHost}.`);
+      } catch (err) {
+        setNote(`Linked ${bench.machine}. It could not be added as a build host yet: ${err}`);
+      }
+      await refresh();
+    });
+
+  const forget = (name) =>
+    run("forget", async () => {
+      await invoke("relay_forget", { name });
+      emit("benches-changed").catch(() => {});
+      await refresh();
+    });
+
+  const revoke = (key) =>
+    run("revoke", async () => setStatus(await invoke("relay_revoke", { key })));
+
+  const listening = status?.enabled;
+  const stateText = !status
+    ? "…"
+    : status.gatewayDown
+      ? "the gateway is not running"
+      : !listening
+        ? "off"
+        : status.connected
+          ? "connected"
+          : status.error
+            ? `not connected: ${status.error}`
+            : "connecting…";
+
+  return (
+    <>
+      <Card title="Across networks, through a relay">
+        <Row
+          title="Relay"
+          sub="An AgentBench relay that both machines can reach (agentbench-relay on any server). Neither machine opens a port, and the relay only forwards end-to-end encrypted traffic — it cannot read it or run anything."
+          stack
+        >
+          <div className="bench-link-form">
+            <input
+              className="harness-input cmd"
+              placeholder="relay.example.com"
+              value={relayUrl}
+              spellCheck={false}
+              autoCapitalize="off"
+              onChange={(ev) => setRelayUrl(ev.target.value)}
+            />
+            {listening ? (
+              <button className="btn-sm" disabled={busy != null} onClick={() => setListening(false)}>
+                Stop listening
+              </button>
+            ) : (
+              <button
+                className="btn-sm"
+                disabled={busy != null || !relayUrl.trim()}
+                onClick={() => setListening(true)}
+              >
+                {busy === "save" ? "Starting…" : "Listen on relay"}
+              </button>
+            )}
+          </div>
+        </Row>
+        <Row
+          title={
+            <span>
+              <span className={`bench-dot${status?.connected ? " on" : ""}`} />
+              This machine on the relay
+            </span>
+          }
+          sub={stateText}
+        >
+          {listening && (
+            <button className="btn-sm" disabled={busy != null || !status?.connected} onClick={mintCode}>
+              {busy === "code" ? "Preparing…" : linkCode ? "New link code" : "Create link code"}
+            </button>
+          )}
+        </Row>
+        {linkCode && (
+          <Row
+            title="Link code"
+            sub="Paste this into the other bench under “Link to a bench through a relay”. It works once, within 10 minutes. Send it privately: it grants access to this machine."
+            stack
+          >
+            <div className="bench-link-form">
+              <code className="mobile-cmd relay-code">{linkCode}</code>
+              <button className="btn-sm" onClick={() => navigator.clipboard?.writeText(linkCode)}>
+                Copy
+              </button>
+            </div>
+          </Row>
+        )}
+        {(status?.authorized || []).map((a) => (
+          <Row
+            key={a.key}
+            title={`Linked bench ${a.fingerprint}`}
+            sub={`May connect through the relay · linked ${new Date(a.linkedAt).toLocaleString()}`}
+          >
+            <button className="btn-sm danger" disabled={busy != null} onClick={() => revoke(a.key)}>
+              Revoke
+            </button>
+          </Row>
+        ))}
+      </Card>
+
+      <Card title="Link to a bench through a relay">
+        <Row
+          title="Link code"
+          sub="On the other machine: Settings → Linked benches → Listen on relay → Create link code. Paste it here. The relay address comes with the code."
+          stack
+        >
+          <div className="bench-link-form">
+            <input
+              className="harness-input cmd"
+              placeholder="abr1.…"
+              value={paste}
+              spellCheck={false}
+              autoCapitalize="off"
+              onChange={(ev) => setPaste(ev.target.value)}
+              onKeyDown={(ev) => ev.key === "Enter" && paste.trim() && linkTo()}
+            />
+            <button className="btn-sm" disabled={busy != null || !paste.trim()} onClick={linkTo}>
+              {busy === "link" ? "Linking…" : "Link"}
+            </button>
+          </div>
+        </Row>
+        {note && <Row title="Done" sub={note} />}
+        {error && (
+          <Row title="Failed" stack>
+            <pre className="remote-error">{error}</pre>
+          </Row>
+        )}
+        {peers.map((p) => (
+          <Row
+            key={p.name}
+            title={
+              <span>
+                <span className={`bench-dot${p.url ? " on" : ""}`} />
+                {p.machine}
+              </span>
+            }
+            sub={p.error ? `${p.relay} · ${p.error}` : `${p.relay} · build host ${p.buildHost}`}
+          >
+            <button className="btn-sm danger" disabled={busy != null} onClick={() => forget(p.name)}>
+              Unlink
+            </button>
+          </Row>
+        ))}
+      </Card>
+    </>
+  );
+}
+
 function LinkedBenches() {
   const [benches, setBenches] = useState(loadGateways);
   const [url, setUrl] = useState("");
@@ -1210,6 +1422,8 @@ function LinkedBenches() {
           </Row>
         )}
       </Card>
+
+      <RelayLinks />
 
       <Card title="Linked machines">
         {benches.length === 0 && (

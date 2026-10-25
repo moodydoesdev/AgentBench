@@ -22,7 +22,7 @@
 
 pub mod cli;
 
-use crate::remote::{last_json, shell_quote, ssh_base, ssh_with, wait_with_timeout};
+use crate::remote::{last_json, shell_quote, ssh_with, wait_with_timeout};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -244,6 +244,47 @@ fn pick_host(explicit: Option<&str>, project: &Project) -> Result<String, String
 
 // ---------------------------------------------------------------- remote kit
 
+/// A build host reached through a linked bench instead of SSH:
+/// `bench:<name>`, where the name is a peer from `relay-peers.json`.
+pub fn bench_peer(host: &str) -> Option<&str> {
+    host.strip_prefix("bench:")
+}
+
+/// The command that carries one remote command line to `host`: `ssh host` for
+/// SSH hosts, and for a linked bench our own `build __exec <name>` helper,
+/// which behaves like ssh — stdin, stdout, stderr and the exit code all pass
+/// through — so every caller below works the same either way.
+fn remote_base(host: &str) -> Command {
+    remote_with(host, &[])
+}
+
+fn remote_with(host: &str, flags: &[&str]) -> Command {
+    match bench_peer(host) {
+        Some(name) => {
+            let mut c = Command::new(helper_exe());
+            c.args(["build", "__exec", name]);
+            c
+        }
+        None => ssh_with(host, flags),
+    }
+}
+
+/// The agentbench-gateway binary: this process when it is the CLI, or the
+/// one beside the desktop app's executable (also true in a cargo build dir).
+fn helper_exe() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let is_gateway = exe
+        .file_stem()
+        .map(|s| s.to_string_lossy().starts_with("agentbench-gateway"))
+        .unwrap_or(false);
+    if is_gateway {
+        return exe;
+    }
+    exe.parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("agentbench-gateway{}", std::env::consts::EXE_SUFFIX))
+}
+
 /// Which kit a host runs. Windows OpenSSH starts commands in cmd.exe or
 /// PowerShell, never bash, so Windows hosts get abkit.ps1 instead of abkit.sh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +327,7 @@ fn detect_family(host: &str) -> Result<Family, String> {
     if out.contains("Windows_NT") {
         return Ok(Family::Windows);
     }
-    let ps = ssh_base(host)
+    let ps = remote_base(host)
         .arg("powershell -NoProfile -Command [Environment]::OSVersion.Platform")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -300,7 +341,7 @@ fn detect_family(host: &str) -> Result<Family, String> {
 /// Run one remote command line, optionally feeding it `stdin`, and return its
 /// stdout. Unlike `remote::ssh_script` this assumes no particular shell.
 fn ssh_run(host: &str, command: &str, stdin: Option<&[u8]>, timeout: Duration) -> Result<String, String> {
-    let mut child = ssh_base(host)
+    let mut child = remote_base(host)
         .arg(command)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -316,13 +357,13 @@ fn ssh_run(host: &str, command: &str, stdin: Option<&[u8]>, timeout: Duration) -
     }
     let out = wait_with_timeout(child, timeout)?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if out.status.success() {
         Ok(stdout)
+    } else if bench_peer(host).is_some() {
+        Err(if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() })
     } else {
-        Err(crate::remote::explain_ssh_failure(
-            &String::from_utf8_lossy(&out.stderr),
-            &stdout,
-        ))
+        Err(crate::remote::explain_ssh_failure(&stderr, &stdout))
     }
 }
 
@@ -445,7 +486,7 @@ fn kit_json(
     stdin: Option<Vec<u8>>,
     mut on_line: impl FnMut(&str, bool),
 ) -> Result<Value, String> {
-    let mut child = ssh_base(host)
+    let mut child = remote_base(host)
         .arg(kit(family(host)?, args))
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -726,7 +767,7 @@ pub fn sync(host: &str, project: &Project) -> Result<SyncStats, String> {
     ensure_kit(host)?;
     let fam = family(host)?;
     let local = project_files(project)?;
-    let remote_raw = ssh_base(host)
+    let remote_raw = remote_base(host)
         .arg(kit(fam, &["manifest".into(), project.slug.clone()]))
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
@@ -793,7 +834,7 @@ fn kit_json_raw(host: &str, args: &[String], stdin: Vec<u8>) -> Result<(), Strin
             base64::engine::general_purpose::STANDARD.encode(stdin).into_bytes()
         }
     };
-    let mut child = ssh_base(host)
+    let mut child = remote_base(host)
         .arg(kit(fam, args))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -838,7 +879,7 @@ fn send_tar(host: &str, project: &Project, files: &[&String]) -> Result<(), Stri
             format!("tar -xzf - -C \"{}\"", project_rel(&project.slug, "src"))
         }
     };
-    let ssh = ssh_base(host)
+    let ssh = remote_base(host)
         .arg(unpack)
         .stdin(Stdio::from(tar_out))
         .stdout(Stdio::null())
@@ -889,7 +930,7 @@ pub fn run(host: &str, project: &Project, command: &str, tty: bool) -> Result<i3
     args.push("--".into());
     args.push(command.to_string());
     let flags: &[&str] = if tty { &["-tt"] } else { &[] };
-    let status = ssh_with(host, flags)
+    let status = remote_with(host, flags)
         .arg(kit(family(host)?, &args))
         .stdin(if tty { Stdio::inherit() } else { Stdio::null() })
         .status()
@@ -948,7 +989,7 @@ fn untar_from(host: &str, command: &str, dest: &Path) -> Result<Vec<String>, Str
         chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
     ));
     let file = std::fs::File::create(&staging).map_err(|e| e.to_string())?;
-    let ssh = ssh_base(host)
+    let ssh = remote_base(host)
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
@@ -1198,7 +1239,7 @@ pub fn shot(host: &str, project: &Project, mode: ShotMode, o: &ShotOptions) -> R
 
 /// Copy one file off the host.
 fn fetch(host: &str, remote: &str, local: &Path) -> Result<(), String> {
-    let mut child = ssh_base(host)
+    let mut child = remote_base(host)
         .arg(format!("cat {}", shell_quote(remote)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

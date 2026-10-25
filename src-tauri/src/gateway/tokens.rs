@@ -105,8 +105,8 @@ pub struct Device {
     pub paired_at: u64,
     #[serde(default)]
     pub last_seen: u64,
-    /// "phone" (default) or "bench" — another AgentBench install. Cosmetic:
-    /// both kinds hold exactly the same capability.
+    /// "phone" (default) or "bench" — another AgentBench install. Both hold
+    /// the same capabilities except build-host exec, which is bench-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
 }
@@ -373,6 +373,17 @@ impl TokenStore {
         });
         self.persist();
         Some(token)
+    }
+
+    /// The kind a token was paired as ("bench", "web", or None for a phone).
+    pub fn kind_of(&self, token: &str) -> Option<String> {
+        let digest = hash(token);
+        self.devices
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| d.hash == digest)
+            .and_then(|d| d.kind.clone())
     }
 
     /// Whether a bearer token is currently valid; refreshes last-seen.

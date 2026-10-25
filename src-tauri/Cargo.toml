@@ -18,6 +18,10 @@ path = "src/bin/broker.rs"
 name = "agentbench-gateway"
 path = "src/bin/gateway.rs"
 
+[[bin]]
+name = "agentbench-relay"
+path = "src/bin/relay.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -64,7 +68,7 @@ axum = { version = "0.8", features = ["ws"] }
 # adapter. Both already in axum's tree — direct deps only for the upgrade API.
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 futures-util = "0.3"
 sha2 = "0.10"
@@ -72,11 +76,22 @@ qrcodegen = "1.8"
 # push notifications to paired phones. Pure Rust throughout: the usual
 # web-push clients pull OpenSSL, which does not build here.
 web-push-native = "0.5"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 base64ct = { version = "1", features = ["alloc"] }
 http = "1"
 sherpa-onnx = { version = "1.13.8", optional = true }
+# AgentBench relay: benches on different networks reach each other through a
+# relay both dial out to, end-to-end encrypted. Every crate here was already
+# in the tree (axum, reqwest, rustls, web-push); these lines only make them
+# direct dependencies, with ring rather than aws-lc as the TLS backend.
+tokio-tungstenite = "0.29"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+data-encoding = "2"
 
 # Chat-tab dictation: capture on AVAudioEngine, transcribe with the same
 # on-device recognizer macOS dictation uses. No API key, no audio leaves the

@@ -2,6 +2,7 @@ pub mod broker;
 pub mod buildhost;
 pub mod fsdata;
 pub mod gateway;
+pub mod relay;
 pub mod remote;
 
 // The daemons above are Tauri-free, and the helper binaries only ever reach

@@ -5734,6 +5734,14 @@ button.chat-question-opt.choice.on {
   white-space: nowrap;
 }
 
+.relay-code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  font-size: 11px;
+}
+
 .build-kit-need {
   grid-column: 2 / -1;
   max-height: 90px;

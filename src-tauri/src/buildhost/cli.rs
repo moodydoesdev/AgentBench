@@ -13,6 +13,8 @@ usage: agentbench-build <command> [--host H] [-C DIR] [options]
 
   hosts                       list build hosts and their capture kits
   add <user@host>             check a host over SSH and save it
+  link <abr1.…>               link a bench through an AgentBench relay with
+                              the code it shows, and add it as bench:<name>
   remove <host>               forget a host (nothing on it is deleted)
   provision [--kits a,b]      install mise, this project's tools and packages,
                               and capture kits: web, linux, windows, android,
@@ -119,6 +121,34 @@ fn dispatch(argv: &[String]) -> Result<i32, String> {
         print!("{USAGE}");
         return Ok(0);
     }
+    // The ssh stand-in for `bench:` hosts: `__exec <name> <command…>` runs
+    // the command on that linked bench with ssh's stdio and exit code.
+    if command == "__exec" {
+        let name = a.rest.first().cloned().ok_or("__exec needs a bench name")?;
+        let line = a.rest[1..].join(" ");
+        let peer = crate::relay::peer(&name)
+            .ok_or_else(|| format!("no linked bench called {name}; see agentbench-build hosts"))?;
+        return match block_on(async move { crate::relay::client::exec(&peer, &line).await }) {
+            Ok(code) => Ok(code),
+            Err(e) => {
+                // 255, like ssh, so callers can tell a transport failure apart
+                eprintln!("{}: {e}", peer_label(&name));
+                Ok(255)
+            }
+        };
+    }
+    // Debug aid: forward a loopback port to a linked bench's gateway, as the
+    // desktop does, and print it. Runs until interrupted.
+    if command == "__forward" {
+        let name = a.rest.first().cloned().ok_or("__forward needs a bench name")?;
+        let peer = crate::relay::peer(&name).ok_or_else(|| format!("no linked bench called {name}"))?;
+        return block_on(async move {
+            let (port, task) = crate::relay::client::forward_local(peer).await?;
+            println!("http://127.0.0.1:{port}");
+            let _ = task.await;
+            Ok(0)
+        });
+    }
     let host_flag = a.value("--host")?;
     let dir = match a.value("-C")? {
         Some(d) => PathBuf::from(d),
@@ -150,6 +180,19 @@ fn dispatch(argv: &[String]) -> Result<i32, String> {
             let h = add_host(&target)?;
             println!("added {} ({} {}, {} cores)", h.host, h.os, h.arch, h.cores);
             println!("next: agentbench-build provision --host {} --kits web", h.host);
+            Ok(0)
+        }
+        "link" => {
+            let code = a.rest.first().cloned().ok_or("link needs the code from the other bench (abr1.…)")?;
+            let device = format!("{} (bench)", crate::gateway::machine_name());
+            let peer = block_on(async move { crate::relay::client::link(&code, &device).await })?;
+            println!("linked {} through {}", peer.machine, peer.relay);
+            let host = format!("bench:{}", peer.name);
+            eprintln!("checking it as a build host …");
+            match add_host(&host) {
+                Ok(h) => println!("added build host {} ({} {}, {} cores)", h.host, h.os, h.arch, h.cores),
+                Err(e) => println!("linked, but it could not be added as a build host yet: {e}"),
+            }
             Ok(0)
         }
         "remove" => {
@@ -341,6 +384,20 @@ fn dispatch(argv: &[String]) -> Result<i32, String> {
         }
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
+}
+
+/// Run async relay work from this synchronous CLI on a runtime of its own.
+fn block_on<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(f)
+}
+
+fn peer_label(name: &str) -> String {
+    format!("bench:{name}")
 }
 
 /// Provision's live log: the kit's report lines as ticks, its chatter dimmed.

@@ -13,7 +13,10 @@ on:
       - "windows-build/**"
     paths:
       - "src-tauri/src/buildhost/**"
+      - "src-tauri/src/relay/**"
+      - "src-tauri/src/gateway/exec.rs"
       - "src-tauri/src/remote.rs"
+      - "packaging/relay/**"
       - ".github/workflows/buildhost-windows-test.yml"
 
 permissions:
@@ -37,7 +40,7 @@ jobs:
 
       - name: Build the CLI
         working-directory: src-tauri
-        run: cargo build --no-default-features --bin agentbench-gateway
+        run: cargo build --no-default-features --bin agentbench-gateway --bin agentbench-relay
 
       # Windows PowerShell 5.1: pwsh's Add-Type cannot emit an .exe.
       - name: Stand-in ssh
@@ -126,9 +129,50 @@ jobs:
           & $G build shot -C "$env:RUNNER_TEMP\proj" --web https://example.com --name example
           if ($LASTEXITCODE -ne 0) { throw 'web capture failed' }
 
+      # The same machine plays both benches here: a relay and a gateway as
+      # the "PC", and the CLI as the linking "Mac". Nothing uses SSH.
+      - name: Relay — link and build over it
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "$env:GITHUB_WORKSPACE\src-tauri\target\debug"
+          Start-Process -FilePath "$bin\agentbench-relay.exe" -ArgumentList '--bind', '127.0.0.1:18480' -RedirectStandardError "$env:RUNNER_TEMP\relay.log" -WindowStyle Hidden
+          $env:AGENTBENCH_PWA_DIR = "$env:GITHUB_WORKSPACE\dist"
+          Start-Process -FilePath "$bin\agentbench-gateway.exe" -ArgumentList '--bind', '127.0.0.1', '--port', '18473' -RedirectStandardError "$env:RUNNER_TEMP\gateway.log" -WindowStyle Hidden
+          $info = "$env:APPDATA\com.connor.agentbench\gateway.json"
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $info); $i++) { Start-Sleep 1 }
+          $cp = (Get-Content $info | ConvertFrom-Json).controlPort
+          Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$cp/local/relay" -ContentType 'application/json' -Body '{"url":"ws://127.0.0.1:18480","enabled":true}' | ConvertTo-Json -Compress
+          for ($i = 0; $i -lt 20; $i++) {
+            if ((Invoke-RestMethod "http://127.0.0.1:$cp/local/relay").connected) { break }
+            Start-Sleep 1
+          }
+          $code = (Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$cp/local/relay/link").code
+          & "$bin\agentbench-gateway.exe" build link $code
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:RUNNER_TEMP\gateway.log"; throw 'relay link failed' }
+          $host_ = (& "$bin\agentbench-gateway.exe" build hosts --json | ConvertFrom-Json | Where-Object { $_.host -like 'bench:*' } | Select-Object -First 1).host
+          if (-not $host_) { throw 'the relayed bench was not added as a build host' }
+          & "$bin\agentbench-gateway.exe" build run -C "$env:RUNNER_TEMP\proj" --host $host_ --no-artifacts -- 'echo over the relay & ver'
+          if ($LASTEXITCODE -ne 0) { throw "run over relay failed: $LASTEXITCODE" }
+          & "$bin\agentbench-gateway.exe" build run -C "$env:RUNNER_TEMP\proj" --host $host_ --no-artifacts -- 'exit 5'
+          if ($LASTEXITCODE -ne 5) { throw "exit code over relay: $LASTEXITCODE" }
+          & "$bin\agentbench-gateway.exe" build shot -C "$env:RUNNER_TEMP\proj" --host $host_ --windows notepad.exe --size 800x500 --name relay-notepad
+          if ($LASTEXITCODE -ne 0) { throw 'capture over relay failed' }
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: buildhost-windows-shots
           path: ${{ runner.temp }}/proj/.agentbench/shots/
           if-no-files-found: warn
+
+  relay-image:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the relay image
+        run: docker build -f packaging/relay/Dockerfile -t agentbench-relay src-tauri
+      - name: Smoke test
+        run: |
+          docker run -d --name relay -p 8480:8480 agentbench-relay
+          for i in $(seq 1 20); do curl -fs http://127.0.0.1:8480/healthz && break; sleep 1; done
+          test "$(curl -fs http://127.0.0.1:8480/healthz)" = ok

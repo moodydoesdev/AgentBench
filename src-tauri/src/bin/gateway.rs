@@ -132,15 +132,22 @@ fn cmd_status() -> ! {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // `agentbench-gateway build …` is the build-host CLI agents call as
-    // `agentbench-build`. It never starts the gateway.
+    // `agentbench-build`. It never starts the gateway, and it runs before any
+    // async runtime exists so it is free to start its own.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("build") {
         std::process::exit(agentbench_lib::buildhost::cli::main(&argv[1..]));
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(serve());
+}
 
+async fn serve() {
     let mut port: u16 = std::env::var("AGENTBENCH_GATEWAY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -290,6 +297,10 @@ async fn main() {
         }
     });
 
+    // Relay: when enabled in Settings, keep a listening connection open so
+    // benches on other networks can reach this gateway. Off by default.
+    agentbench_lib::relay::host::start(port);
+
     eprintln!("agentbench-gateway: public :{port}, control 127.0.0.1:{local_port}");
 
     // Anything unauthenticated lives here and nowhere else: the pairing
@@ -321,6 +332,7 @@ async fn main() {
         .route("/api/answer", post(answer))
         .route("/api/usage", get(usage))
         .route("/api/file", get(download))
+        .route("/api/build/exec", any(build_exec))
         .route(
             "/api/upload",
             post(upload).layer(axum::extract::DefaultBodyLimit::max(
@@ -359,6 +371,9 @@ async fn main() {
         .route("/local/passkeys", get(local_passkeys))
         .route("/local/passkeys/remove", post(local_remove_passkey))
         .route("/local/quit", post(local_quit))
+        .route("/local/relay", get(local_relay).post(local_relay_set))
+        .route("/local/relay/link", post(local_relay_link))
+        .route("/local/relay/revoke", post(local_relay_revoke))
         .with_state(gw.clone());
 
     let public_srv = axum::serve(public_listener, public);
@@ -1003,6 +1018,59 @@ fn socket_token(
         .or_else(|| params.get("token").cloned())
         .or_else(|| header_token(headers))?;
     gw.tokens.verify(&token).then_some(token)
+}
+
+/// Build-host exec: run one command here for a linked bench's
+/// `agentbench-build`, streamed over the socket (see gateway::exec). Only
+/// tokens paired as another bench may use it — not phones or browsers.
+async fn build_exec(
+    ws: WebSocketUpgrade,
+    State(gw): State<Arc<Gateway>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: header::HeaderMap,
+) -> Response {
+    let Some(token) = socket_token(&gw, &params, &headers) else {
+        return unauthorized();
+    };
+    if gw.tokens.kind_of(&token).as_deref() != Some("bench") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "only linked benches may run build commands" })),
+        )
+            .into_response();
+    }
+    ws.protocols(["bearer"]).on_upgrade(gateway::exec::serve)
+}
+
+/// Relay settings for this bench: status, and turning it on or off.
+async fn local_relay() -> Json<Value> {
+    Json(agentbench_lib::relay::host::status())
+}
+
+async fn local_relay_set(Json(body): Json<Value>) -> Response {
+    let enabled = body["enabled"].as_bool().unwrap_or(false);
+    match agentbench_lib::relay::host::configure(body["url"].as_str(), enabled) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// A link code another bench pastes to link here through the relay. It
+/// carries a fresh pairing code, so it is good for one link within ten
+/// minutes.
+async fn local_relay_link(State(gw): State<Arc<Gateway>>) -> Response {
+    let pair = gw.tokens.new_code(true);
+    match agentbench_lib::relay::host::mint_link(&pair, &gw.machine) {
+        Ok(code) => Json(json!({ "code": code })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn local_relay_revoke(Json(body): Json<Value>) -> Response {
+    match agentbench_lib::relay::host::revoke(body["key"].as_str().unwrap_or_default()) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
 }
 
 /// Whether the browser mic should stream to Parakeet here or fall back to the

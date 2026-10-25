@@ -4,9 +4,12 @@ A build host is another machine that builds, runs and screenshots your
 projects. Agents use one through `agentbench-build`. Run commands can target
 one too, and their output streams into a normal run pane.
 
-It is only an SSH target. Unlike a [remote host](linux-vm.md), it runs no
-AgentBench daemons, so it can be Linux, a Mac, or Windows with OpenSSH
-Server.
+A build host is either of two things:
+- **An SSH target.** Unlike a [remote host](linux-vm.md), it runs no
+  AgentBench daemons, so it can be Linux, a Mac, or Windows with OpenSSH
+  Server.
+- **A bench linked through an [AgentBench relay](relay.md)**
+  (`bench:<name>`). This works across networks and needs no SSH server.
 
 ## Setup
 

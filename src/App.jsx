@@ -281,23 +281,34 @@ export default function App() {
   const { machines } = useFleet(allBenches);
   const [remoteSel, setRemoteSel] = useState(null); // { url, cwd } — selected remote project
 
-  // Ask Rust for the SSH hosts and their current tunnel addresses.
+  // Ask Rust for the SSH hosts and relay-linked benches and their current
+  // local addresses. Both are forwarded ports that change every launch.
   const refreshSshBenches = () =>
-    invoke("remote_list")
-      .then((list) =>
-        setSshBenches(
-          (Array.isArray(list) ? list : [])
-            .filter((h) => h.url && h.token)
-            .map((h) => ({
-              url: h.url,
-              token: h.token,
-              machine: h.machine,
-              name: h.machine || h.host,
-              kind: "ssh",
-            })),
-        ),
-      )
-      .catch(() => {});
+    Promise.all([
+      invoke("remote_list").catch(() => []),
+      invoke("relay_list").catch(() => []),
+    ]).then(([ssh, relayed]) =>
+      setSshBenches([
+        ...(Array.isArray(ssh) ? ssh : [])
+          .filter((h) => h.url && h.token)
+          .map((h) => ({
+            url: h.url,
+            token: h.token,
+            machine: h.machine,
+            name: h.machine || h.host,
+            kind: "ssh",
+          })),
+        ...(Array.isArray(relayed) ? relayed : [])
+          .filter((p) => p.url && p.token)
+          .map((p) => ({
+            url: p.url,
+            token: p.token,
+            machine: p.machine,
+            name: p.machine,
+            kind: "relay",
+          })),
+      ]),
+    );
 
   // On launch, bring saved SSH hosts back up. Each one is a fresh tunnel and
   // a fresh local port, so this has to happen before they can be in the

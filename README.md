@@ -75,6 +75,10 @@ miss, and makes everything in between effortless.
   apps in a VM. Nothing pops up on that machine's screen, toolchains install
   themselves, and only changed files travel. See
   [docs/build-hosts.md](docs/build-hosts.md).
+- **AgentBench relay** — link benches on different networks through a relay
+  you run, with no open ports, tunnels or VPN. Traffic is end-to-end
+  encrypted, so the relay only ever sees ciphertext. A relayed bench is also
+  a build host. See [docs/relay.md](docs/relay.md).
 - **Projects sidebar** — group agents by repository, give each project its own
   accent color, and flip between projects instantly; every pane keeps running
   in the background.
