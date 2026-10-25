@@ -52,6 +52,7 @@ pub use unsupported::*;
 mod imp {
 use std::cell::RefCell;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2_avf_audio::{AVAudioEngine, AVAudioPCMBuffer, AVAudioTime};
@@ -74,6 +75,104 @@ pub const EV_PARTIAL: &str = "dictation://partial";
 pub const EV_FINAL: &str = "dictation://final";
 pub const EV_ERROR: &str = "dictation://error";
 pub const EV_STATE: &str = "dictation://state";
+/// Mic loudness, 0–1, ~30 times a second while listening (macOS 26+ engine).
+pub const EV_LEVEL: &str = "dictation://level";
+/// A progress note worth showing, e.g. the first-use model download.
+pub const EV_STATUS: &str = "dictation://status";
+
+/// The macOS 26 engine: SpeechAnalyzer + DictationTranscriber, in
+/// swift/Dictation.swift (built by build.rs). Far more accurate than
+/// SFSpeechRecognizer and made for long-form speech, so it's preferred
+/// whenever it supports the user's language; the SFSpeechRecognizer code
+/// below remains the fallback for older systems.
+#[cfg(speech_analyzer)]
+mod analyzer {
+    use std::ffi::{c_char, CStr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    use serde::Serialize;
+    use tauri::{AppHandle, Emitter};
+
+    use super::{MessageEvent, StateEvent, TextEvent};
+    use super::{EV_ERROR, EV_FINAL, EV_LEVEL, EV_PARTIAL, EV_STATE, EV_STATUS};
+
+    extern "C" {
+        fn agd_available() -> bool;
+        fn agd_start(cb: extern "C" fn(i32, *const c_char, f32));
+        fn agd_stop();
+        fn agd_cancel();
+    }
+
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    /// Between our start and the session's final/error — routes stop and
+    /// cancel here rather than to the fallback engine.
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Clone, Serialize)]
+    struct LevelEvent {
+        level: f32,
+    }
+
+    pub fn available() -> bool {
+        *AVAILABLE.get_or_init(|| unsafe { agd_available() })
+    }
+
+    pub fn active() -> bool {
+        ACTIVE.load(Ordering::SeqCst)
+    }
+
+    pub fn start(app: &AppHandle) {
+        let _ = APP.set(app.clone());
+        ACTIVE.store(true, Ordering::SeqCst);
+        unsafe { agd_start(on_event) };
+    }
+
+    pub fn stop() {
+        unsafe { agd_stop() };
+    }
+
+    pub fn cancel() {
+        ACTIVE.store(false, Ordering::SeqCst);
+        unsafe { agd_cancel() };
+    }
+
+    /// Called from Swift on arbitrary threads; emitting is thread-safe.
+    extern "C" fn on_event(kind: i32, text: *const c_char, level: f32) {
+        let Some(app) = APP.get() else { return };
+        let text = if text.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
+        };
+        match kind {
+            0 => {
+                app.emit(EV_PARTIAL, TextEvent { text }).ok();
+            }
+            1 => {
+                ACTIVE.store(false, Ordering::SeqCst);
+                app.emit(EV_FINAL, TextEvent { text }).ok();
+                app.emit(EV_STATE, StateEvent { listening: false }).ok();
+            }
+            2 => {
+                ACTIVE.store(false, Ordering::SeqCst);
+                app.emit(EV_ERROR, MessageEvent { message: text }).ok();
+                app.emit(EV_STATE, StateEvent { listening: false }).ok();
+            }
+            3 => {
+                app.emit(EV_LEVEL, LevelEvent { level }).ok();
+            }
+            4 => {
+                app.emit(EV_STATE, StateEvent { listening: true }).ok();
+            }
+            5 => {
+                app.emit(EV_STATUS, MessageEvent { message: text }).ok();
+            }
+            _ => {}
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 struct TextEvent {
@@ -101,14 +200,39 @@ struct Session {
     /// keeping the finished text here, speaking a second time would render
     /// over the first.
     committed: String,
+    /// The current task's latest hypothesis. The on-device recognizer often
+    /// abandons a hypothesis after a pause and starts the next partial from
+    /// empty *without* finalising — so this is what gets folded into
+    /// `committed` when that happens, instead of being rendered over.
+    live: Hyp,
     /// Set by `dictation_stop`. Makes the next final end the session rather
     /// than re-arm.
     stopping: bool,
+    /// When the current task was armed, and how many tasks in a row have
+    /// errored almost immediately. Silence ends a task with an error ("No
+    /// speech detected"), which just re-arms — dictation stays open until the
+    /// user stops it — but a recognizer failing on every arm must not spin.
+    armed_at: Instant,
+    quick_failures: u32,
     /// Bumped on every re-arm. A superseded task can still deliver results
     /// after we've moved on; anything not stamped with the current value is
     /// dropped rather than folded in twice.
     generation: u64,
 }
+
+/// One recognizer hypothesis, with the span of task audio it covers (seconds
+/// from the task's start; both zero when the recognizer gave no timings).
+#[derive(Clone, Default)]
+struct Hyp {
+    text: String,
+    start: f64,
+    end: f64,
+}
+
+/// An error this soon after arming counts as the recognizer failing, not the
+/// user going quiet.
+const QUICK_FAILURE: Duration = Duration::from_secs(1);
+const MAX_QUICK_FAILURES: u32 = 3;
 
 impl Session {
     /// Detach from the microphone. Safe to call twice — stopping an engine that
@@ -133,8 +257,14 @@ thread_local! {
 /// Deliberately does not consider authorization — a not-yet-granted mic is a
 /// prompt waiting to happen, not an unavailable feature, and the button should
 /// still be there to trigger it.
+/// Async so the first call, which asks the Swift engine about the user's
+/// language and waits on the answer, runs off the main thread.
 #[tauri::command]
-pub fn dictation_available() -> bool {
+pub async fn dictation_available() -> bool {
+    #[cfg(speech_analyzer)]
+    if analyzer::available() {
+        return true;
+    }
     recognizer().is_some_and(|r| unsafe { r.isAvailable() && r.supportsOnDeviceRecognition() })
 }
 
@@ -153,6 +283,11 @@ fn recognizer() -> Option<Retained<SFSpeechRecognizer>> {
 /// `dictation://partial` per revision, and finally `dictation://final`.
 #[tauri::command]
 pub fn dictation_start(app: AppHandle) -> Result<(), String> {
+    #[cfg(speech_analyzer)]
+    if analyzer::available() {
+        analyzer::start(&app);
+        return Ok(());
+    }
     on_main(&app, move |app| {
         if SESSION.with_borrow(|s| s.is_some()) {
             return;
@@ -184,11 +319,20 @@ pub fn dictation_start(app: AppHandle) -> Result<(), String> {
 /// for `dictation://final` rather than using whatever it has.
 #[tauri::command]
 pub fn dictation_stop(app: AppHandle) -> Result<(), String> {
+    #[cfg(speech_analyzer)]
+    if analyzer::active() {
+        analyzer::stop();
+        app.emit(EV_STATE, StateEvent { listening: false }).ok();
+        return Ok(());
+    }
     on_main(&app, |app| {
         // Drop the tap and the engine now, but keep the task alive: its result
         // handler still owes us one call with `isFinal`.
-        let request = SESSION.with_borrow(|s| {
-            s.as_ref().inspect(|s| s.teardown()).map(|s| s.request.clone())
+        let request = SESSION.with_borrow_mut(|s| {
+            let s = s.as_mut()?;
+            s.stopping = true;
+            s.teardown();
+            Some(s.request.clone())
         });
         if let Some(request) = request {
             unsafe { request.endAudio() };
@@ -201,6 +345,12 @@ pub fn dictation_stop(app: AppHandle) -> Result<(), String> {
 /// away mid-phrase.
 #[tauri::command]
 pub fn dictation_cancel(app: AppHandle) -> Result<(), String> {
+    #[cfg(speech_analyzer)]
+    if analyzer::active() {
+        analyzer::cancel();
+        app.emit(EV_STATE, StateEvent { listening: false }).ok();
+        return Ok(());
+    }
     on_main(&app, |app| {
         if let Some(session) = SESSION.with_borrow_mut(|s| s.take()) {
             session.teardown();
@@ -231,7 +381,10 @@ fn begin(app: &AppHandle) -> Result<(), String> {
             request,
             task,
             committed: String::new(),
+            live: Hyp::default(),
             stopping: false,
+            armed_at: Instant::now(),
+            quick_failures: 0,
             generation: 0,
         })
     });
@@ -272,10 +425,21 @@ fn arm(
             move |result: *mut SFSpeechRecognitionResult, error: *mut objc2_foundation::NSError| {
                 // A result and an error are mutually exclusive per call.
                 if let Some(result) = unsafe { result.as_ref() } {
-                    let text =
-                        unsafe { result.bestTranscription().formattedString() }.to_string();
+                    let best = unsafe { result.bestTranscription() };
+                    let segments = unsafe { best.segments() };
+                    let (start, end) = match (segments.firstObject(), segments.lastObject()) {
+                        (Some(first), Some(last)) => unsafe {
+                            (first.timestamp(), last.timestamp() + last.duration())
+                        },
+                        _ => (0.0, 0.0),
+                    };
+                    let hyp = Hyp {
+                        text: unsafe { best.formattedString() }.to_string(),
+                        start,
+                        end,
+                    };
                     let is_final = unsafe { result.isFinal() };
-                    deliver(&app, generation, Ok((text, is_final)));
+                    deliver(&app, generation, Ok((hyp, is_final)));
                 } else if let Some(error) = unsafe { error.as_ref() } {
                     deliver(
                         &app,
@@ -322,7 +486,7 @@ fn arm(
 
 /// Fold one recognizer callback into the session. Hops to the main thread
 /// because the callback arrives on the recognizer's own queue.
-fn deliver(app: &AppHandle, generation: u64, result: Result<(String, bool), String>) {
+fn deliver(app: &AppHandle, generation: u64, result: Result<(Hyp, bool), String>) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         let current = SESSION
@@ -332,28 +496,99 @@ fn deliver(app: &AppHandle, generation: u64, result: Result<(String, bool), Stri
             return;
         }
         match result {
-            Err(message) => fail(&app, &message),
+            // Silence ends a task with an error rather than a final. That is
+            // the end of an utterance, not of dictation: keep what was heard
+            // and carry on (or finish, if the user already stopped). Only a
+            // recognizer that errors straight away, repeatedly, gives up.
+            Err(message) => {
+                let give_up = SESSION.with_borrow_mut(|s| {
+                    let s = s.as_mut()?;
+                    if s.stopping {
+                        return Some(false);
+                    }
+                    if s.armed_at.elapsed() < QUICK_FAILURE {
+                        s.quick_failures += 1;
+                    } else {
+                        s.quick_failures = 0;
+                    }
+                    Some(s.quick_failures >= MAX_QUICK_FAILURES)
+                });
+                match give_up {
+                    Some(false) => commit(&app, Hyp::default()),
+                    Some(true) => fail(&app, &message),
+                    None => {}
+                }
+            }
             // Partials are revisions of the live utterance, so the UI gets the
             // finished text plus the current hypothesis, never the hypothesis
             // alone.
-            Ok((text, false)) => {
-                if let Some(text) =
-                    SESSION.with_borrow(|s| s.as_ref().map(|s| joined(&s.committed, &text)))
-                {
+            Ok((hyp, false)) => {
+                let text = SESSION.with_borrow_mut(|s| {
+                    let s = s.as_mut()?;
+                    if !hyp.text.trim().is_empty() {
+                        s.quick_failures = 0;
+                    }
+                    if restarted(&s.live, &hyp) {
+                        s.committed = joined(&s.committed, &s.live.text);
+                    }
+                    s.live = hyp;
+                    Some(joined(&s.committed, &s.live.text))
+                });
+                if let Some(text) = text {
                     app.emit(EV_PARTIAL, TextEvent { text }).ok();
                 }
             }
-            Ok((text, true)) => commit(&app, text),
+            Ok((hyp, true)) => commit(&app, hyp),
         }
     });
 }
 
-/// A task finalised. Either the user asked to stop, which ends the phrase, or
-/// the recognizer decided the utterance was over by itself — in which case
+/// Whether `next` is a new utterance rather than a revision of `prev` — the
+/// recognizer dropped `prev` after a pause without finalising it.
+fn restarted(prev: &Hyp, next: &Hyp) -> bool {
+    if prev.text.trim().is_empty() {
+        return false;
+    }
+    // Timings are relative to the task's audio, so a hypothesis that begins
+    // where the previous one ended covers new speech. Partials don't always
+    // carry timings (all zero), hence the text check too: a revision rewrites
+    // words but keeps the opening and doesn't lose most of its length.
+    if next.start > 0.0 && prev.end > 0.0 && next.start >= prev.end - 0.05 {
+        return true;
+    }
+    let (a, b) = (words(&prev.text), words(&next.text));
+    b.len() < a.len() && a.first() != b.first()
+}
+
+fn words(s: &str) -> Vec<String> {
+    s.split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// A task ended. Either the user asked to stop, which ends the phrase, or the
+/// recognizer decided the utterance was over by itself — in which case
 /// dictation carries on under a fresh task and the mic never closes.
-fn commit(app: &AppHandle, text: String) {
+fn commit(app: &AppHandle, hyp: Hyp) {
     let Some((stopping, committed)) = SESSION.with_borrow_mut(|s| {
         let session = s.as_mut()?;
+        let live = std::mem::take(&mut session.live);
+        // The final can come back empty (the words were in a hypothesis the
+        // recognizer already dropped), or holding only what followed such a
+        // drop. Either way the last partial is text the user saw and meant.
+        let text = if hyp.text.trim().is_empty() {
+            live.text
+        } else if restarted(&live, &hyp) {
+            joined(&live.text, &hyp.text)
+        } else {
+            hyp.text
+        };
         session.committed = joined(&session.committed, &text);
         Some((session.stopping, session.committed.clone()))
     }) else {
@@ -382,6 +617,7 @@ fn commit(app: &AppHandle, text: String) {
                 if let Some(session) = s.as_mut() {
                     session.request = request;
                     session.task = task;
+                    session.armed_at = Instant::now();
                 }
             });
             // Re-render so the just-finalised words stop looking provisional.

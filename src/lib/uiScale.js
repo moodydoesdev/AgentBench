@@ -14,6 +14,16 @@ export function resolveUiScale(uiScale) {
 }
 
 export function applyUiScale(uiScale) {
+  if (!("__TAURI_INTERNALS__" in window)) {
+    // Browser (web UI, plan test harness): CSS zoom is the closest equivalent
+    // and the stylesheet is px-based, so it scales the same way.
+    try {
+      document.documentElement.style.zoom = String(resolveUiScale(uiScale));
+    } catch {
+      /* non-blink engines without zoom just stay 1:1 */
+    }
+    return;
+  }
   try {
     getCurrentWebview()
       .setZoom(resolveUiScale(uiScale))

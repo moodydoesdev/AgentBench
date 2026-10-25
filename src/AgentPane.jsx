@@ -1,15 +1,15 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import usePaneDrag from "./usePaneDrag";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl, isTauri, getWebTransport } from "@/lib/ipc";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { Terminal as WtermTerminal } from "@wterm/react";
 import { GhosttyCore } from "@wterm/ghostty";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@/lib/ipc";
+import { invoke } from "@/lib/ipc";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   X,
@@ -19,10 +19,14 @@ import {
   Play,
   Moon,
   PushPin,
+  SidebarSimple,
 } from "@phosphor-icons/react";
 import ChatView from "./chat/ChatView";
+import TeamSidebar from "./teams/TeamSidebar";
+import ProcessDrawer from "./components/ProcessDrawer";
 import { formatBytes } from "./lib/resourceFormat";
-import { tauriTransport } from "./lib/transport";
+import { contextPercent, contextWindow, fmtTokens } from "./lib/contextUsage";
+import { useTransport } from "./lib/TransportContext";
 import { createOutputBatcher } from "./lib/terminalOutput";
 import { pasteAndSubmit } from "./lib/ptyPaste";
 import { isTerminalReport } from "./lib/terminalReports";
@@ -30,11 +34,11 @@ import "@xterm/xterm/css/xterm.css";
 import "@wterm/dom/css";
 
 // XtermInner used to reach for Tauri's invoke/listen directly, which is why a
-// remote pane needed its own terminal component. It now takes a transport and
-// defaults to this one, so the same terminal drives a local pty or a linked
-// bench's over the gateway socket. Module-level so the default prop is stable
-// across renders — it sits in the terminal effect's dep list.
-const LOCAL_TRANSPORT = tauriTransport();
+// remote pane needed its own terminal component. It now takes a transport
+// prop (dock, linked benches) and otherwise uses the ambient one from
+// TransportContext, so the same terminal drives a local pty, a linked bench's
+// over the gateway socket, or — in the browser — this machine's over its own
+// gateway.
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -143,8 +147,8 @@ function createSyncFilter(write) {
   };
 }
 
-const FALLBACK_STACK = '"SF Mono", Menlo, Consolas, monospace';
-const FONT_STACK = `"FiraCode Nerd Font Mono", ${FALLBACK_STACK}`;
+export const FALLBACK_STACK = '"SF Mono", Menlo, Consolas, monospace';
+export const FONT_STACK = `"FiraCode Nerd Font Mono", ${FALLBACK_STACK}`;
 
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
@@ -167,15 +171,26 @@ export function XtermInner({
   copyOnSelect = true,
   visible = true,
   scrollback = 2000,
-  transport = LOCAL_TRANSPORT,
+  transport: transportProp,
 }) {
+  // Prop wins (dock, remote panes); otherwise the ambient transport — Tauri
+  // IPC on the desktop, the gateway socket in the browser. Both are stable
+  // singletons, so effect deps behave exactly as with the old module default.
+  const ctxTransport = useTransport();
+  const transport = transportProp ?? ctxTransport;
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
   const outputRef = useRef(null);
   const gpuToggleRef = useRef(null);
+  // Remote pane hidden at mount: its backlog fetch waits here for the first
+  // reveal (see the pane_buffer block below).
+  const backlogRef = useRef(null);
   useEffect(() => {
     gpuToggleRef.current?.(visible);
-    if (visible) outputRef.current?.flush();
+    if (visible) {
+      outputRef.current?.flush();
+      backlogRef.current?.();
+    }
   }, [visible]);
   useEffect(() => {
     if (termRef.current) termRef.current.options.scrollback = Math.max(500, Math.min(8000, scrollback));
@@ -380,26 +395,43 @@ export function XtermInner({
     if (initialData) term.write(b64ToBytes(initialData));
 
     // A local pane gets its scrollback handed to it as `initialData` from the
-    // app's own cache. A pane on a linked bench has no such cache here, so ask
-    // the bench that owns the pty. Live frames that arrive before that resolves
-    // are held rather than written: an escape sequence split across the seam
-    // corrupts the screen.
+    // app's own cache. A pane on a linked bench (or the web bench) has no such
+    // cache here, so ask the machine that owns the pty. Live frames that
+    // arrive before that resolves are held rather than written: an escape
+    // sequence split across the seam corrupts the screen.
+    //
+    // Off-screen remote panes defer the fetch until their first reveal — the
+    // web bench mounts every pane of every project, and fetching every
+    // backlog at boot floods the tunnel. While deferred, live frames are
+    // dropped, not held: the eventual backlog carries everything up to the
+    // moment it is fetched, so holding them would paint the overlap twice.
     // Keyed on transport kind, not object identity: more than one module
     // builds a local transport, and they must all count as local.
     let held = initialData || transport.kind === "tauri" ? null : [];
+    let deferred = false;
     if (held) {
       const drain = () => {
         const pending = held;
         held = null;
         if (pending) for (const chunk of pending) output.push(chunk);
       };
-      transport
-        .invoke("pane_buffer", { id, limit: 512 * 1024 })
-        .then((res) => {
-          if (res?.buffer) term.write(b64ToBytes(res.buffer));
-        })
-        .catch(() => {})
-        .finally(drain);
+      const fetchBacklog = () => {
+        backlogRef.current = null;
+        deferred = false;
+        held = [];
+        transport
+          .invoke("pane_buffer", { id, limit: 512 * 1024 })
+          .then((res) => {
+            if (res?.buffer) term.write(b64ToBytes(res.buffer));
+          })
+          .catch(() => {})
+          .finally(drain);
+      };
+      if (visibleRef.current) fetchBacklog();
+      else {
+        deferred = true;
+        backlogRef.current = fetchBacklog;
+      }
     }
 
     term.onData(sendData);
@@ -471,8 +503,20 @@ export function XtermInner({
     });
     ro.observe(containerRef.current);
 
+    // The same pty can be on screen elsewhere at another size (the phone's
+    // Term tab resizes it to phone width). Touching this terminal, or this
+    // window coming back to the front, takes the size back.
+    const reclaim = () => {
+      const el = containerRef.current;
+      if (!el || el.offsetWidth === 0 || !visibleRef.current) return;
+      transport.invoke("resize_pane", { id, cols: term.cols, rows: term.rows }).catch(() => {});
+    };
+    containerRef.current.addEventListener("pointerdown", reclaim);
+    window.addEventListener("focus", reclaim);
+
     const unlisten = transport.listen("pane-output", (e) => {
       if (e.payload.id !== id) return;
+      if (deferred) return; // backlog will carry these bytes at reveal
       const bytes = b64ToBytes(e.payload.data);
       if (held) held.push(bytes);
       else output.push(bytes);
@@ -482,10 +526,13 @@ export function XtermInner({
 
     return () => {
       register(null);
+      backlogRef.current = null;
       clearTimeout(resyncTimer);
       clearTimeout(copyTimer);
       clearTimeout(toastTimer);
       ro.disconnect();
+      containerEl.removeEventListener("pointerdown", reclaim);
+      window.removeEventListener("focus", reclaim);
       containerEl.removeEventListener("contextmenu", onCtxMenu, true);
       unlisten.then((f) => f());
       output.dispose();
@@ -653,24 +700,32 @@ export default memo(function AgentPane({
   scrollback = 2000,
   hibernated = false,
   team, // saved team name when this agent was started as part of one
-  teamTabs, // focus-layout team: [{id, role, status}] for every member sharing this cell
+  teamTabs, // focus-layout team: [{id, role, status, projectPath, sid, hibernated}] for every member sharing this cell
   onTeamTab,
+  // focus-layout team: { hibernate, resume, close } acting on every member,
+  // since the cell *is* the team — its moon/X/resume mean the whole team
+  teamActions,
+  inputLockedBy = null, // manager's role: this developer pane takes no direct user input
   resource,
   resourceBusy,
   onResourceAction,
+  onStopCommand, // stop one of this agent's running commands (process drawer)
+  onFollowTask, // open a background task's live output in the dock
   codex = false,
   claude = false, // Claude harness — enables the Term ⇄ Chat view toggle
   view = "term", // "term" | "chat" (read-along transcript view)
   onViewChange,
   initialLines, // chat panes: replayed stream-json lines from reattach
-  hidden = false, // run pane hidden while its process keeps running
+  hidden = false, // pane minimized to the tray while its agent keeps working
   command, // run panes: the command line (shown where agents show cwd)
   onHide,
+  onMinimize, // agent panes: drop into the bottom tray (team cells sit out)
   onRestart,
   onResumeRequest, // chat "/resume" → the app's searchable session picker
   status,
   focused,
   agentColor,
+  usage, // broker transcript snapshot: { context, …, model } token counts
   engine = "xterm",
   termTheme,
   wordMod = "ctrl",
@@ -680,6 +735,7 @@ export default memo(function AgentPane({
   gridCols = 3,
   onResize,
   onReorder,
+  gridOrder, // grid slot; a focus team's cell takes its earliest member's
   onRegister,
   onActivity,
   onTitle,
@@ -741,7 +797,35 @@ export default memo(function AgentPane({
     onResize(id, { w: next, h });
   };
 
+  // A managed team's developer takes direction from its manager, not the
+  // user — typing is ignored while locked. Unlock is a per-pane override so
+  // permission prompts can still be answered by hand.
+  const [lockOverride, setLockOverride] = useState(false);
+  useEffect(() => setLockOverride(false), [inputLockedBy]);
+  const inputLocked = !!inputLockedBy && !lockOverride;
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const running = hibernated
+    ? 0
+    : (resource?.commands?.length ?? 0) +
+      (resource?.background?.filter((t) => !t.startsWith("toolu_")).length ?? 0);
+  const [railOpen, setRailOpen] = useState(() => {
+    try {
+      return localStorage.getItem("agentbench.teamRail") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleRail = () =>
+    setRailOpen((o) => {
+      try {
+        localStorage.setItem("agentbench.teamRail", o ? "0" : "1");
+      } catch { /* per-device convenience only */ }
+      return !o;
+    });
+
   const sendData = (data) => {
+    // terminal reports (focus/size replies) must flow even when locked
+    if (inputLocked && !isTerminalReport(data)) return;
     if (sigintGuard && data === "\x03") {
       const now = Date.now();
       if (now - lastSigintRef.current < SIGINT_GUARD_MS) return;
@@ -751,6 +835,12 @@ export default memo(function AgentPane({
     if (!isTerminalReport(data)) callbacksRef.current.onActivity(id);
     invoke("write_pane", { id, data }).catch(() => {});
   };
+  // xterm binds term.onData once at mount, so hand terminals a stable
+  // wrapper — otherwise they keep the lock state from first render and
+  // stay dead after Unlock.
+  const sendDataRef = useRef(sendData);
+  sendDataRef.current = sendData;
+  const stableSendData = useCallback((data) => sendDataRef.current(data), []);
 
   const shellQuote = (p) =>
     /^[\w./-]+$/.test(p) ? p : `'${p.replaceAll("'", `'\\''`)}'`;
@@ -773,6 +863,50 @@ export default memo(function AgentPane({
       const r = el.getBoundingClientRect();
       return x / s >= r.left && x / s < r.right && y / s >= r.top && y / s < r.bottom;
     };
+    if (!isTauri) {
+      // Browser (bench over the web): drops carry File bytes, no OS path, so
+      // upload each to the workstation and use the temp path it lands at.
+      // The chat composer handles its own drops; this covers the terminal.
+      const el = sectionRef.current;
+      const upload = getWebTransport()?.upload;
+      if (!el || !upload) return;
+      // The composer's own React handlers take drops aimed at it; a native
+      // listener here runs first, so step aside rather than stage twice.
+      const hasFiles = (ev) =>
+        !ev.target.closest?.(".chat-composer-card") &&
+        Array.from(ev.dataTransfer?.types ?? []).includes("Files");
+      const onOver = (ev) => {
+        if (!hasFiles(ev)) return;
+        ev.preventDefault();
+        setDragOver(true);
+      };
+      const onLeave = (ev) => {
+        if (!el.contains(ev.relatedTarget)) setDragOver(false);
+      };
+      const onDrop = (ev) => {
+        setDragOver(false);
+        if (!hasFiles(ev)) return;
+        const files = Array.from(ev.dataTransfer?.files ?? []);
+        if (!files.length) return;
+        ev.preventDefault();
+        const chat = chatVisibleRef.current ? chatHandleRef.current : null;
+        if (chat?.addFile) {
+          files.forEach((f) => chat.addFile(f));
+          return;
+        }
+        Promise.all(files.map((f) => upload(f)))
+          .then((paths) => sendData(paths.map(shellQuote).join(" ") + " "))
+          .catch((err) => console.error("upload failed", err));
+      };
+      el.addEventListener("dragover", onOver);
+      el.addEventListener("dragleave", onLeave);
+      el.addEventListener("drop", onDrop);
+      return () => {
+        el.removeEventListener("dragover", onOver);
+        el.removeEventListener("dragleave", onLeave);
+        el.removeEventListener("drop", onDrop);
+      };
+    }
     const sub = getCurrentWebview().onDragDropEvent(({ payload }) => {
       if (payload.type === "enter" || payload.type === "over") {
         setDragOver(inside(payload.position));
@@ -873,7 +1007,9 @@ export default memo(function AgentPane({
     sendData(seq);
   };
 
-  const isWterm = engine.startsWith("wterm");
+  // wterm is wired straight to Tauri IPC (and ships a wasm core the gateway
+  // doesn't serve), so the browser always gets xterm regardless of setting.
+  const isWterm = isTauri && engine.startsWith("wterm");
   const Inner = isWterm ? WtermInner : XtermInner;
   const isRun = kind === "run";
   const isChat = kind === "chat"; // headless — no pty, no terminal view
@@ -895,6 +1031,7 @@ export default memo(function AgentPane({
   // Read-along composer: same bracketed-paste-then-Enter path as plan
   // feedback, so the text lands in the pty exactly like a user paste.
   const sendChatToPty = (text) => {
+    if (inputLocked) return;
     callbacksRef.current.onActivity(id);
     pasteAndSubmit(id, text);
   };
@@ -902,6 +1039,7 @@ export default memo(function AgentPane({
   // Headless composer: plain text — the broker wraps it into a stream-json
   // user message on the harness's stdin.
   const sendChatToStream = (text) => {
+    if (inputLocked) return;
     callbacksRef.current.onActivity(id);
     invoke("write_pane", { id, data: text }).catch(() => {});
   };
@@ -915,6 +1053,7 @@ export default memo(function AgentPane({
       style={{
         gridColumn: `span ${w}`,
         gridRow: `span ${h}`,
+        order: gridOrder,
         display: hidden ? "none" : undefined,
       }}
       data-pane-id={id}
@@ -956,6 +1095,18 @@ export default memo(function AgentPane({
                 {t.role}
               </button>
             ))}
+            <button
+              type="button"
+              className={`pane-size pane-rail-toggle${railOpen ? " on" : ""}`}
+              title={railOpen ? "Hide team sidebar" : "Show what each teammate is doing"}
+              aria-pressed={railOpen}
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleRail();
+              }}
+            >
+              <SidebarSimple size={14} />
+            </button>
           </div>
         ) : (
           <span className="pane-title" title={name}>
@@ -968,12 +1119,50 @@ export default memo(function AgentPane({
         {resource && !hibernated && <span className="pane-resource" title={`${resource.processes} processes · resident RAM; CPU is whole-machine share`}>
           {formatBytes(resource.resident_bytes)} · {(resource.cpu_percent ?? 0).toFixed(1)}%
         </span>}
-        {resource && <button className={`pane-size${resource.pinned ? " pinned" : ""}`} title={resource.pinned ? "Unpin agent" : "Pin agent — keep alive"}
-          aria-label="Keep agent alive" aria-pressed={!!resource.pinned} disabled={!!resourceBusy}
-          onClick={(e) => { e.stopPropagation(); onResourceAction?.("pin", !resource.pinned); }}><PushPin size={14}/></button>}
-        {resource && !hibernated && <button className="pane-size" title={resource.reason || "Hibernate agent — save session and stop its processes"}
-          aria-label="Hibernate agent" disabled={!resource.eligible || !!resourceBusy}
-          onClick={(e) => { e.stopPropagation(); onResourceAction?.("hibernate"); }}><Moon size={14}/></button>}
+        {usage?.context > 0 && !hibernated && (() => {
+          const pct = contextPercent(usage);
+          const tone = pct >= 90 ? "hot" : pct >= 70 ? "warm" : "ok";
+          return (
+            <span
+              className={`pane-context pane-context-${tone}`}
+              title={[
+                `Context window: ${usage.context.toLocaleString()} of ${fmtTokens(contextWindow(usage))} tokens (${pct}%)`,
+                `Last turn — input ${fmtTokens(usage.input)} · cache read ${fmtTokens(usage.cache_read)} · cache write ${fmtTokens(usage.cache_create)} · output ${fmtTokens(usage.output)}`,
+                usage.model && `Model: ${usage.model}`,
+              ].filter(Boolean).join("\n")}
+            >
+              {fmtTokens(usage.context)} · {pct}%
+            </span>
+          );
+        })()}
+        {(running > 0 || drawerOpen) && (
+          <button
+            className={`pane-running${drawerOpen ? " on" : ""}`}
+            title="What this agent is running — view output or stop it"
+            onClick={(e) => {
+              e.stopPropagation();
+              setDrawerOpen((o) => !o);
+            }}
+          >
+            <span className="pane-running-pulse" />
+            {running} running
+          </button>
+        )}
+        {resource && (teamActions
+          ? <button className={`pane-size${teamActions.pinned ? " pinned" : ""}`}
+              title={teamActions.pinned ? "Unpin team — its agents may hibernate when idle" : "Pin team — keep every agent awake, no hibernation"}
+              aria-label="Keep team alive" aria-pressed={teamActions.pinned} disabled={!!resourceBusy}
+              onClick={(e) => { e.stopPropagation(); teamActions.pin(!teamActions.pinned); }}><PushPin size={14}/></button>
+          : <button className={`pane-size${resource.pinned ? " pinned" : ""}`} title={resource.pinned ? "Unpin agent" : "Pin agent — keep alive"}
+              aria-label="Keep agent alive" aria-pressed={!!resource.pinned} disabled={!!resourceBusy}
+              onClick={(e) => { e.stopPropagation(); onResourceAction?.("pin", !resource.pinned); }}><PushPin size={14}/></button>)}
+        {resource && !hibernated && (teamActions
+          ? <button className="pane-size" title={teamActions.pinned ? "Team is pinned — unpin it to hibernate" : "Hibernate the whole team — save every session and stop their processes"}
+              aria-label="Hibernate team" disabled={!!resourceBusy || teamActions.pinned}
+              onClick={(e) => { e.stopPropagation(); teamActions.hibernate(); }}><Moon size={14}/></button>
+          : <button className="pane-size" title={resource.reason || "Hibernate agent — save session and stop its processes"}
+              aria-label="Hibernate agent" disabled={!resource.eligible || !!resourceBusy}
+              onClick={(e) => { e.stopPropagation(); onResourceAction?.("hibernate"); }}><Moon size={14}/></button>)}
         <span className="pane-cwd" title={command ?? cwd}>
           {command ?? cwd}
         </span>
@@ -1018,13 +1207,18 @@ export default memo(function AgentPane({
             <ArrowClockwise size={14} weight="bold" />
           </button>
         )}
-        {isRun && (
+        {(isRun ? onHide : onMinimize) && (
           <button
             className="pane-size"
-            title="Hide pane — process keeps running (bring back from the Run menu)"
+            aria-label="Minimize pane"
+            title={
+              isRun
+                ? "Hide pane — process keeps running (bring back from the Run menu)"
+                : "Minimize to the bottom tray — the agent keeps working"
+            }
             onClick={(ev) => {
               ev.stopPropagation();
-              onHide?.(id);
+              (isRun ? onHide : onMinimize)(id);
             }}
           >
             <Minus size={14} weight="bold" />
@@ -1042,20 +1236,58 @@ export default memo(function AgentPane({
         </button>
         <button
           className="pane-close"
-          title={isRun ? "Kill process and close pane" : "Kill agent and close pane"}
+          title={teamActions ? "Kill every agent in the team and close it" : isRun ? "Kill process and close pane" : "Kill agent and close pane"}
           onClick={(ev) => {
             ev.stopPropagation();
-            onClose(id);
+            if (teamActions) teamActions.close();
+            else onClose(id);
           }}
         >
           <X size={13} weight="bold" />
         </button>
       </header>
+      {drawerOpen && (
+        <ProcessDrawer
+          commands={resource?.commands}
+          background={resource?.background}
+          onStop={(cmd) => onStopCommand?.(cmd)}
+          onFollow={(task) => onFollowTask?.(task)}
+          onClose={() => setDrawerOpen(false)}
+        />
+      )}
+      <div className="pane-body">
+      {teamTabs && railOpen && (
+        <TeamSidebar
+          members={teamTabs}
+          listId={teamTabs[0]?.listId}
+          teamId={teamTabs[0]?.teamId}
+          currentId={id}
+          visible={visible}
+          onPick={(tabId) => onTeamTab?.(tabId)}
+        />
+      )}
+      <div className="pane-main">
+      {inputLockedBy && !hibernated && (
+        <div className="pane-lock-banner">
+          <span>
+            {inputLocked
+              ? `Managed by ${inputLockedBy} — message the team through them`
+              : `Unlocked — input reaches ${team ? "this developer" : "this agent"} directly`}
+          </span>
+          <button
+            className="btn-sm"
+            title={inputLocked ? "Let input through, e.g. to answer a permission prompt" : "Lock input again"}
+            onClick={() => setLockOverride((o) => !o)}
+          >
+            {inputLocked ? "Unlock" : "Lock"}
+          </button>
+        </div>
+      )}
       {hibernated ? (
         <>
           <div className="pane-sleep-banner"><span>{resource?.can_resume === false ? "Session saved · recovery needs attention" : "Session saved · agent hibernated"}</span>
             <button className="btn-sm" disabled={!!resourceBusy || resource?.can_resume === false} title={resource?.reason || undefined}
-              onClick={() => onResourceAction?.("resume")}>{resourceBusy || "Resume agent"}</button></div>
+              onClick={() => teamActions ? teamActions.resume() : onResourceAction?.("resume")}>{resourceBusy || (teamActions ? "Resume team" : "Resume agent")}</button></div>
           <ChatView key={`sleep-${id}`} id={id} cwd={cwd} mode="transcript" readOnly visible={visible}/>
         </>
       ) : isChat ? (
@@ -1063,6 +1295,8 @@ export default memo(function AgentPane({
           id={id}
           cwd={cwd}
           mode="stream"
+          name={name}
+          accentColor={AGENT_COLORS[agentColor]}
           visible={visible}
           initialLines={initialLines}
           onSend={sendChatToStream}
@@ -1075,9 +1309,11 @@ export default memo(function AgentPane({
           // the desktop always has save_pasted_image, so headless panes can
           // take pasted/dropped images too — Claude reads them by path
           allowImages
+          readOnly={inputLocked}
           status={status}
           register={registerChat}
           trackTasks
+          shells={{ commands: resource?.commands, onStop: onStopCommand, onFollow: onFollowTask }}
         />
       ) : (
         <>
@@ -1096,7 +1332,7 @@ export default memo(function AgentPane({
               copyOnSelect={copyOnSelect}
               initialData={initialData}
               register={register}
-              sendData={sendData}
+              sendData={stableSendData}
               onTitle={handleTitle}
             />
           </div>
@@ -1107,6 +1343,8 @@ export default memo(function AgentPane({
                 cwd={cwd}
                 mode="transcript"
                 agent={codex ? "Codex" : "Claude"}
+                name={name}
+                accentColor={AGENT_COLORS[agentColor]}
                 visible={visible && chatVisible}
                 onSend={sendChatToPty}
                 onStop={(resubmit) =>
@@ -1116,14 +1354,18 @@ export default memo(function AgentPane({
           }
                 onNeedsTerm={() => onViewChange?.(id, "term")}
                 onResume={codex ? undefined : onResumeRequest}
+                readOnly={inputLocked}
                 status={status}
                 register={registerChat}
                 trackTasks
+                shells={{ commands: resource?.commands, onStop: onStopCommand, onFollow: onFollowTask }}
               />
             </div>
           )}
         </>
       )}
+      </div>
+      </div>
       <div
         className="pane-grip e"
         title="Drag to resize · double-click to reset"

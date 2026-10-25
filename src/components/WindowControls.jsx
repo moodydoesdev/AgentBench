@@ -1,13 +1,16 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isTauri } from "@/lib/ipc";
 
 // Caption buttons for Windows, where the native title bar is disabled
 // (decorations: false). macOS keeps its native traffic lights via the
-// Overlay title bar style, so this never renders there.
+// Overlay title bar style, so this never renders there. A browser tab has the
+// OS's own chrome, so in web mode this renders nothing at all.
 export default function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
+    if (!isTauri) return;
     const win = getCurrentWindow();
     let unlisten;
     win.isMaximized().then(setMaximized);
@@ -19,6 +22,7 @@ export default function WindowControls() {
     return () => unlisten?.();
   }, []);
 
+  if (!isTauri) return null;
   const win = getCurrentWindow();
 
   return (

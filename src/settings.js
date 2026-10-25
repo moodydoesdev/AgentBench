@@ -109,6 +109,8 @@ export const DEFAULT_SETTINGS = {
   bgFrostBlur: 24, // frost blur radius in px
   bgHeadOpacity: 1, // pane-header opacity over the bg image (0–1, 1 = solid)
   commandMenuKey: "mod+shift+p", // opens the command menu; "mod" = ⌘ on macOS, Ctrl elsewhere
+  dictationKey: "", // extra push-to-talk combo, e.g. "ctrl+z" ("" = only the Space defaults)
+  dictationHoldDelay: 250, // ms a held push-to-talk key must stay down before the mic opens
   planSkillSync: true, // keep ~/.claude/skills/agentbench-plan in sync on launch
   defaultHarness: "claude", // harness spawned by the New Agent button
   customHarnesses: [], // user-defined harnesses: {id, name, command}

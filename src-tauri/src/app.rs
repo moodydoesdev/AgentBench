@@ -127,6 +127,9 @@ fn spawn_broker() -> Result<(), String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for k in crate::broker::CLAUDE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
     // detach into its own process group so Ctrl+C on `tauri dev` (or the app
     // quitting) can't take the broker down with it
     #[cfg(unix)]
@@ -159,6 +162,12 @@ fn connect_or_spawn() -> Result<TcpStream, String> {
         }
     }
     Err("broker did not come up".into())
+}
+
+/// Claude plan usage (5-hour + weekly windows) for the titlebar meter.
+#[tauri::command]
+async fn claude_usage() -> Result<Value, String> {
+    crate::gateway::usage::claude_usage().await
 }
 
 #[tauri::command]
@@ -220,6 +229,45 @@ async fn resource_state(client: State<'_, Arc<BrokerClient>>) -> Result<Value, S
     broker_request(client, json!({"op":"resources"})).await
 }
 
+/// Local text-to-speech (Kokoro), in-process — same contract as the
+/// gateway's `speak_text` read: `{ mime, data }` with a base64 WAV.
+#[tauri::command]
+async fn speak_text(
+    text: String,
+    voice: Option<String>,
+    speed: Option<f32>,
+    raw: Option<bool>,
+    engine: Option<String>,
+) -> Result<Value, String> {
+    let args = json!({ "text": text, "voice": voice, "speed": speed, "raw": raw, "engine": engine });
+    crate::gateway::speak::synth_json(args).await
+}
+
+#[tauri::command]
+async fn speech_voices() -> Result<Value, String> {
+    crate::gateway::speak::eleven_voices().await
+}
+
+#[tauri::command]
+fn speech_prefs() -> Value {
+    crate::gateway::speak::prefs()
+}
+
+#[tauri::command]
+fn set_speech_prefs(prefs: Value) -> Result<Value, String> {
+    crate::gateway::speak::set_prefs(&prefs)
+}
+
+#[tauri::command]
+async fn tty_prompt(client: State<'_, Arc<BrokerClient>>, id: u32) -> Result<Value, String> {
+    broker_request(client, json!({"op":"tty-prompt", "id":id})).await
+}
+
+#[tauri::command]
+async fn answer_tty_prompt(client: State<'_, Arc<BrokerClient>>, id: u32, sig: String, index: u32) -> Result<Value, String> {
+    broker_request(client, json!({"op":"answer-tty-prompt", "id":id, "sig":sig, "index":index})).await
+}
+
 #[tauri::command]
 async fn resource_policy(client: State<'_, Arc<BrokerClient>>, policy: Value) -> Result<Value, String> {
     broker_request(client, json!({"op":"resource-policy", "policy":policy})).await
@@ -233,6 +281,25 @@ async fn resource_draft(client: State<'_, Arc<BrokerClient>>, id: u32, owner: St
 #[tauri::command]
 async fn resource_pin(client: State<'_, Arc<BrokerClient>>, id: u32, pinned: bool) -> Result<Value, String> {
     broker_request(client, json!({"op":"resource-pin", "id":id, "pinned":pinned})).await
+}
+
+/// Live output file of a session's background task, if it has one.
+#[tauri::command]
+fn task_output_path(project: String, sid: String, task: String) -> Option<String> {
+    fsdata::task_output_path(&project, &sid, &task)
+}
+
+/// Follow a background task's output file; see fsdata::tail_output.
+#[tauri::command]
+fn tail_output(path: String, offset: u64) -> Result<Value, String> {
+    fsdata::tail_output(&path, offset)
+}
+
+/// Stop one of an agent's running commands (and its children); see
+/// broker::resources::stop_command.
+#[tauri::command]
+async fn stop_command(client: State<'_, Arc<BrokerClient>>, id: u32, pid: u32, start: u64) -> Result<Value, String> {
+    broker_request(client, json!({"op":"stop-command", "id":id, "pid":pid, "start":start})).await
 }
 
 #[tauri::command]
@@ -296,6 +363,23 @@ fn saved_panes(client: State<'_, Arc<BrokerClient>>) -> Result<Value, String> {
     client.request(json!({ "op": "saved" }))
 }
 
+/// Team decisions live in the broker (the manager files them through the
+/// hook server); the UI lists and answers them.
+#[tauri::command]
+fn decisions(client: State<'_, Arc<BrokerClient>>) -> Result<Value, String> {
+    client.request(json!({ "op": "decisions" }))
+}
+
+#[tauri::command]
+fn decision_answer(
+    client: State<'_, Arc<BrokerClient>>,
+    id: String,
+    answer: String,
+    note: Option<String>,
+) -> Result<Value, String> {
+    client.request(json!({ "op": "decision-answer", "id": id, "answer": answer, "note": note }))
+}
+
 /// Scheduled prompts live in the broker (they must fire with the app closed);
 /// these four commands are thin passthroughs to its ops.
 #[tauri::command]
@@ -351,9 +435,16 @@ fn save_teams(project: String, teams: Value) -> Result<(), String> {
     fsdata::write_teams(&project, &teams)
 }
 
+/// The registry as it stands on disk — a phone may have added a project
+/// through the gateway since this webview last wrote it.
+#[tauri::command]
+fn list_projects() -> Vec<Value> {
+    fsdata::read_projects()
+}
+
 /// Mirror the desktop's project registry to disk so the mobile gateway can
-/// read it. localStorage stays the desktop's source of truth; this file is
-/// desktop-owned and read-only everywhere else.
+/// read it. localStorage stays the desktop's source of truth; phones may
+/// append to it, which the desktop folds back in on focus.
 #[tauri::command]
 fn save_projects(projects: Value) -> Result<(), String> {
     fsdata::write_projects(&projects)
@@ -387,6 +478,18 @@ async fn search_sessions(project: String, query: String) -> Vec<Value> {
 #[tauri::command]
 fn session_tail(project: String, sid: String) -> Option<String> {
     fsdata::last_assistant_text(&project, &sid)
+}
+
+/// A team's shared task list — the team sidebar polls this.
+#[tauri::command]
+fn team_tasks(list: String) -> Vec<serde_json::Value> {
+    fsdata::task_list(&list)
+}
+
+/// One line on what a session is doing now — the team sidebar polls this.
+#[tauri::command]
+fn session_brief(project: String, sid: String) -> Option<String> {
+    fsdata::session_brief(&project, &sid)
 }
 
 /// Switch a headless chat pane's model mid-session (stream-json set_model).
@@ -485,6 +588,17 @@ fn save_pasted_image(data_url: String) -> Result<String, String> {
     let path = dir.join(format!("paste-{stamp}-{seq}.{ext}"));
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Any file picked or pasted in the chat composer (base64 bytes + its name) →
+/// a temp path Claude can read. Same store the gateway's /api/upload writes.
+#[tauri::command]
+fn save_upload(name: String, data_base64: String) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.trim())
+        .map_err(|e| format!("bad base64: {e}"))?;
+    crate::gateway::uploads::save_upload(&name, &bytes).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Drop images older than a day so the temp dir doesn't grow without bound.
@@ -714,6 +828,9 @@ fn spawn_gateway(port: Option<u16>, url: Option<String>) -> Result<(), String> {
             .join(format!("agentbench-gateway{}", std::env::consts::EXE_SUFFIX));
         cmd = Command::new(path);
     }
+    for k in crate::broker::CLAUDE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
     if let Some(port) = port {
         cmd.env("AGENTBENCH_GATEWAY_PORT", port.to_string());
     }
@@ -832,6 +949,60 @@ fn gateway_cancel_pair() -> Result<Value, String> {
 #[tauri::command]
 fn gateway_revoke(id: String) -> Result<Value, String> {
     gateway_control("POST", "/local/revoke", Some(json!({ "id": id })))
+}
+
+/// Set (or clear) the web-login password. Loopback control only — the public
+/// side of the gateway can verify a password, never change one.
+#[tauri::command]
+fn gateway_set_password(password: String) -> Result<Value, String> {
+    gateway_control("POST", "/local/password", Some(json!({ "password": password })))
+}
+
+#[tauri::command]
+fn gateway_clear_password() -> Result<Value, String> {
+    gateway_control("DELETE", "/local/password", None)
+}
+
+#[tauri::command]
+fn gateway_remove_passkey(id: String) -> Result<Value, String> {
+    gateway_control("POST", "/local/passkeys/remove", Some(json!({ "id": id })))
+}
+
+/// Toggle serving the desktop web UI at the gateway root.
+#[tauri::command]
+fn gateway_webui(enabled: bool) -> Result<Value, String> {
+    gateway_control("POST", "/local/webui", Some(json!({ "enabled": enabled })))
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare tunnel — puts the gateway (and with it the web UI) on a public
+// HTTPS URL without opening a port. See tunnel.rs for the daemon contract.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn tunnel_status() -> Value {
+    crate::tunnel::status()
+}
+
+#[tauri::command]
+async fn tunnel_start(port: Option<u16>, mode: Option<String>, name: Option<String>) -> Result<Value, String> {
+    // start() blocks up to ~20s waiting for the public URL; keep it off the
+    // main thread so the Settings window stays alive.
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::tunnel::start(
+            port.unwrap_or(gateway::DEFAULT_PORT),
+            mode.as_deref().unwrap_or("quick"),
+            name.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn tunnel_stop() -> Value {
+    crate::tunnel::stop();
+    crate::tunnel::status()
 }
 
 /// Like `restore_gateway`, but synchronous and with the caller waiting: bring
@@ -993,23 +1164,31 @@ async fn open_preview_window(app: AppHandle, url: String, title: String) -> Resu
 /// agents spawned in panes know how to publish visual plans.
 #[tauri::command]
 fn sync_plan_skill() -> Result<(), String> {
-    let files: [(&str, &str); 2] = [
+    // (skill dir, file within it, contents). agentbench-files teaches agents
+    // to send files back as download links in the chat view.
+    let files: [(&str, &str, &str); 3] = [
         (
+            "agentbench-plan",
             "SKILL.md",
             include_str!("../../skills/agentbench-plan/SKILL.md"),
         ),
         (
+            "agentbench-plan",
             "references/blocks.md",
             include_str!("../../skills/agentbench-plan/references/blocks.md"),
         ),
+        (
+            "agentbench-files",
+            "SKILL.md",
+            include_str!("../../skills/agentbench-files/SKILL.md"),
+        ),
     ];
-    let dir = dirs::home_dir()
+    let skills = dirs::home_dir()
         .ok_or("no home dir")?
         .join(".claude")
-        .join("skills")
-        .join("agentbench-plan");
-    for (rel, content) in files {
-        let path = dir.join(rel);
+        .join("skills");
+    for (skill, rel, content) in files {
+        let path = skills.join(skill).join(rel);
         if std::fs::read_to_string(&path).ok().as_deref() == Some(content) {
             continue;
         }
@@ -1304,6 +1483,10 @@ async fn remote_logs(host: String) -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // launched from an agent's shell (`open` passes the caller's environment
+    // along), the app would hand Claude's session markers to everything it
+    // starts — see broker::scrub_claude_env
+    crate::broker::scrub_claude_env();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1352,11 +1535,18 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            claude_usage,
             create_pane,
             write_pane,
             create_chat_pane,
             watch_transcript,
             resource_state,
+            tty_prompt,
+            speak_text,
+            speech_prefs,
+            set_speech_prefs,
+            speech_voices,
+            answer_tty_prompt,
             resource_policy,
             resource_pin,
             resource_draft,
@@ -1368,6 +1558,8 @@ pub fn run() {
             kill_pane,
             list_panes,
             saved_panes,
+            decisions,
+            decision_answer,
             schedules,
             schedule_save,
             schedule_delete,
@@ -1377,12 +1569,20 @@ pub fn run() {
             list_teams,
             save_teams,
             save_projects,
+            list_projects,
             gateway_status,
             gateway_start,
             gateway_stop,
             gateway_pair,
             gateway_cancel_pair,
             gateway_revoke,
+            gateway_set_password,
+            gateway_clear_password,
+            gateway_remove_passkey,
+            gateway_webui,
+            tunnel_status,
+            tunnel_start,
+            tunnel_stop,
             link_bench,
             gateway_links,
             gateway_forget_link,
@@ -1391,10 +1591,16 @@ pub fn run() {
             list_sessions,
             search_sessions,
             session_tail,
+            session_brief,
+            stop_command,
+            task_output_path,
+            tail_output,
+            team_tasks,
             set_chat_model,
             read_image_data_url,
             read_file_base64,
             save_pasted_image,
+            save_upload,
             sync_plan_skill,
             check_binaries,
             install_harness,

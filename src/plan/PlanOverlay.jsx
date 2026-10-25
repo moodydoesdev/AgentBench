@@ -2,7 +2,7 @@
 // reviewing. Esc or ✕ returns to the terminals; content live-reloads on
 // republish and via a light mtime poll.
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/ipc";
 import { X, FileText } from "@phosphor-icons/react";
 import PlanRenderer from "./PlanRenderer";
 import { usePreserveScroll } from "./lib/usePreserveScroll";

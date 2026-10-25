@@ -99,8 +99,20 @@ fn ssh_base(host: &str) -> Command {
 
 fn control_path() -> String {
     // %C is a hash of (host, port, user), so one socket per target.
-    let dir = std::env::temp_dir().join("agentbench-ssh");
+    //
+    // Under the home directory, not temp_dir(): a unix socket path is capped at
+    // ~104 bytes, %C alone is 40 and ssh appends a random suffix while it binds.
+    // macOS's per-user temp dir (/var/folders/…/T/) is long enough to blow that.
+    let dir = dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".agentbench")
+        .join("ssh");
     let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     format!("{}/%C", dir.display())
 }
 

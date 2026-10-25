@@ -25,7 +25,7 @@ tauri-build = { version = "2", features = [] }
 # and every plugin, leaving the two daemons — which is how the broker and
 # gateway get built for a headless Linux VM without webkit2gtk.
 [features]
-default = ["gui"]
+default = ["gui", "parakeet"]
 gui = [
   "dep:tauri",
   "dep:tauri-plugin-opener",
@@ -39,6 +39,9 @@ gui = [
   "dep:objc2-avf-audio",
   "dep:block2",
 ]
+# Browser dictation in the gateway: NVIDIA Parakeet through sherpa-onnx. Its
+# build script downloads k2-fsa's prebuilt static libraries.
+parakeet = ["dep:sherpa-onnx"]
 
 [dependencies]
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system"] }
@@ -73,6 +76,7 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 base64ct = { version = "1", features = ["alloc"] }
 http = "1"
+sherpa-onnx = { version = "1.13.8", optional = true }
 
 # Chat-tab dictation: capture on AVAudioEngine, transcribe with the same
 # on-device recognizer macOS dictation uses. No API key, no audio leaves the
@@ -86,6 +90,6 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSValue", "NSLocale", "NSObjCRuntime"], optional = true }
-objc2-speech = { version = "0.3", features = ["block2", "SFSpeechRecognizer", "SFSpeechRecognitionRequest", "SFSpeechRecognitionResult", "SFSpeechRecognitionTask", "SFTranscription"], optional = true }
+objc2-speech = { version = "0.3", features = ["block2", "SFSpeechRecognizer", "SFSpeechRecognitionRequest", "SFSpeechRecognitionResult", "SFSpeechRecognitionTask", "SFTranscription", "SFTranscriptionSegment"], optional = true }
 objc2-avf-audio = { version = "0.3", features = ["block2", "AVAudioEngine", "AVAudioNode", "AVAudioIONode", "AVAudioFormat", "AVAudioBuffer", "AVAudioTypes"], optional = true }
 block2 = { version = "0.6", optional = true }

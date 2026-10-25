@@ -1,15 +1,18 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { emit, listen } from "@tauri-apps/api/event";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
+  emit,
+  listen,
+  convertFileSrc,
+  invoke,
+  isTauri,
   isPermissionGranted,
   requestPermission,
   sendNotification,
-} from "@tauri-apps/plugin-notification";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+  revealItemInDir,
+} from "@/lib/ipc";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import AgentPane from "./AgentPane";
 import ResourcePanel from "./resources/ResourcePanel";
 import RemotePane from "./RemotePane";
@@ -19,6 +22,9 @@ import { reconcileRemoteDock, remoteScope } from "./lib/remoteDock";
 
 // Lazy: keeps mdx/shiki out of the entry chunk until a plan is opened
 const PlanOverlay = lazy(() => import("./plan/PlanOverlay.jsx"));
+// Web mode only: settings render as an in-page modal (no second webview in a
+// browser), loaded on first open so the desktop app never fetches this chunk.
+const WebSettings = lazy(() => import("./SettingsWindow.jsx"));
 import WindowControls from "./components/WindowControls";
 import { getTheme, terminalThemeFromVars, themeVars } from "./themes";
 import {
@@ -39,7 +45,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
-import { Cpu, Bell, CalendarCheck, CaretDown, GearSix, Play, Plus, FileText, Pulse, TerminalWindow, Tray, X } from "@phosphor-icons/react";
+import { Cpu, Bell, CalendarCheck, CaretDown, GearSix, Kanban, Play, Plus, FileText, Pulse, TerminalWindow, Tray, X } from "@phosphor-icons/react";
 import { Popover } from "radix-ui";
 import {
   DropdownMenu,
@@ -50,7 +56,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import RunCommandsDialog from "./RunCommandsDialog";
 import TeamsDialog from "./teams/TeamsDialog";
-import { missingSeats, normalizeTeams, seatFor } from "./teams/teams";
+import BoardDialog from "./teams/BoardDialog";
+import { attentionStatus, isMutedSeat, missingSeats, normalizeTeams, seatFor, seatOrder, taskListId } from "./teams/teams";
 import SessionsDialog from "./SessionsDialog";
 import SchedulesDialog from "./SchedulesDialog";
 import TerminalDock from "./dock/TerminalDock";
@@ -59,10 +66,12 @@ import { setSchedules as feedTaskSchedules, setTaskResources, useTasks } from ".
 import notifyWav from "./assets/notify.wav";
 import Logo, { LogoMark } from "./components/Logo";
 import CommandMenu from "./components/CommandMenu";
+import UsageMeter from "./components/UsageMeter";
 import PlanComposer from "./PlanComposer";
 import { matchesHotkey } from "./lib/hotkey";
 import { applyUiScale, resolveUiScale, SCALE_STEPS } from "./lib/uiScale";
 import { autoCols, packSpans, resetPaneWidths } from "./lib/gridLayout";
+import { contextPercent } from "./lib/contextUsage";
 import { pasteAndSubmit } from "./lib/ptyPaste";
 import { THEMES } from "./themes";
 
@@ -116,6 +125,49 @@ export default function App() {
   const [activePath, setActivePath] = useState(
     () => localStorage.getItem("agentbench.active") || loadJSON("agentbench.projects", [])[0]?.path,
   );
+
+  // Web: this browser's localStorage knows nothing about the bench — the
+  // desktop's registry on disk (mirrored for the gateway) is where project
+  // names live. Hydrate from it, and never mirror back before it lands: a
+  // browser writing its empty list would wipe the names for every client.
+  const projectsHydrated = useRef(isTauri);
+  useEffect(() => {
+    if (isTauri) return;
+    invoke("list_projects")
+      .then((ps) => {
+        if (Array.isArray(ps) && ps.length) {
+          setProjects((cur) => {
+            const known = new Set(ps.map((p) => p.path));
+            return [...ps, ...cur.filter((p) => !known.has(p.path))];
+          });
+          setActivePath((a) => a ?? ps[0]?.path);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        projectsHydrated.current = true;
+      });
+  }, []);
+  // Desktop: a phone can add a project through the gateway, which appends to
+  // the registry on disk. Fold those in when the window comes back into
+  // focus, before this webview's next mirror would write them away.
+  useEffect(() => {
+    if (!isTauri) return;
+    const pull = () =>
+      invoke("list_projects")
+        .then((ps) => {
+          if (!Array.isArray(ps) || !ps.length) return;
+          setProjects((cur) => {
+            const known = new Set(cur.map((p) => p.path));
+            const added = ps.filter((p) => p?.path && !known.has(p.path));
+            return added.length ? [...cur, ...added] : cur;
+          });
+        })
+        .catch(() => {});
+    pull();
+    window.addEventListener("focus", pull);
+    return () => window.removeEventListener("focus", pull);
+  }, []);
   const [panes, setPanes] = useState([]); // {id, projectPath, label}
   const [planNonces, setPlanNonces] = useState({}); // plan path -> refresh counter
   const [planView, setPlanView] = useState(null); // {path, title, agentId} — full-window overlay
@@ -123,7 +175,15 @@ export default function App() {
   const [statuses, setStatuses] = useState({}); // id -> status
   const [initialData, setInitialData] = useState({}); // id -> base64 scrollback
   const [titles, setTitles] = useState({}); // id -> session name from OSC title
+  // id -> newest Claude session id; the team sidebar reads each member's
+  // transcript by it. Seeded from the broker, then kept by agent events.
+  const [sessions, setSessions] = useState({});
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const [paneColors, setPaneColors] = useState({}); // id -> /color choice
+  // id -> { context, input, cache_read, cache_create, output, model } — the
+  // broker's transcript-tail snapshot of each pane's context-window usage
+  const [paneUsage, setPaneUsage] = useState({});
   const [paneSizes, setPaneSizes] = useState(() =>
     loadJSON("agentbench.paneSizes", {}),
   ); // id -> {w, h} grid spans
@@ -151,7 +211,27 @@ export default function App() {
   const [inbox, setInbox] = useState(() => loadJSON("agentbench.inbox", []));
   const [runDialog, setRunDialog] = useState(null); // project path whose run commands are being edited
   const [teamsDialog, setTeamsDialog] = useState(null); // project path whose teams are being edited
+  const [boardOpen, setBoardOpen] = useState(false); // kanban of the active project's team tasks
   const [projectTeams, setProjectTeams] = useState({}); // project path → saved teams (.agentbench/teams.json)
+  // Newest Claude session per team seat, so starting a team that was closed
+  // picks its conversations back up instead of beginning from scratch.
+  // `${projectPath}\0${teamId}` → { role (lowercased) → session id }.
+  const [teamSessions, setTeamSessions] = useState(() => loadJSON("agentbench.teamSessions", {}));
+  useEffect(() => {
+    localStorage.setItem("agentbench.teamSessions", JSON.stringify(teamSessions));
+  }, [teamSessions]);
+  const rememberSeatSession = (pane, sid) => {
+    if (!pane?.team?.team_id || !pane.claude) return;
+    const key = `${pane.projectPath}\0${pane.team.team_id}`;
+    const role = pane.team.role.toLowerCase();
+    setTeamSessions((m) => (m[key]?.[role] === sid ? m : { ...m, [key]: { ...m[key], [role]: sid } }));
+  };
+  // Roles of a team whose saved session can still be resumed right now.
+  const resumableSeats = (projectPath, team) => {
+    const saved = teamSessions[`${projectPath}\0${team.id}`] ?? {};
+    return missingSeats(team, panesRef.current.filter((p) => p.projectPath === projectPath))
+      .filter((a) => saved[a.role.toLowerCase()]);
+  };
   const [sessionsOpen, setSessionsOpen] = useState(false); // resume-session picker
   const [schedulesOpen, setSchedulesOpen] = useState(false); // scheduled prompts
   // Terminal dock: tabbed plain shells along the bottom, per project —
@@ -280,8 +360,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("agentbench.projects", JSON.stringify(projects));
     // Mirror to disk so the mobile gateway can name projects — localStorage
-    // lives in this webview and no other process can read it. The file is
-    // desktop-owned: the gateway only ever reads it.
+    // lives in this webview and no other process can read it. In the browser
+    // the same mirror runs through the gateway, but only after hydration:
+    // pre-hydration state is this browser's ignorance, not the registry.
+    if (!projectsHydrated.current) return;
     invoke("save_projects", { projects }).catch(() => {});
   }, [projects]);
 
@@ -367,6 +449,9 @@ export default function App() {
   }, [paneViews]);
 
   const savedDockIds = useRef(new Set(loadJSON("agentbench.dockPanes", [])));
+  // Minimized agent panes, same id-list contract as the dock: survives a
+  // frontend reload (broker keeps the panes alive), reset by a broker restart.
+  const savedMinIds = useRef(new Set(loadJSON("agentbench.minimizedPanes", [])));
 
   // Dock persistence. Membership is a plain id list — pane ids are stable
   // for the life of a broker run (the broker outlives frontend reloads), so
@@ -375,7 +460,13 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(
       "agentbench.dockPanes",
-      JSON.stringify(panes.filter((p) => p.dock).map((p) => p.id)),
+      JSON.stringify(panes.filter((p) => p.dock && p.kind !== "log").map((p) => p.id)),
+    );
+    // run panes' hidden flag is session-transient (the Run menu owns it);
+    // only minimized agents come back minimized after a reload
+    localStorage.setItem(
+      "agentbench.minimizedPanes",
+      JSON.stringify(panes.filter((p) => p.hidden && p.kind !== "run").map((p) => p.id)),
     );
   }, [panes]);
   useEffect(() => {
@@ -423,9 +514,11 @@ export default function App() {
   }, []);
 
   // Keep the bundled plan-authoring skill in ~/.claude/skills up to date so
-  // agents know how to publish plans (Settings toggle to opt out).
+  // agents know how to publish plans (Settings toggle to opt out). Desktop
+  // only — the skill files live next to the desktop install, and the gateway
+  // deliberately has no op for writing them.
   useEffect(() => {
-    if (settingsRef.current.planSkillSync !== false) {
+    if (isTauri && settingsRef.current.planSkillSync !== false) {
       invoke("sync_plan_skill").catch((e) =>
         console.error("plan skill sync failed", e),
       );
@@ -555,10 +648,20 @@ export default function App() {
         const dockIds = savedDockIds.current;
         const live = await invoke("list_panes");
         if (live.length) {
+          setSessions(Object.fromEntries(live.filter((p) => p.session).map((p) => [p.id, p.session])));
+          for (const p of live) {
+            if (p.team && p.session && !p.harness?.startsWith("run:"))
+              rememberSeatSession({ projectPath: p.cwd, team: p.team, claude: getHarness(settingsRef.current, p.harness ?? "claude").claude }, p.session);
+          }
           setInitialData(Object.fromEntries(live.map((p) => [p.id, p.buffer])));
           setPaneColors(
             Object.fromEntries(
               live.filter((p) => p.color).map((p) => [p.id, p.color]),
+            ),
+          );
+          setPaneUsage(
+            Object.fromEntries(
+              live.filter((p) => p.usage).map((p) => [p.id, p.usage]),
             ),
           );
           setChatLines(
@@ -585,6 +688,7 @@ export default function App() {
                       label: `Claude Chat ${p.id}`,
                       kind: "chat",
                       hibernated: !!p.hibernated,
+                      hidden: savedMinIds.current.has(p.id) || undefined,
                     }
                   : {
                       id: p.id,
@@ -596,6 +700,8 @@ export default function App() {
                       team: p.team ?? undefined,
                       // reattached dock shells go back to the dock
                       dock: p.harness === "terminal" || dockIds.has(p.id) || undefined,
+                      // and minimized agents back to the tray
+                      hidden: savedMinIds.current.has(p.id) || undefined,
                     },
             ),
           );
@@ -697,7 +803,13 @@ export default function App() {
       const { id, kind, cwd, sid } = e.payload;
       const status = kind === "done" ? "done" : "input";
       setStatuses((s) => (id in s ? { ...s, [id]: status } : s));
+      if (sid) setSessions((m) => (m[id] === sid ? m : { ...m, [id]: sid }));
       const pane = panesRef.current.find((p) => p.id === id);
+      if (sid) rememberSeatSession(pane, sid);
+      // Developers on a managed team report to their manager, not the user:
+      // the pane still glows (status above), but no inbox entry, toast,
+      // sound, or OS notification.
+      if (isMutedSeat(pane, panesRef.current)) return;
       const label = titlesRef.current[id] || pane?.label || `Agent ${id}`;
       setNotifs((list) =>
         [
@@ -761,6 +873,22 @@ export default function App() {
 
     // Agent published (or updated) a plan: open the full-window plan view
     // when it belongs to the active project, else badge it in the rail.
+    // A team manager filed a decision for the user: it waits in the team
+    // sidebar; this just makes sure it gets noticed.
+    const unDecision = listen("decision", (e) => {
+      const d = e.payload?.decision;
+      if (!d) return;
+      const cfg = settingsRef.current;
+      if (cfg.sound) {
+        ping.volume = cfg.volume ?? 0.8;
+        ping.currentTime = 0;
+        ping.play().catch(() => {});
+      }
+      if (cfg.osNotify && !document.hasFocus()) {
+        sendNotification({ title: `Decision needed · ${d.team}`, body: `${d.id}: ${d.question}` });
+      }
+    });
+
     const unPlan = listen("plan-ready", (e) => {
       const { id: agentId, path, title } = e.payload;
       if (agentId != null) planOwners.current[path] = agentId;
@@ -834,6 +962,11 @@ export default function App() {
       setPaneColors((c) => (c[id] === color ? c : { ...c, [id]: color }));
     });
 
+    const unUsage = listen("pane-usage", (e) => {
+      const { id, usage } = e.payload;
+      setPaneUsage((u) => ({ ...u, [id]: usage }));
+    });
+
     // The settings window persists to localStorage and broadcasts the full
     // settings object; adopt it so the grid re-themes live.
     const unSettings = listen("settings-changed", (e) => {
@@ -861,9 +994,11 @@ export default function App() {
       unSchedState.then((f) => f());
       unEvent.then((f) => f());
       unPlan.then((f) => f());
+      unDecision.then((f) => f());
       unExit.then((f) => f());
       unSchedRun.then((f) => f());
       unColor.then((f) => f());
+      unUsage.then((f) => f());
       unSettings.then((f) => f());
       unBenches.then((f) => f());
     };
@@ -918,6 +1053,7 @@ export default function App() {
     });
 
   useEffect(() => {
+    if (!isTauri) return; // web: settings render as an in-page modal instead
     WebviewWindow.getByLabel("settings").then((w) => {
       if (!w) spawnSettingsWindow();
     });
@@ -933,14 +1069,23 @@ export default function App() {
     };
   }, []);
 
+  const [webSettingsOpen, setWebSettingsOpen] = useState(false);
   const openSettings = async () => {
+    if (!isTauri) {
+      setWebSettingsOpen(true);
+      return;
+    }
     const w = (await WebviewWindow.getByLabel("settings")) ?? spawnSettingsWindow();
     w.show().catch(() => {});
     w.setFocus().catch(() => {});
   };
 
   const addProject = async () => {
-    const dir = await open({ directory: true, title: "Add a project folder" });
+    // The browser has no native directory picker for the workstation's disk;
+    // a typed path is the honest equivalent.
+    const dir = isTauri
+      ? await open({ directory: true, title: "Add a project folder" })
+      : window.prompt("Project folder path on the workstation:")?.trim();
     if (!dir) return;
     setProjects((ps) =>
       ps.some((p) => p.path === dir) ? ps : [...ps, { path: dir, name: baseName(dir) }],
@@ -1112,9 +1257,22 @@ export default function App() {
     }
   };
 
-  // Hide keeps the process running; the Run caret (green dot) brings it back.
-  const hideRun = (id) =>
+  // Minimize keeps the pane mounted and its agent working — it just stops
+  // taking a grid cell. Agents come back from the tray above the dock, run
+  // panes from the Run caret (green dot).
+  const minimizePane = (id) => {
     setPanes((ps) => ps.map((p) => (p.id === id ? { ...p, hidden: true } : p)));
+    // never leave keyboard focus on an invisible pty
+    if (focusedRef.current === id) setFocusedId(null);
+  };
+
+  const restorePane = (pane) => {
+    setPanes((ps) =>
+      ps.map((p) => (p.id === pane.id ? { ...p, hidden: false } : p)),
+    );
+    // same reveal delay as un-hiding elsewhere: let the grid cell mount first
+    setTimeout(() => focusAgent(pane), 50);
+  };
 
   const restartRun = (pane) => {
     const project = projects.find((pr) => pr.path === pane.projectPath);
@@ -1164,7 +1322,7 @@ export default function App() {
       const { [old_id]: value, ...rest } = state;
       return { ...rest, [id]: value };
     };
-    setPaneSizes(move); setPaneViews(move); setTitles(move);
+    setPaneSizes(move); setPaneViews(move); setTitles(move); setSessions(move);
     setStatuses((s) => { const { [old_id]: _, ...rest } = s; return { ...rest, [id]: "working" }; });
     setFocusedId((focused) => focused === old_id ? id : focused);
   };
@@ -1338,9 +1496,10 @@ export default function App() {
 
   // Start every role of a saved team that isn't already running in the
   // project. Each agent is its own pane; the seat gives it its name, model
-  // and team prompt at launch.
+  // and team prompt at launch. A Claude seat whose last session still has a
+  // transcript resumes it, unless `fresh`.
   const launchingTeams = useRef(new Set());
-  const launchTeam = async (projectPath, team) => {
+  const launchTeam = async (projectPath, team, { fresh = false } = {}) => {
     const key = `${projectPath}\0${team.id}`;
     if (launchingTeams.current.has(key)) return;
     launchingTeams.current.add(key);
@@ -1349,6 +1508,12 @@ export default function App() {
     const nameOf = (id) => getHarness(settingsRef.current, id).name;
     const started = [];
     const failed = [];
+    const saved = fresh ? {} : teamSessions[key] ?? {};
+    // a sid whose transcript is gone would make `claude --resume` exit
+    // and take the pane with it
+    const onDisk = Object.keys(saved).length
+      ? new Set((await invoke("list_sessions", { project: projectPath }).catch(() => [])).map((s) => s.sid))
+      : new Set();
     try {
       for (const agent of todo) {
         const base = getHarness(settingsRef.current, agent.harness);
@@ -1360,14 +1525,15 @@ export default function App() {
           failed.push(`${agent.role}: ${base.name} isn't installed`);
           continue;
         }
-        const seat = seatFor(team, agent, nameOf);
+        const seat = seatFor(team, agent, nameOf, baseName(projectPath));
         const harness = withSeat(base, seat);
+        const sid = saved[agent.role.toLowerCase()];
         try {
           const id = await invoke("create_pane", {
             cwd: projectPath,
             cols: 100,
             rows: 30,
-            resume: null,
+            resume: harness.claude && onDisk.has(sid) ? sid : null,
             theme: harness.claude ? getTheme(settingsRef.current.theme).claudeTheme ?? null : null,
             harness,
             shell: settingsRef.current.shell?.trim() || null,
@@ -1379,6 +1545,12 @@ export default function App() {
       }
     } finally {
       launchingTeams.current.delete(key);
+    }
+    // Members started into a pinned team join it pinned — otherwise the
+    // newcomers would be the ones idle hibernation picks off.
+    const already = inProject.filter((p) => p.team?.team_id === team.id);
+    if (started.length && already.length && already.every((p) => isPinned(p.id))) {
+      for (const p of started) await invoke("resource_pin", { id: p.id, pinned: true }).catch(() => {});
     }
     if (started.length) {
       // keep teammates next to each other: after the team's running panes,
@@ -1414,6 +1586,54 @@ export default function App() {
     for (const p of panesRef.current) {
       if (p.projectPath === projectPath && p.team?.team_id === teamId) onClose(p.id);
     }
+  };
+  const teamMembers = (projectPath, teamId) =>
+    panesRef.current.filter((p) => p.projectPath === projectPath && p.team?.team_id === teamId);
+  // Whole-team hibernate/resume, one member at a time — each is a broker
+  // round-trip that saves or relaunches a session. Members that can't
+  // hibernate right now (busy, pinned) are skipped rather than failing the
+  // rest, and named afterwards.
+  // A team counts as pinned when every member is: the broker then refuses to
+  // hibernate any of them, automatically or by hand. Pinning from the team
+  // pane (or the palette) sets every member at once.
+  const isPinned = (id) => !!resources?.panes?.find((r) => r.id === id)?.pinned;
+  const teamPinned = (projectPath, teamId) => {
+    const members = teamMembers(projectPath, teamId);
+    return members.length > 0 && members.every((p) => isPinned(p.id));
+  };
+  const pinTeam = async (projectPath, teamId, pinned) => {
+    for (const p of teamMembers(projectPath, teamId)) {
+      if (isPinned(p.id) !== pinned) await resourceAction("pin", p.id, pinned);
+    }
+  };
+  const hibernateTeam = async (projectPath, teamId) => {
+    if (teamPinned(projectPath, teamId)) {
+      setResourceError("This team is pinned. Unpin it to hibernate it.");
+      setResourcesOpen(true);
+      return;
+    }
+    const skipped = [];
+    for (const p of teamMembers(projectPath, teamId)) {
+      if (p.hibernated) continue;
+      const r = resources?.panes?.find((x) => x.id === p.id);
+      if (r?.pinned) { skipped.push(`${p.team.role} — pinned`); continue; }
+      if (!r?.eligible) { skipped.push(`${p.team.role}${r?.reason ? ` — ${r.reason}` : ""}`); continue; }
+      await resourceAction("hibernate", p.id);
+    }
+    if (skipped.length) {
+      setResourceError(`Some team members stayed awake:\n${skipped.join("\n")}`);
+      setResourcesOpen(true);
+    }
+  };
+  const resumeTeam = async (projectPath, teamId) => {
+    for (const p of teamMembers(projectPath, teamId)) {
+      if (p.hibernated) await resourceAction("resume", p.id);
+    }
+  };
+  const closeTeam = (projectPath, teamId, name) => {
+    const n = teamMembers(projectPath, teamId).length;
+    if (n > 1 && !window.confirm(`Close all ${n} agents in ${name ? `"${name}"` : "this team"}? Their processes are killed.`)) return;
+    stopTeam(projectPath, teamId);
   };
 
   // Headless Claude pane: stream-json over pipes, rendered as chat — no
@@ -1532,19 +1752,29 @@ export default function App() {
     setPaneSizes(({ [id]: _gone, ...rest }) => rest);
     setPaneViews(({ [id]: _gone, ...rest }) => rest);
     setChatLines(({ [id]: _gone, ...rest }) => rest);
+    setPaneUsage(({ [id]: _gone, ...rest }) => rest);
   };
 
-  // Drag-drop reorder: move dragged pane to the drop target's slot.
-  const reorderPane = (dragId, targetId) => {
+  // Drag-drop reorder: move dragged pane to the drop target's slot. A
+  // focus-layout team is one cell, so its members move as a block — moving
+  // only the shown member would leave the team's slot (its earliest member)
+  // behind and the cell would snap back.
+  const reorderPane = (dragId, targetId, unitOf = (id) => [id]) => {
     if (dragId === targetId) return;
+    const unit = new Set(unitOf(dragId));
+    if (unit.has(targetId)) return;
+    const targetUnit = new Set(unitOf(targetId));
     setPanes((p) => {
-      const from = p.findIndex((x) => x.id === dragId);
-      const to = p.findIndex((x) => x.id === targetId);
+      const from = p.findIndex((x) => unit.has(x.id));
+      const to = p.findIndex((x) => targetUnit.has(x.id));
       if (from === -1 || to === -1) return p;
-      const next = [...p];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
-      return next;
+      const moved = p.filter((x) => unit.has(x.id));
+      const rest = p.filter((x) => !unit.has(x.id));
+      // land before the target's whole unit when moving up, after it when
+      // moving down — same feel as a single-pane swap
+      const idxs = rest.map((x, i) => (targetUnit.has(x.id) ? i : -1)).filter((i) => i >= 0);
+      const at = from > to ? Math.min(...idxs) : Math.max(...idxs) + 1;
+      return [...rest.slice(0, at), ...moved, ...rest.slice(at)];
     });
   };
 
@@ -1558,15 +1788,29 @@ export default function App() {
 
   // Aggregate a project's pane statuses for its sidebar dot. input > done > working.
   // Dock shells are excluded — an idle shell reports "working" forever and
-  // would pin every project dot green.
+  // would pin every project dot green. A managed team's developer seats only
+  // glow their own pane; the project lights up for the manager alone.
   const projectStatus = (path) => {
-    const ss = panesRef.current
+    const all = panesRef.current;
+    const ss = all
       .filter((p) => p.projectPath === path && !p.dock)
-      .map((p) => statuses[p.id]);
+      .map((p) => attentionStatus(p, statuses[p.id], all));
     if (ss.includes("input")) return "input";
     if (ss.includes("done")) return "done";
     if (ss.includes("working")) return "working";
     return ss.length ? "exited" : "idle";
+  };
+
+  // Teams whose task lists feed a project's board: its saved teams, plus any
+  // running team that was never saved (its seat still carries id and name).
+  const boardTeams = (path) => {
+    const teams = (projectTeams[path] ?? []).map((t) => ({ id: t.id, name: t.name }));
+    for (const p of panes) {
+      if (p.projectPath !== path || !p.team?.team_id) continue;
+      if (!teams.some((t) => t.id === p.team.team_id))
+        teams.push({ id: p.team.team_id, name: p.team.team });
+    }
+    return teams;
   };
 
   const focusAgent = (pane) => {
@@ -1579,6 +1823,15 @@ export default function App() {
       handle?.focus();
       handle?.scrollIntoView?.();
     };
+    // focusing a minimized pane (notification click, inbox, task row) brings
+    // it back to the grid first — focus on a display:none pty types nowhere
+    if (panesRef.current.find((p) => p.id === pane.id)?.hidden) {
+      setPanes((ps) =>
+        ps.map((p) => (p.id === pane.id ? { ...p, hidden: false } : p)),
+      );
+      setTimeout(reveal, 50);
+      return;
+    }
     if (pane.team) {
       // a tucked focus-team member must be swapped in before it can take focus
       const key = `${pane.projectPath}\0${pane.team.team_id}`;
@@ -1660,6 +1913,51 @@ export default function App() {
       setDockTabs((t) => ({ ...t, [path]: next[next.length - 1]?.id }));
       if (next.length) setTimeout(() => focusAgent(next[next.length - 1]), 30);
     }
+  };
+
+  // Command output in a read-only dock tab: a background task's live output
+  // file (followed as it grows) or a finished command's text. One tab per
+  // file — asking again just brings it forward.
+  const openOutputTab = ({ paneId, path, text, title }) => {
+    const owner = panesRef.current.find((p) => p.id === paneId);
+    const projectPath = owner?.projectPath ?? activePathRef.current;
+    if (!projectPath) return;
+    const id = path ? `log:${path}` : `log:text:${Date.now()}`;
+    if (!panesRef.current.some((p) => p.id === id)) {
+      const who = owner ? owner.team?.role ?? titlesRef.current[owner.id] ?? owner.label : null;
+      const what = (title ?? "output").slice(0, 60);
+      setPanes((ps) => [
+        ...ps,
+        {
+          id,
+          projectPath,
+          label: who ? `${who} · ${what}` : what,
+          kind: "log",
+          dock: true,
+          logPath: path ?? null,
+          logText: path ? null : text ?? "",
+        },
+      ]);
+    }
+    setDockTabs((t) => ({ ...t, [projectPath]: id }));
+    setDockOpen(true);
+  };
+  const openOutputRef = useRef(openOutputTab);
+  openOutputRef.current = openOutputTab;
+  useEffect(() => {
+    const on = (e) => openOutputRef.current(e.detail ?? {});
+    window.addEventListener("agentbench:open-output", on);
+    return () => window.removeEventListener("agentbench:open-output", on);
+  }, []);
+  // A background task from an agent's process drawer: find its output file
+  // by the agent's session, then follow it like any other.
+  const followTask = async (paneId, task, title) => {
+    const pane = panesRef.current.find((p) => p.id === paneId);
+    const sid = sessionsRef.current[paneId];
+    if (!pane || !sid) return;
+    const path = await invoke("task_output_path", { project: pane.projectPath, sid, task }).catch(() => null);
+    if (path) openOutputTab({ paneId, path, title: title ?? `task ${task}` });
+    else setResourceError(`No output file found for background task ${task}.`);
   };
 
   const selectDockTab = (path, id) => {
@@ -1807,7 +2105,26 @@ export default function App() {
     setGridW(el.clientWidth);
     return () => ro.disconnect();
   }, []);
-  const effCols = settings.cols || autoCols(gridW);
+  // Cells the active project's grid draws: dock shells and hidden panes take
+  // none, and a focus-layout team of 2+ shares one cell (see the grid below).
+  const activeCells = useMemo(() => {
+    const proj = panes.filter((p) => p.projectPath === activePath && !p.dock);
+    const focusTeams = {};
+    for (const p of proj) {
+      if (!p.team?.team_id) continue;
+      const saved = projectTeams[activePath]?.find((t) => t.id === p.team.team_id);
+      if ((saved?.layout ?? "focus") !== "focus") continue;
+      (focusTeams[p.team.team_id] ??= []).push(p);
+    }
+    let cells = proj.filter((p) => !p.hidden).length;
+    for (const members of Object.values(focusTeams)) {
+      if (members.length < 2) continue;
+      cells -= members.filter((m) => !m.hidden).length;
+      if (members.some((m) => !m.hidden)) cells += 1;
+    }
+    return cells;
+  }, [panes, activePath, projectTeams]);
+  const effCols = settings.cols || autoCols(gridW, remoteSel ? 0 : activeCells);
   const effColsRef = useRef(effCols);
   effColsRef.current = effCols;
 
@@ -1868,9 +2185,10 @@ export default function App() {
         if (!e.repeat) toggleDock();
         return;
       }
-      // dock shells are outside the grid — ⌘1-9 / arrows / ⌘` skip them
+      // dock shells are outside the grid, and minimized panes are invisible —
+      // ⌘1-9 / arrows / ⌘` skip both (focusing display:none sends keys nowhere)
       const inProject = panesRef.current.filter(
-        (p) => p.projectPath === activePath && !p.dock,
+        (p) => p.projectPath === activePath && !p.dock && !p.hidden,
       );
 
       // Pane navigation: user-chosen modifier + arrows (Settings), plus
@@ -2050,6 +2368,12 @@ export default function App() {
         action: () => setRunDialog(activePath),
       });
       cmds.push({
+        id: "task-board",
+        label: "Task board…",
+        hint: "kanban of what each team is doing and has finished",
+        action: () => setBoardOpen(true),
+      });
+      cmds.push({
         id: "edit-teams",
         label: "Teams…",
         hint: "saved agent setups for this project",
@@ -2058,13 +2382,26 @@ export default function App() {
       for (const t of projectTeams[activePath] ?? []) {
         const running = activePanes.filter((p) => p.team?.team_id === t.id).length;
         const missing = missingSeats(t, activePanes).length;
+        const resumable = resumableSeats(activePath, t).length;
         cmds.push({
           id: `team-start-${t.id}`,
           group: "Teams",
-          label: running ? `Start missing: ${t.name}` : `Start team: ${t.name}`,
-          hint: missing ? `${missing} of ${t.agents.length} agents` : "all running — focus",
+          label: running ? `Start missing: ${t.name}` : resumable ? `Reopen team: ${t.name}` : `Start team: ${t.name}`,
+          hint: !missing
+            ? "all running — focus"
+            : resumable
+              ? `continues ${resumable} saved session${resumable === 1 ? "" : "s"}`
+              : `${missing} of ${t.agents.length} agents`,
           action: () => launchTeam(activePath, t),
         });
+        if (resumable)
+          cmds.push({
+            id: `team-fresh-${t.id}`,
+            group: "Teams",
+            label: `Start team fresh: ${t.name}`,
+            hint: "new sessions, previous conversations left behind",
+            action: () => launchTeam(activePath, t, { fresh: true }),
+          });
         if (running) {
           cmds.push({
             id: `team-stop-${t.id}`,
@@ -2073,6 +2410,32 @@ export default function App() {
             hint: `kills ${running} agent${running === 1 ? "" : "s"}`,
             action: () => stopTeam(activePath, t.id),
           });
+          const members = activePanes.filter((p) => p.team?.team_id === t.id);
+          const asleep = members.filter((p) => p.hibernated).length;
+          const pinned = teamPinned(activePath, t.id);
+          cmds.push({
+            id: `team-pin-${t.id}`,
+            group: "Teams",
+            label: `${pinned ? "Unpin" : "Pin"} team: ${t.name}`,
+            hint: pinned ? "let it hibernate when idle" : "keep every agent awake",
+            action: () => pinTeam(activePath, t.id, !pinned),
+          });
+          if (asleep < members.length && !pinned)
+            cmds.push({
+              id: `team-hibernate-${t.id}`,
+              group: "Teams",
+              label: `Hibernate team: ${t.name}`,
+              hint: "save every session, free their memory",
+              action: () => hibernateTeam(activePath, t.id),
+            });
+          if (asleep)
+            cmds.push({
+              id: `team-resume-${t.id}`,
+              group: "Teams",
+              label: `Resume team: ${t.name}`,
+              hint: `${asleep} hibernated`,
+              action: () => resumeTeam(activePath, t.id),
+            });
         }
       }
     }
@@ -2109,11 +2472,30 @@ export default function App() {
       cmds.push({
         id: `agent-${p.id}`,
         group: "Agent",
-        label: titles[p.id] || p.label,
+        // a team seat is named by its role — the OSC title says what it's
+        // doing, not who it is
+        label: p.team?.role ?? (titles[p.id] || p.label),
         hint: i < 9 ? `⌘${i + 1}` : undefined,
         action: () => focusAgent(p),
       });
     });
+    // Every other project's agents, searchable by the same names; picking one
+    // switches projects first (focus needs the pane mounted — see
+    // openScheduleRun for the same dance).
+    for (const p of panes) {
+      if (p.projectPath === activePath || p.dock) continue;
+      const proj = projects.find((x) => x.path === p.projectPath);
+      cmds.push({
+        id: `agent-far-${p.id}`,
+        group: "Agents elsewhere",
+        label: `${p.team?.role ?? (titles[p.id] || p.label)} — ${proj?.name ?? baseName(p.projectPath)}`,
+        action: () => {
+          setRemoteSel(null);
+          setActivePath(p.projectPath);
+          setTimeout(() => focusAgent(p), 50);
+        },
+      });
+    }
     for (const pl of projectPlans[activePath] ?? []) {
       cmds.push({
         id: `plan-${pl.path}`,
@@ -2144,7 +2526,7 @@ export default function App() {
       action: () => setTasksOpen((o) => !o),
     });
     return cmds;
-  }, [cmdMenuOpen, activeProject, activePath, projects, activePanes, titles, projectPlans, projectTeams, showPlans, dockOpen, tasksOpen, settings.theme, settings.defaultHarness, settings.customHarnesses]);
+  }, [cmdMenuOpen, activeProject, activePath, projects, panes, activePanes, titles, projectPlans, projectTeams, showPlans, dockOpen, tasksOpen, settings.theme, settings.defaultHarness, settings.customHarnesses]);
 
   return (
     <div className="app">
@@ -2156,6 +2538,7 @@ export default function App() {
           <Logo className="brand-logo" aria-label="AgentBench" />
         </div>
         <div className="topbar-right" data-tauri-drag-region>
+          <UsageMeter />
           {activeProject && !remoteSel && (
             <span className="agent-count" data-tauri-drag-region>
               {activeProject.name} · {activePanes.length} agent
@@ -2169,6 +2552,15 @@ export default function App() {
               onClick={() => setShowPlans((s) => !s)}
             >
               <FileText size={15} />
+            </button>
+          )}
+          {activeProject && !remoteSel && (
+            <button
+              className={`btn-icon${boardOpen ? " active" : ""}`}
+              title="Task board — what each team is doing and has finished"
+              onClick={() => setBoardOpen((o) => !o)}
+            >
+              <Kanban size={15} />
             </button>
           )}
           <button
@@ -2705,6 +3097,15 @@ export default function App() {
             }
             const tucked = new Set();
             const tabsFor = {};
+            // Grid slot and size of a focus team's cell belong to the team,
+            // not to whichever member is showing: the cell sits where the
+            // team's earliest member sits and keeps one saved width. Keyed
+            // per member, switching tabs (or a member restarting at the end
+            // of the list) moved the cell past neighbouring panes and resized it.
+            const slotOf = {}; // shown member id -> grid order
+            const sizeKeyOf = {}; // every member id -> "team:<id>"
+            const unitOf = {}; // every member id -> all member ids
+            const order = Object.fromEntries(projPanes.map((p, i) => [p.id, i]));
             for (const [teamId, { saved, members }] of Object.entries(teamGroups)) {
               if (members.length < 2) continue;
               const picked = teamFocus[`${proj.path}\0${teamId}`];
@@ -2713,23 +3114,51 @@ export default function App() {
                 members.find((m) => m.team.role === saved?.defaultTarget) ??
                 members.find((m) => /manager|lead/i.test(m.team.role)) ??
                 members[0];
-              const tabs = members.map((m) => ({
+              const tabs = [...members].sort(seatOrder).map((m) => ({
                 id: m.id,
                 role: m.team.role,
+                manager: !!m.team.manager,
                 status: statuses[m.id] || "working",
+                projectPath: m.projectPath,
+                sid: sessions[m.id] ?? null,
+                hibernated: !!m.hibernated,
+                sessionName: m.team.session_name ?? null,
+                listId: taskListId(teamId),
+                teamId,
               }));
+              const ids = members.map((m) => m.id);
               for (const m of members) {
                 if (m.id !== shown.id) tucked.add(m.id);
                 tabsFor[m.id] = tabs;
+                sizeKeyOf[m.id] = `team:${teamId}`;
+                unitOf[m.id] = ids;
               }
+              slotOf[shown.id] = Math.min(...ids.map((i) => order[i]));
             }
+            const gridOrder = (p) => slotOf[p.id] ?? order[p.id];
+            const sizeKey = (id) => sizeKeyOf[id] ?? id;
+            // the team's own width, falling back to the shown member's old one
+            const sizesView = { ...paneSizes };
+            for (const id of Object.keys(slotOf))
+              sizesView[id] = paneSizes[sizeKey(id)] ?? paneSizes[id];
             const isHidden = (p) => p.hidden || tucked.has(p.id);
             // hidden panes take no grid cell, so pack only the visible ones
             const packed = packSpans(
-              projPanes.filter((p) => !isHidden(p)),
-              paneSizes,
+              projPanes.filter((p) => !isHidden(p)).sort((a, b) => gridOrder(a) - gridOrder(b)),
+              sizesView,
               effCols,
             );
+            // A managed team's developer panes take no direct user input —
+            // the saved team is the live source of truth (edits apply to
+            // running panes); seat flags cover teams that failed to load.
+            const lockedBy = (p) => {
+              if (!p.team?.team_id) return null;
+              const saved = projectTeams[proj.path]?.find((t) => t.id === p.team.team_id);
+              const managerRole = saved
+                ? saved.agents.find((a) => a.manager)?.role ?? null
+                : p.team.muted ? "the manager" : null;
+              return !managerRole || managerRole === p.team.role ? null : managerRole;
+            };
             return (
               <main
                 key={proj.path}
@@ -2751,6 +3180,8 @@ export default function App() {
                     resource={resources?.panes?.find((r) => r.id === p.id)}
                     resourceBusy={resourceBusy[p.id]}
                     onResourceAction={(action, pinned) => resourceAction(action, p.id, pinned)}
+                    onStopCommand={(cmd) => invoke("stop_command", { id: p.id, pid: cmd.pid, start: cmd.start })}
+                    onFollowTask={(task, title) => followTask(p.id, task, title)}
                     sigintGuard={!!p.harness?.claude || !!p.claude}
                     claude={!!p.claude}
                     codex={p.harness?.id === "codex"}
@@ -2758,13 +3189,28 @@ export default function App() {
                     onViewChange={setPaneView}
                     initialLines={chatLines[p.id]}
                     hidden={isHidden(p)}
+                    inputLockedBy={lockedBy(p)}
                     teamTabs={tabsFor[p.id]}
+                    teamActions={
+                      tabsFor[p.id] && {
+                        hibernate: () => hibernateTeam(p.projectPath, p.team.team_id),
+                        pinned: teamPinned(p.projectPath, p.team.team_id),
+                        pin: (pinned) => pinTeam(p.projectPath, p.team.team_id, pinned),
+                        resume: () => resumeTeam(p.projectPath, p.team.team_id),
+                        close: () =>
+                          closeTeam(
+                            p.projectPath,
+                            p.team.team_id,
+                            projectTeams[p.projectPath]?.find((t) => t.id === p.team.team_id)?.name ?? p.team.team,
+                          ),
+                      }
+                    }
                     onTeamTab={(tabId) => {
                       const target = panesRef.current.find((x) => x.id === tabId);
                       if (target) focusAgent(target);
                     }}
                     command={p.command}
-                    onHide={hideRun}
+                    onHide={minimizePane}
                     onRestart={p.hibernated ? undefined : () => p.kind === "run" ? restartRun(p) : restartAgent(p)}
                     onResumeRequest={() => setSessionsOpen(true)}
                     name={p.team?.role ?? (titles[p.id] || p.label)}
@@ -2773,15 +3219,22 @@ export default function App() {
                     status={statuses[p.id] || "working"}
                     focused={focusedId === p.id}
                     agentColor={paneColors[p.id]}
+                    usage={paneUsage[p.id]}
+                    // team cells are one unit — minimizing a single member
+                    // would strand its tucked teammates, so they sit this out
+                    onMinimize={tabsFor[p.id] ? undefined : minimizePane}
                     engine={settings.engine}
                     termTheme={termTheme}
                     wordMod={settings.wordMod ?? "ctrl"}
                     copyOnSelect={settings.copyOnSelect !== false}
                     initialData={initialData[p.id]}
                     size={{ h: 1, w: packed[p.id] ?? 1 }}
+                    gridOrder={gridOrder(p)}
                     gridCols={effCols}
-                    onResize={resizePane}
-                    onReorder={reorderPane}
+                    onResize={(id, size) => resizePane(sizeKey(id), size)}
+                    onReorder={(dragId, targetId) =>
+                      reorderPane(dragId, targetId, (id) => unitOf[id] ?? [id])
+                    }
                     onRegister={registerTerm}
                     onActivity={onActivity}
                     onTitle={onTitle}
@@ -2924,6 +3377,35 @@ export default function App() {
                 </div>
               );
             })()}
+
+          {/* Minimized panes: a tray of pills above the dock. The panes
+              themselves stay mounted in the grid markup (display:none), so
+              their agents keep working; a pill click puts one back. */}
+          {!remoteSel && activeProject && activePanes.some((p) => p.hidden) && (
+            <div className="min-tray" role="tablist" aria-label="Minimized panes">
+              {activePanes
+                .filter((p) => p.hidden)
+                .map((p) => {
+                  const pct = contextPercent(paneUsage[p.id]);
+                  return (
+                    <button
+                      key={p.id}
+                      className={`min-pill status-${statuses[p.id] || "working"}`}
+                      title="Restore pane — it kept working while minimized"
+                      onClick={() => restorePane(p)}
+                    >
+                      <span className={`dot ${statuses[p.id] || "working"}`} />
+                      <span className="min-pill-label">
+                        {p.team?.role ?? (titles[p.id] || p.label)}
+                      </span>
+                      {pct != null && (
+                        <span className="min-pill-ctx">{pct}%</span>
+                      )}
+                    </button>
+                  );
+                })}
+            </div>
+          )}
 
           {/* Terminal dock — always mounted so its shells' terminals and
               ptys survive project switches and dock toggles; hidden with
@@ -3092,6 +3574,14 @@ export default function App() {
         commands={commands}
       />
 
+      {webSettingsOpen && (
+        <Suspense fallback={null}>
+          <div className="web-settings-overlay">
+            <WebSettings asModal onClose={() => setWebSettingsOpen(false)} />
+          </div>
+        </Suspense>
+      )}
+
       {runDialog && (
         <RunCommandsDialog
           project={projects.find((p) => p.path === runDialog)}
@@ -3111,8 +3601,22 @@ export default function App() {
           harnesses={getHarnesses(settings).filter((h) => h.id !== "terminal")}
           onClose={() => setTeamsDialog(null)}
           onSaved={() => loadTeams(teamsDialog)}
-          onLaunch={(team) => launchTeam(teamsDialog, team)}
+          onLaunch={(team, opts) => launchTeam(teamsDialog, team, opts)}
+          resumable={(team) => resumableSeats(teamsDialog, team).length}
           onStop={(team) => stopTeam(teamsDialog, team.id)}
+        />
+      )}
+
+      {boardOpen && activeProject && (
+        <BoardDialog
+          project={activeProject}
+          teams={boardTeams(activeProject.path)}
+          panes={panes.filter((p) => p.projectPath === activeProject.path)}
+          onFocusAgent={(pane) => {
+            setBoardOpen(false);
+            focusAgent(pane);
+          }}
+          onClose={() => setBoardOpen(false)}
         />
       )}
 
@@ -3141,7 +3645,7 @@ export default function App() {
           project={activePath}
           agents={activePanes.map((p) => ({
             id: p.id,
-            label: titles[p.id] || p.label,
+            label: p.team?.role ?? (titles[p.id] || p.label),
             status: statuses[p.id] || "working",
           }))}
           defaultAgentId={

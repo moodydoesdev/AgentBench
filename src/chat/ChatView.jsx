@@ -1,18 +1,26 @@
-import { Component, memo, useEffect, useReducer, useRef, useState } from "react";
+import { Component, memo, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { listen as listenApp } from "@/lib/ipc";
 import { useTransport } from "../lib/TransportContext";
+import { CLAUDE_MODELS, CODEX_MODELS, pickerIdFor } from "../lib/models";
+import { matchesHotkey, parseHotkey, formatHotkey } from "../lib/hotkey";
+import { loadSettings } from "../settings";
 import {
   ArrowUp,
   Bell,
   CaretUp,
   CircleNotch,
   Cpu,
-  ImageSquare,
+  FileText,
+  Paperclip,
   Microphone,
   Robot,
+  SpeakerHigh,
+  SpeakerSimpleSlash,
   Stop,
   Terminal,
   X,
 } from "@phosphor-icons/react";
+import { loadSpeechPrefs, onSpeaking, saveSpeechPrefs, speak } from "../lib/speech";
 import { LogoMark } from "../components/Logo";
 import useDictation from "./useDictation";
 import {
@@ -28,16 +36,23 @@ import {
   retrySend,
 } from "./records";
 import Markdown from "./Markdown";
-import ToolCard from "./ToolCard";
+import ToolCard, { TtyPromptCard } from "./ToolCard";
+import { PeerBubble, SendMessageCard, isSendMessage } from "./PeerMessage";
 import { isAmbiguousSendError } from "../lib/paneSend";
 import { buildWire, imageToken } from "../lib/imageTokens";
 import { removeChatPane, reportChatActivity } from "../tasks/taskRegistry";
 
 // Older sessions can be thousands of messages; mount only the recent tail
 // and let "Show earlier" page backwards. content-visibility handles paint,
-// this handles mount + markdown-parse cost.
-const TAIL = 250;
+// this handles mount + markdown-parse cost. The tail is deliberately small:
+// a bench mounts many chats, and markdown + tool cards are the expensive
+// half of a row.
+const TAIL = 100;
 const PAGE = 500;
+// Holding a bare Space mid-text this long turns it into push-to-talk. Longer
+// than the macOS key-repeat delay would be sluggish; shorter and a normal
+// space typed slowly would start dictating.
+const SOFT_HOLD_MS = 350;
 
 // Claude Code built-ins worth surfacing in the composer's "/" autocomplete;
 // custom commands + skills are merged in from list_slash_commands. `tui`
@@ -95,35 +110,20 @@ const ARG_DIRECT = new Set(["model", "resume"]);
 // (and even on headless panes where there is no terminal at all).
 const CHAT_NATIVE = new Set(["model", "resume"]);
 
-// Model shortcuts Claude Code's `/model <name>` (and the stream-json
-// set_model control request) accept. Fable has no shortcut alias, so its
-// entry carries the exact model id — /model and set_model take those too.
-const MODELS = [
-  { id: "default", label: "Default", desc: "recommended for daily use" },
-  { id: "claude-fable-5", label: "Fable", desc: "most capable, deepest reasoning" },
-  { id: "opus", label: "Opus", desc: "great for complex work" },
-  { id: "sonnet", label: "Sonnet", desc: "fast and smart" },
-  { id: "sonnet[1m]", label: "Sonnet 1M", desc: "1M-token context" },
-  { id: "haiku", label: "Haiku", desc: "fastest" },
-  { id: "opusplan", label: "Opus Plan", desc: "Opus plans, Sonnet builds" },
-];
-
-// The transcript and init records report full model ids ("claude-opus-4-6",
-// "claude-3-5-haiku-20241022"); the picker's ids are the shortcuts. Map an
-// observed id onto a picker id so the button and menu can show where the
-// session actually is.
-function pickerIdFor(full) {
-  if (!full) return null;
-  if (MODELS.some((m) => m.id === full)) return full;
-  const fam = /^claude-(?:\d+(?:-\d+)*-)?(opus|sonnet|haiku|fable)/.exec(full)?.[1];
-  return fam ?? full;
-}
+// Model lists live in lib/models.js — Claude's /model shortcuts and Codex's
+// slugs (its /model also takes a slug directly, so both get a picker).
 
 // Rows re-render only when their message's rev changes — messages mutate in
 // place (tool results, draft tokens), so identity alone isn't enough.
 const Row = memo(
-  function Row({ msg, onRetry }) {
-    if (msg.kind === "tool") return <ToolCard tool={msg.tool} rev={msg.rev} />;
+  function Row({ msg, onRetry, onSendNow }) {
+    if (msg.kind === "peer") return <PeerBubble peer={msg.peer} />;
+    if (msg.kind === "tool")
+      return isSendMessage(msg.tool) ? (
+        <SendMessageCard tool={msg.tool} />
+      ) : (
+        <ToolCard tool={msg.tool} rev={msg.rev} />
+      );
     if (msg.kind === "thinking") return <ThinkingRow msg={msg} />;
     if (msg.kind === "error") return <pre className="chat-error">{msg.text}</pre>;
     if (msg.kind === "notice")
@@ -170,7 +170,18 @@ const Row = memo(
           {msg.text}
           {msg.local && <span className="chat-user-spin" aria-label="sending" />}
           {msg.queued && !msg.failed && (
-            <span className="chat-user-queued">queued · sends when the agent is free</span>
+            <span className="chat-user-queued">
+              queued · sends when the agent is free
+              {onSendNow && (
+                <button
+                  className="chat-send-now"
+                  title="Deliver into the running turn now (Ctrl+X Ctrl+S)"
+                  onClick={() => onSendNow()}
+                >
+                  send now
+                </button>
+              )}
+            </span>
           )}
           {msg.failed && (
             // "may not have sent": the reply was lost, not necessarily the
@@ -189,7 +200,9 @@ const Row = memo(
     }
     return (
       <div className="chat-assistant">
-        <Markdown text={msg.text} />
+        {msg.text.trim() && <Markdown text={msg.text} />}
+        {msg.spoken && <Readout text={msg.spoken} speakKey={`${msg.key}:spoken`} />}
+        {!msg.sidechain && msg.text.trim() && <ReadAloud text={msg.text} speakKey={`${msg.key}:all`} />}
       </div>
     );
   },
@@ -197,6 +210,96 @@ const Row = memo(
   // prop pair is the only reliable change signal
   (prev, next) => prev.msg === next.msg && prev.rev === next.rev,
 );
+
+// Whether this machine has a voice, and whether `key` is what's playing.
+function useSpeechState(key) {
+  const { invoke } = useTransport();
+  const [available, setAvailable] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    let dead = false;
+    loadSpeechPrefs(invoke).then((p) => !dead && setAvailable(!!p.available));
+    const off = onSpeaking((k) => setPlaying(k === key));
+    return () => {
+      dead = true;
+      off();
+    };
+  }, [invoke, key]);
+  return { invoke, available, playing };
+}
+
+// The spoken readout Claude ended its turn with: the gist in one line, tap
+// to hear it (again). New ones play by themselves — see ChatView's autoplay.
+function Readout({ text, speakKey }) {
+  const { invoke, available, playing } = useSpeechState(speakKey);
+  return (
+    <button
+      type="button"
+      className={`chat-readout${playing ? " playing" : ""}`}
+      disabled={!available}
+      title={available ? (playing ? "Stop" : "Play readout") : "Voice model not installed on this machine"}
+      onClick={() => speak(invoke, text, { key: speakKey, raw: true }).catch(() => {})}
+    >
+      {playing ? <SpeakerSimpleSlash size={13} weight="fill" /> : <SpeakerHigh size={13} weight="fill" />}
+      <span>{text}</span>
+    </button>
+  );
+}
+
+// Auto-read on/off, right in the composer so any device can flip it (the
+// phone app has no Settings → Voice). One machine-wide switch: every screen
+// showing the chat follows it. Hidden unless readouts are on.
+function AutoReadToggle() {
+  const { invoke } = useTransport();
+  const [prefs, setPrefs] = useState(null);
+  useEffect(() => {
+    let dead = false;
+    const refresh = () => loadSpeechPrefs(invoke, true).then((p) => !dead && setPrefs(p));
+    refresh();
+    // flipped on another device: pick it up when this window comes back
+    window.addEventListener("focus", refresh);
+    return () => {
+      dead = true;
+      window.removeEventListener("focus", refresh);
+    };
+  }, [invoke]);
+  if (!prefs?.readouts || !prefs.available) return null;
+  const on = !!prefs.autoplay;
+  return (
+    <button
+      type="button"
+      className={`chat-model-btn chat-autoread${on ? " on" : ""}`}
+      title={on ? "Readouts play automatically on every device — click to turn off" : "Readouts play only when tapped — click to auto-play"}
+      aria-pressed={on}
+      onMouseDown={(ev) => ev.preventDefault()} // keep the textarea focused
+      onClick={() => {
+        setPrefs((p) => ({ ...p, autoplay: !on }));
+        saveSpeechPrefs(invoke, { autoplay: !on }).then(setPrefs).catch(() => {});
+      }}
+    >
+      {on ? <SpeakerHigh size={12} weight="fill" /> : <SpeakerSimpleSlash size={12} />}
+      Auto-read
+    </button>
+  );
+}
+
+// Read a whole message aloud (code, tables and links skipped server-side).
+function ReadAloud({ text, speakKey }) {
+  const { invoke, available, playing } = useSpeechState(speakKey);
+  if (!available) return null;
+  return (
+    <button
+      type="button"
+      className={`chat-read-aloud${playing ? " playing" : ""}`}
+      title={playing ? "Stop reading" : "Read aloud"}
+      aria-label={playing ? "Stop reading" : "Read aloud"}
+      onClick={() => speak(invoke, text, { key: speakKey }).catch(() => {})}
+    >
+      {playing ? <SpeakerSimpleSlash size={12} /> : <SpeakerHigh size={12} />}
+      <span>{playing ? "Stop" : "Read aloud"}</span>
+    </button>
+  );
+}
 
 // A platform-specific render crash must show itself in the pane, not blank
 // it (or take the whole app down) — debugging "completely blank" over chat
@@ -271,7 +374,7 @@ function groupMessages(messages) {
           agentId: m.agentId,
           items: [m],
         });
-    } else if (m.kind === "tool") {
+    } else if (m.kind === "tool" && !isSendMessage(m.tool)) {
       if (last?.type === "tools") last.items.push(m);
       else out.push({ type: "tools", key: `t-${m.key}`, items: [m] });
     } else {
@@ -279,6 +382,18 @@ function groupMessages(messages) {
     }
   }
   return out;
+}
+
+// The agent process a background shell is running as: the broker lists each
+// child by its unwrapped command line (capped at 400 chars), so match on that.
+const squash = (t) => (t ?? "").replace(/\s+/g, " ").trim();
+function processFor(act, commands) {
+  const want = squash(act.detail);
+  if (!want || !commands?.length) return null;
+  return commands.find((c) => {
+    const got = squash(c.command).replace(/…$/, "");
+    return got && (got === want || want.startsWith(got) || got.includes(want));
+  }) ?? null;
 }
 
 /**
@@ -294,6 +409,10 @@ export default memo(function ChatView({
   cwd,
   mode,
   agent = "Claude",
+  // Pane identity for the composer chip: the agent's session name and its
+  // /color dot. Without them the chip still shows the project folder.
+  name,
+  accentColor,
   visible = true,
   readOnly = false,
   initialLines,
@@ -326,9 +445,35 @@ export default memo(function ChatView({
   // registry. Local desktop panes only — remote pane ids would collide with
   // local ones in the registry.
   trackTasks = false,
+  // Background shells' controls (desktop panes): the agent's live processes
+  // from the broker's resources push, plus stop/follow from the process
+  // drawer. Without it the activity list can only jump to the card.
+  shells,
 }) {
   // Desktop: Tauri IPC. Phone: the WebSocket to the machine owning this pane.
-  const { invoke, listen } = useTransport();
+  const { invoke, listen, kind: transportKind, upload } = useTransport();
+  // Any other file type rides the transport's upload (a temp file on the
+  // workstation) and reaches Claude as a path it can Read.
+  const allowFiles = allowImages && typeof upload === "function";
+  // A transcript backfill costs real bandwidth on a remote transport, and the
+  // web bench mounts every pane of every project — fetching them all at boot
+  // shipped tens of MB through the tunnel. Off-screen panes hold off until
+  // their first moment on screen; that arms the watcher permanently (the live
+  // tail keeps it current afterwards). Local IPC is free: armed from birth,
+  // so the desktop behaves exactly as before.
+  const [armed, setArmed] = useState(transportKind === "tauri" || visible);
+  useEffect(() => {
+    if (visible) setArmed(true);
+  }, [visible]);
+  // Rendering rows is the other expensive half: the bench mounts every pane
+  // of every project, most never looked at. The store keeps ingesting (the
+  // tasks rail and status heuristics need it), but no row tree is built
+  // until the pane's first moment on screen — the ResizeObserver pin below
+  // lands that first render at the bottom.
+  const [shown, setShown] = useState(visible);
+  useEffect(() => {
+    if (visible) setShown(true);
+  }, [visible]);
   const storeRef = useRef(null);
   if (!storeRef.current) storeRef.current = createChatStore();
   const [, forceRender] = useReducer((n) => n + 1, 0);
@@ -371,6 +516,16 @@ export default memo(function ChatView({
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   // running sub-agents / background shells popup
   const [activityOpen, setActivityOpen] = useState(false);
+  const [stoppingShells, setStoppingShells] = useState({});
+  const stopShell = async (key, proc) => {
+    setStoppingShells((s) => ({ ...s, [key]: true }));
+    try {
+      await shells.onStop(proc);
+    } catch (err) {
+      console.error("stop shell failed", err);
+      setStoppingShells(({ [key]: _, ...rest }) => rest);
+    }
+  };
   // First-message insurance (transcript mode): the paste-then-Enter dance can
   // leave the text sitting in the TUI's input box (Enter coalesced into the
   // paste — worst while Claude is still booting). If neither the
@@ -382,21 +537,28 @@ export default memo(function ChatView({
   // They render inline (WYSIWYG), can be removed, and are written to temp files
   // on send so Claude gets them by path.
   const [images, setImages] = useState([]);
+  // Non-image files staged alongside: { key, name, size, file }. Uploaded on
+  // send; each path is appended to the message.
+  const [files, setFiles] = useState([]);
+  const filesRef = useRef(files);
+  filesRef.current = files;
   const draftOwner = useRef(crypto.randomUUID());
   const lastDraft = useRef(null);
   const publishDraft = (focused = document.activeElement === inputRef.current) => {
     if (!trackTasks || readOnly) return;
-    const present = focused || !!inputRef.current?.value.trim() || images.length > 0;
+    const present = focused || !!inputRef.current?.value.trim() || images.length > 0 || files.length > 0;
     if (lastDraft.current === present) return;
     lastDraft.current = present;
     invoke("resource_draft", { id, owner: draftOwner.current, present }).catch(() => {});
   };
-  useEffect(() => { publishDraft(); }, [images]);
+  useEffect(() => { publishDraft(); }, [images, files]);
   useEffect(() => () => {
     if (trackTasks && !readOnly) invoke("resource_draft", { id, owner: draftOwner.current, present: false }).catch(() => {});
   }, [id, trackTasks, readOnly]);
 
   const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const uploadingRef = useRef(false);
   const imgKeyRef = useRef(0);
   // Staging an image drops its "[Image #N]" token at the cursor, like Claude
   // Code's composer, so the message can say which image it means. Numbers
@@ -430,22 +592,53 @@ export default memo(function ChatView({
 
   // Dictation writes into the textarea, which is uncontrolled — the composer
   // reads el.value directly. Partials are revisions of the whole phrase, so
-  // each one replaces the transcript rather than appending: keep whatever was
-  // typed before the mic opened and rewrite only the tail after it.
-  const dictBaseRef = useRef("");
+  // each one replaces the transcript rather than appending: keep whatever sat
+  // either side of the caret when the mic opened and rewrite only the middle.
+  const dictAroundRef = useRef({ before: "", after: "" });
   const [dictError, setDictError] = useState(null);
+  const [dictStatus, setDictStatus] = useState(null);
+  // While listening the textarea's text is hidden under a mirror that draws
+  // the same text with a level meter at the insertion point, so the words
+  // appear to stream out behind it. { head, tail } either side of the meter.
+  const [dictView, setDictView] = useState(null);
+  const dictMirrorRef = useRef(null);
+  const meterRef = useRef(null);
+  const levelsRef = useRef([0, 0, 0, 0, 0]);
+  const dictCaretRef = useRef(0);
   const writeTranscript = (text) => {
     const el = inputRef.current;
     if (!el) return;
-    el.value = dictBaseRef.current + text;
+    const { before, after } = dictAroundRef.current;
+    const lead = before && text && !/\s$/.test(before) ? " " : "";
+    const trail = after && text && !/^\s/.test(after) ? " " : "";
+    const head = before + lead + text;
+    el.value = head + trail + after;
+    el.setSelectionRange(head.length, head.length);
+    dictCaretRef.current = head.length;
+    setDictView({ head, tail: trail + after });
     // match the autosize + "/" menu the onInput handler would have done
     el.style.height = "";
     el.style.height = Math.min(el.scrollHeight, 160) + "px";
     syncCmdMenu(el.value);
   };
+  // Bars scroll left like a tiny waveform: newest level enters on the right.
+  const showLevel = (level) => {
+    const bars = meterRef.current?.children;
+    if (!bars) return;
+    const levels = levelsRef.current;
+    levels.shift();
+    levels.push(level);
+    meterRef.current.classList.add("metered");
+    for (let i = 0; i < bars.length; i++)
+      bars[i].style.transform = `scaleY(${0.18 + 0.82 * levels[i]})`;
+  };
   const dictation = useDictation({
-    onPartial: writeTranscript,
+    onPartial: (text) => {
+      setDictStatus(null);
+      writeTranscript(text);
+    },
     onFinal: (text) => {
+      setDictStatus(null);
       writeTranscript(text);
       const el = inputRef.current;
       if (!el) return;
@@ -454,24 +647,127 @@ export default memo(function ChatView({
       // press into another stray space. The separator before the next phrase
       // is added when that phrase starts instead.
       el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
+      el.setSelectionRange(dictCaretRef.current, dictCaretRef.current);
     },
-    onError: setDictError,
+    onError: (message) => {
+      setDictStatus(null);
+      setDictError(message);
+    },
+    onLevel: showLevel,
+    onStatus: setDictStatus,
   });
+  // The mirror has to scroll with the textarea it covers.
+  useLayoutEffect(() => {
+    if (dictMirrorRef.current && inputRef.current)
+      dictMirrorRef.current.scrollTop = inputRef.current.scrollTop;
+  }, [dictView, dictation.listening]);
   // Whether the current phrase is push-to-talk (⌥Space) rather than a button
   // toggle. Only a held phrase is tied to keys that must be released, so only
   // it should be abandoned when the composer loses focus.
   const dictHoldRef = useRef(false);
+  // Push-to-talk settings: the desktop stores them in localStorage and the
+  // settings window broadcasts edits over the app-wide Tauri event, which the
+  // pane's transport doesn't carry (a mobile pane's transport listens to the
+  // remote machine, but these prefs belong to the device in hand).
+  const [dictPrefs, setDictPrefs] = useState(() => {
+    const s = loadSettings();
+    return { key: s.dictationKey ?? "", delay: s.dictationHoldDelay ?? 250 };
+  });
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    const un = listenApp("settings-changed", (e) =>
+      setDictPrefs({
+        key: e.payload.dictationKey ?? "",
+        delay: e.payload.dictationHoldDelay ?? 250,
+      }),
+    );
+    return () => un.then((f) => f());
+  }, []);
+  // The mic only opens once the key has been held this long, so brushing
+  // Space can't start a phrase; released inside the window, nothing happens.
+  const dictTimerRef = useRef(null);
+  // "Armed or talking": the window between keydown and the phrase ending.
+  // dictHoldRef alone isn't it — that ref stays set after stop() until the
+  // next start, and gating key handling on it would eat Space forever.
+  const dictHoldActive = () =>
+    dictHoldRef.current && (dictTimerRef.current != null || dictation.listening);
+  // Where a bare Space typed mid-text landed, while it might still turn into
+  // a hold. That Space is let through (it's usually just a space), and only
+  // taken back out once it's been held long enough to mean "dictate here".
+  const dictSoftRef = useRef(null);
+  const beginHold = (softAt = null) => {
+    if (dictTimerRef.current || dictation.listening) return;
+    // A soft hold always waits: with no delay every space typed would dictate.
+    const delay = softAt == null ? dictPrefs.delay : Math.max(dictPrefs.delay, SOFT_HOLD_MS);
+    if (delay <= 0) return startDictation(true);
+    dictHoldRef.current = true; // armed — repeats are swallowed from here on
+    dictSoftRef.current = softAt;
+    dictTimerRef.current = setTimeout(() => {
+      dictTimerRef.current = null;
+      const at = dictSoftRef.current;
+      dictSoftRef.current = null;
+      const el = inputRef.current;
+      if (at != null && el && el.value[at] === " " && el.selectionStart === at + 1) {
+        el.value = el.value.slice(0, at) + el.value.slice(at + 1);
+        el.setSelectionRange(at, at);
+      }
+      startDictation(true);
+    }, delay);
+  };
+  // A pane unmounting mid-delay must not open the mic afterwards.
+  useEffect(() => () => clearTimeout(dictTimerRef.current), []);
+  const endHold = (commit) => {
+    if (dictTimerRef.current) {
+      // released within the delay window: never listened, nothing to insert
+      clearTimeout(dictTimerRef.current);
+      dictTimerRef.current = null;
+      dictHoldRef.current = false;
+      dictSoftRef.current = null;
+      return;
+    }
+    if (dictHoldRef.current && dictation.listening)
+      commit ? dictation.stop() : dictation.cancel();
+  };
+  // Which released key ends a held phrase: either half of the built-in
+  // chords (Space / ⌥Space), or any piece of the custom combo.
+  const endsHold = (ev) => {
+    if (ev.code === "Space" || ev.key === "Alt") return true;
+    if (!dictPrefs.key) return false;
+    const c = parseHotkey(dictPrefs.key);
+    const k = ev.key.toLowerCase();
+    return (
+      k === c.key ||
+      (c.ctrl && k === "control") ||
+      (c.alt && k === "alt") ||
+      (c.meta && k === "meta") ||
+      (c.shift && k === "shift")
+    );
+  };
   const startDictation = (held) => {
     const el = inputRef.current;
-    // Anything already typed is kept and the phrase lands after it, separated
-    // by exactly one space however much trailing whitespace is sitting there.
-    // A box holding only whitespace counts as empty, so a few stray Space
-    // presses can't prefix the message with them.
+    // The phrase lands at the caret (or replaces a selection), and
+    // writeTranscript puts exactly one space either side of it. A box holding
+    // only whitespace counts as empty, so a few stray Space presses can't
+    // prefix the message with them.
     const typed = el?.value ?? "";
-    dictBaseRef.current = typed.trim() ? typed.replace(/\s+$/, "") + " " : "";
+    if (!typed.trim()) {
+      dictAroundRef.current = { before: "", after: "" };
+    } else {
+      const from = el.selectionStart ?? typed.length;
+      const to = el.selectionEnd ?? from;
+      dictAroundRef.current = {
+        before: typed.slice(0, from).replace(/[ \t]+$/, ""),
+        after: typed.slice(to).replace(/^[ \t]+/, ""),
+      };
+    }
+    const { before, after } = dictAroundRef.current;
+    const lead = before && !/\s$/.test(before) ? " " : "";
+    dictCaretRef.current = (before + lead).length;
+    setDictView({ head: before + lead, tail: after && !/^\s/.test(after) ? " " + after : after });
+    levelsRef.current = [0, 0, 0, 0, 0];
     dictHoldRef.current = held;
     setDictError(null);
+    setDictStatus(null);
     dictation.start();
   };
   const toggleDictation = () =>
@@ -579,6 +875,7 @@ export default memo(function ChatView({
   }, []);
 
   useEffect(() => {
+    if (!armed) return; // off-screen remote pane: no watch, no listeners yet
     const store = storeRef.current;
     let dead = false;
     const unlistens = [];
@@ -602,28 +899,43 @@ export default memo(function ChatView({
     unlistens.push(onTurn);
 
     if (mode === "transcript") {
-      invoke("watch_transcript", { id })
-        .then((res) => {
-          if (dead) return;
-          setWaiting(!res?.sid);
-          setLoading(false);
-          if (res?.text) {
-            try {
-              applyLines(storeRef.current, res.text.split("\n"));
-            } catch (err) {
-              setWatchError(`backfill parse failed: ${err}`);
-            }
-            bump();
-          }
-        })
-        .catch((err) => {
-          // an old broker answers "unknown op" — surface it, don't spin
-          if (!dead) {
-            setWatchError(String(err));
+      const startWatch = (rewatch) =>
+        invoke("watch_transcript", { id })
+          .then((res) => {
+            if (dead) return;
+            setWaiting(!res?.sid);
             setLoading(false);
-          }
-        });
+            setWatchError(null);
+            if (res?.text) {
+              // A re-watch replays the whole backfill; into a fresh store,
+              // or every message would render twice. In-flight sends carry
+              // over the same way transcript-reset's do.
+              if (rewatch) {
+                const prev = storeRef.current;
+                storeRef.current = createChatStore();
+                carryPending(prev, storeRef.current);
+              }
+              try {
+                applyLines(storeRef.current, res.text.split("\n"));
+              } catch (err) {
+                setWatchError(`backfill parse failed: ${err}`);
+              }
+              bump();
+            }
+          })
+          .catch((err) => {
+            // an old broker answers "unknown op" — surface it, don't spin
+            if (!dead) {
+              setWatchError(String(err));
+              setLoading(false);
+            }
+          });
+      startWatch(false);
       unlistens.push(
+        // A reconnected gateway socket says hello again — the watch it held
+        // for this pane died with the old connection, so re-arm it or the
+        // chat silently stops tailing. Desktop IPC never emits this.
+        listen("hello", () => startWatch(true)),
         // storeRef.current, NOT a captured store: transcript-reset swaps the
         // store, and writing into the orphaned one left the pane blank until
         // a remount (the Windows "works after Ctrl+R" bug)
@@ -677,7 +989,7 @@ export default memo(function ChatView({
     };
     // the transport is part of the identity of "which stream is this": a
     // mobile pane re-subscribes when its gateway connection is replaced
-  }, [id, mode, invoke, listen]);
+  }, [id, mode, invoke, listen, armed]);
 
   useEffect(() => {
     register?.({
@@ -685,6 +997,8 @@ export default memo(function ChatView({
       // OS file drops arrive through Tauri's native drag-drop (the webview
       // never sees HTML5 file drops), so the pane pushes them in here.
       addImage: (img) => stageImageRef.current(img.url, img.name || "image"),
+      // browser drops on the pane (no OS path): any File
+      addFile: (file) => addAnyFileRef.current(file),
       insertText: (t) => {
         const el = inputRef.current;
         if (!el) return;
@@ -696,6 +1010,45 @@ export default memo(function ChatView({
     });
     return () => register?.(null);
   }, [id]);
+
+  // Spoken readouts play by themselves when they arrive live — never for
+  // backfill (anything written before this view opened), never twice, and
+  // only while this window is on screen. Per-device switch in Settings, so a
+  // phone and the desk don't talk over each other.
+  const openedAtRef = useRef(Date.now());
+  const spokenRef = useRef(new Set());
+  useEffect(() => {
+    const msgs = storeRef.current.messages;
+    let last = null;
+    for (let i = msgs.length - 1; i >= 0 && !last; i--)
+      if (msgs[i].spoken && !msgs[i].sidechain) last = msgs[i];
+    if (!last || spokenRef.current.has(last.key)) return;
+    spokenRef.current.add(last.key);
+    if (last.at < openedAtRef.current - 3000) return;
+    if (document.visibilityState !== "visible") return;
+    loadSpeechPrefs(invoke).then((p) => {
+      if (p.available && p.autoplay) speak(invoke, last.spoken, { key: `${last.key}:spoken`, raw: true }).catch(() => {});
+    });
+  });
+
+  // Terminal-only dialogs (folder trust, computer-use access…) the broker
+  // spotted on this pane's screen. Fetched once so a late-opened view sees a
+  // dialog that is already up; the event keeps it current. Pty panes only.
+  const [ttyPrompt, setTtyPrompt] = useState(null);
+  useEffect(() => {
+    if (mode !== "transcript" || !armed) return;
+    let dead = false;
+    invoke("tty_prompt", { id })
+      .then((p) => { if (!dead) setTtyPrompt(p ?? null); })
+      .catch(() => {}); // older broker: no op, no card
+    const un = listen("tty-prompt", (e) => {
+      if (e.payload.id === id) setTtyPrompt(e.payload.prompt ?? null);
+    });
+    return () => {
+      dead = true;
+      un.then((f) => f());
+    };
+  }, [id, mode, invoke, listen, armed]);
 
   // Render questions that were already waiting. applyAsk dedupes by question
   // signature, so this is a no-op once the live ping or the transcript has
@@ -756,6 +1109,17 @@ export default memo(function ChatView({
   };
   const handleRetry = useRef((msg) => retryFnRef.current?.(msg)).current;
 
+  // Claude Code parks a message typed mid-turn in its input queue; the
+  // Ctrl+X Ctrl+S chord delivers the queue into the running turn instead of
+  // waiting for it to end. Same stable-identity trick as retry so the
+  // memoized Row never holds a stale closure.
+  const sendNowFnRef = useRef(null);
+  sendNowFnRef.current = () => {
+    if (readOnly) return;
+    invoke("write_pane", { id, data: "\x18\x13" }).catch(() => {});
+  };
+  const handleSendNow = useRef(() => sendNowFnRef.current?.()).current;
+
   const clearSubmitGuard = () => {
     if (submitGuardRef.current) {
       clearTimeout(submitGuardRef.current);
@@ -783,9 +1147,13 @@ export default memo(function ChatView({
   };
   useEffect(() => clearSubmitGuard, [id]);
 
+  // Codex sessions pick from Codex's slugs; Claude from /model's shortcuts.
+  const modelList = agent === "Codex" ? CODEX_MODELS : CLAUDE_MODELS;
+
   // Apply a model choice. Pty panes: send "/model <name>" — with an argument
-  // it applies directly, no dialog. Headless panes: the stream-json
-  // set_model control request, since slash commands never reach a TUI.
+  // it applies directly, no dialog (Codex ≥ 0.153 takes a slug the same
+  // way). Headless panes: the stream-json set_model control request, since
+  // slash commands never reach a TUI.
   const selectModel = (m) => {
     setModelMenuOpen(false);
     setModel(m);
@@ -819,10 +1187,30 @@ export default memo(function ChatView({
     // straight back into it — and the image write below can await, widening
     // the window it lands in.
     dictation.cancel();
-    dictBaseRef.current = "";
+    dictAroundRef.current = { before: "", after: "" };
     const text = el?.value.trim() ?? "";
     const imgs = imagesRef.current;
-    if (!text && imgs.length === 0) return;
+    const staged = filesRef.current;
+    if (!text && imgs.length === 0 && staged.length === 0) return;
+
+    // Upload staged files first; a failure keeps the draft intact so nothing
+    // typed is lost, and says why.
+    let filePaths = [];
+    if (staged.length && allowFiles) {
+      if (uploadingRef.current) return; // a second Enter mid-upload
+      uploadingRef.current = true;
+      setUploading(true);
+      try {
+        filePaths = await Promise.all(staged.map((f) => upload(f.file)));
+      } catch (err) {
+        addNotice(storeRef.current, "Couldn't send the file", String(err?.message || err));
+        bump();
+        return;
+      } finally {
+        uploadingRef.current = false;
+        setUploading(false);
+      }
+    }
 
     // Persist staged images to temp files up front — Claude ingests them by
     // path (deterministic), instead of us racing the OS clipboard. If a write
@@ -843,6 +1231,8 @@ export default memo(function ChatView({
     setCmdQuery(null);
     imagesRef.current = [];
     setImages([]);
+    filesRef.current = [];
+    setFiles([]);
 
     const parts = text.startsWith("/") ? text.slice(1).split(/\s+/) : null;
     const tok = parts?.[0] ?? null;
@@ -851,12 +1241,12 @@ export default memo(function ChatView({
 
     // Commands the chat handles natively, in either mode (skipped when
     // images are staged — then it's a message that happens to start with /).
-    if (tok && imgs.length === 0) {
+    if (tok && imgs.length === 0 && staged.length === 0) {
       if (tok === "resume" && !arg && onResume) {
         onResume();
         return;
       }
-      if (tok === "model" && agent !== "Codex") {
+      if (tok === "model") {
         if (!arg) {
           setModelMenuOpen(true);
           return;
@@ -888,12 +1278,16 @@ export default memo(function ChatView({
     // Wire text: each [Image #N] token becomes its image's temp path (names
     // never contain spaces, so no quoting); untokened images lead. The pty
     // paste sends each path on its own so Claude attaches it in place.
-    const wire = paths.length
+    const imgWire = paths.length
       ? buildWire(text, imgs.map((im, i) => ({ n: im.n, path: paths[i] })))
       : text;
+    // Uploaded files trail the message as plain paths (sanitized names, no
+    // spaces), which Claude reads with its own tools.
+    const wire = [imgWire, ...filePaths].filter(Boolean).join(" ");
+    const shown = [text, ...filePaths].filter(Boolean).join(" ");
     let echo = null;
     if (!opensDialog) {
-      echo = addLocalUser(store, text, imgs.map((im) => ({ url: im.url, n: im.n })));
+      echo = addLocalUser(store, shown, imgs.map((im) => ({ url: im.url, n: im.n })));
       echo.wire = wire; // what a retry must resend (paths included)
     }
     // Sending into a live turn means the TUI queues this message — remember
@@ -926,6 +1320,23 @@ export default memo(function ChatView({
     reader.readAsDataURL(file);
   };
 
+  // Any File: images stage as thumbnails, everything else as a file chip.
+  const addAnyFile = (file) => {
+    if (!file) return;
+    if (file.type.startsWith("image/") && !/svg/.test(file.type)) return addImageFile(file);
+    if (!allowFiles) return;
+    const next = [...filesRef.current, { key: `file${imgKeyRef.current++}`, name: file.name || "file", size: file.size, file }];
+    filesRef.current = next;
+    setFiles(next);
+  };
+  const addAnyFileRef = useRef(addAnyFile);
+  addAnyFileRef.current = addAnyFile;
+  const removeFile = (key) => {
+    const next = filesRef.current.filter((f) => f.key !== key);
+    filesRef.current = next;
+    setFiles(next);
+  };
+
   // Dropping an image takes its token out of the text too.
   const removeImage = (key) => {
     const gone = imagesRef.current.find((i) => i.key === key);
@@ -942,31 +1353,33 @@ export default memo(function ChatView({
   const onPaste = (ev) => {
     if (!allowImages) return;
     const items = Array.from(ev.clipboardData?.items ?? []);
-    const imageItems = items.filter((it) => it.type.startsWith("image/"));
-    if (!imageItems.length) return;
+    const fileItems = items.filter((it) =>
+      it.kind === "file" && (allowFiles || it.type.startsWith("image/")),
+    );
+    if (!fileItems.length) return;
     const hasText = items.some((it) => it.type === "text/plain");
     if (!hasText) ev.preventDefault();
-    for (const it of imageItems) addImageFile(it.getAsFile());
+    for (const it of fileItems) addAnyFile(it.getAsFile());
   };
 
   const onDrop = (ev) => {
     if (!allowImages) return;
-    const files = Array.from(ev.dataTransfer?.files ?? []).filter((f) =>
-      f.type.startsWith("image/"),
+    const dropped = Array.from(ev.dataTransfer?.files ?? []).filter(
+      (f) => allowFiles || f.type.startsWith("image/"),
     );
     setDragOver(false);
-    if (!files.length) return;
+    if (!dropped.length) return;
     ev.preventDefault();
-    files.forEach(addImageFile);
+    dropped.forEach(addAnyFile);
   };
 
   const store = storeRef.current;
   // Model to show on the picker: the last explicit choice, else whatever the
   // session reported it's actually on (init message / assistant replies).
-  const activeModel = model ?? pickerIdFor(store.model);
+  const activeModel = model ?? pickerIdFor(store.model, modelList);
   const hiddenCount = Math.max(0, store.messages.length - tailCap);
   const visibleMessages = hiddenCount ? store.messages.slice(hiddenCount) : store.messages;
-  const groups = groupMessages(visibleMessages);
+  const groups = shown ? groupMessages(visibleMessages) : [];
 
   // Live background work: sub-agents and background shells still running.
   const activity = [...store.activity.values()].filter((a) => !a.done);
@@ -1026,6 +1439,10 @@ export default memo(function ChatView({
   // nothing to show yet: the list becomes a centered welcome panel instead
   const empty = groups.length === 0;
   const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : "";
+  // "ravenclaw · AgentBench" — who gets this message, and in which project.
+  // Sits in the placeholder AND in a chip that stays up while typing, since
+  // wrong-pane sends happen exactly when the placeholder is gone.
+  const who = `${name ?? agent}${folder ? ` · ${folder}` : ""}`;
 
   // Any click elsewhere closes the small composer popovers (their triggers
   // stopPropagation so the toggle doesn't immediately undo itself).
@@ -1054,7 +1471,11 @@ export default memo(function ChatView({
           <ChatErrorBoundary>
           {watchError && (
             <pre className="chat-error">
-              {`chat view couldn't reach the transcript watcher (${watchError}).\nThe broker probably predates this build — use Settings → Workspace →\nRestart broker (or the command menu's "Restart broker").`}
+              {/unknown op/i.test(watchError)
+                ? `chat view couldn't reach the transcript watcher (${watchError}).\nThe broker probably predates this build — use Settings → Workspace →\nRestart broker (or the command menu's "Restart broker").`
+                : /not connected|disconnected/i.test(watchError)
+                  ? "Connection to the workstation dropped while opening this chat.\nIt reconnects and reloads by itself — if this sticks around, check that\nthe machine is awake and reachable."
+                  : `chat view couldn't load this conversation (${watchError}).`}
             </pre>
           )}
           {empty && !watchError && loading && (
@@ -1079,11 +1500,11 @@ export default memo(function ChatView({
                 <span>
                   <kbd>Esc</kbd> stop
                 </span>
-                <span>paste or drop images</span>
+                <span>{allowFiles ? "paste or drop files" : "paste or drop images"}</span>
               </div>
             </div>
           )}
-          {hiddenCount > 0 && (
+          {shown && hiddenCount > 0 && (
             <button
               className="chat-earlier"
               onClick={() => {
@@ -1113,7 +1534,19 @@ export default memo(function ChatView({
                 ))}
               </div>
             ) : (
-              <Row key={g.key} msg={g.msg} rev={g.msg.rev} onRetry={handleRetry} />
+              <Row
+                key={g.key}
+                msg={g.msg}
+                rev={g.msg.rev}
+                onRetry={handleRetry}
+                // the chord lands in a pty; headless stream input has no
+                // queue-jump, and Codex has no such binding at all
+                onSendNow={
+                  mode === "transcript" && agent !== "Codex" && !readOnly
+                    ? handleSendNow
+                    : undefined
+                }
+              />
             ),
           )}
           {working && last?.kind !== "draft" && (
@@ -1125,6 +1558,10 @@ export default memo(function ChatView({
         </div>
       </div>
       <div className="chat-composer" style={readOnly ? {display:"none"} : undefined}>
+        {/* AskUserQuestion's picker is a menu too; its own card covers it */}
+        {ttyPrompt && !store.messages.some((m) => m.tool?.name === "AskUserQuestion" && !m.tool.done) && (
+          <TtyPromptCard prompt={ttyPrompt} paneId={id} />
+        )}
         {activity.length > 0 && (
           <div className="chat-activity">
             <button
@@ -1152,25 +1589,57 @@ export default memo(function ChatView({
                 className="chat-activity-list"
                 onMouseDown={(ev) => ev.stopPropagation()}
               >
-                {activity.map((a, i) => (
-                  <button
-                    key={`${a.msgKey}-${i}`}
-                    className="chat-activity-item"
-                    title="Jump to its card in the conversation"
-                    onClick={() => revealMsg(a.msgKey)}
-                  >
-                    {a.kind === "agent" ? (
-                      <Robot size={12} />
-                    ) : (
-                      <Terminal size={12} />
-                    )}
-                    <span className="chat-activity-label">{a.label}</span>
-                    {a.detail && a.detail !== a.label && (
-                      <span className="chat-activity-detail">{a.detail}</span>
-                    )}
-                    <CircleNotch size={11} className="chat-activity-spin" />
-                  </button>
-                ))}
+                {activity.map((a, i) => {
+                  const proc = a.kind === "shell" ? processFor(a, shells?.commands) : null;
+                  const busy = stoppingShells[a.msgKey];
+                  return (
+                    <div
+                      key={`${a.msgKey}-${i}`}
+                      role="button"
+                      tabIndex={0}
+                      className="chat-activity-item"
+                      title="Jump to its card in the conversation"
+                      onClick={() => revealMsg(a.msgKey)}
+                    >
+                      {a.kind === "agent" ? (
+                        <Robot size={12} />
+                      ) : (
+                        <Terminal size={12} />
+                      )}
+                      <span className="chat-activity-label">{a.label}</span>
+                      {a.detail && a.detail !== a.label && (
+                        <span className="chat-activity-detail">{a.detail}</span>
+                      )}
+                      {a.kind === "shell" && a.bgId && shells?.onFollow && (
+                        <button
+                          className="chat-activity-act"
+                          title="Follow its live output in the dock"
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            setActivityOpen(false);
+                            shells.onFollow(a.bgId, a.label);
+                          }}
+                        >
+                          <FileText size={11} /> Output
+                        </button>
+                      )}
+                      {proc && shells?.onStop && (
+                        <button
+                          className="chat-activity-act stop"
+                          disabled={!!busy}
+                          title="Stop it: Ctrl+C, then terminate, then kill if it won't go"
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            stopShell(a.msgKey, proc);
+                          }}
+                        >
+                          <Stop size={10} weight="fill" /> {busy ? "Stopping…" : "Stop"}
+                        </button>
+                      )}
+                      <CircleNotch size={11} className="chat-activity-spin" />
+                    </div>
+                  );
+                })}                ))}
               </div>
             )}
           </div>
@@ -1189,6 +1658,16 @@ export default memo(function ChatView({
             if (!ev.currentTarget.contains(ev.relatedTarget)) setDragOver(false);
           }}
         >
+          {(name || folder) && (
+            <div className="chat-identity" title={cwd || undefined}>
+              <span
+                className="chat-identity-dot"
+                style={accentColor ? { background: accentColor } : undefined}
+              />
+              <span className="chat-identity-name">{name ?? agent}</span>
+              {folder && <span className="chat-identity-proj">{folder}</span>}
+            </div>
+          )}
           {cmdQuery != null && cmdMatches.length > 0 && (
             <div className="chat-cmd-menu">
               {cmdMatches.map((c, i) => (
@@ -1207,6 +1686,29 @@ export default memo(function ChatView({
                   <span className="chat-cmd-src">{cmdHint(c)}</span>
                 </button>
               ))}
+            </div>
+          )}
+          {files.length > 0 && (
+            <div className="chat-file-tray">
+              {files.map((f) => (
+                <div key={f.key} className="chat-file-chip" title={f.name}>
+                  <FileText size={13} />
+                  <span className="chat-file-name">{f.name}</span>
+                  <span className="chat-file-size">{formatBytes(f.size)}</span>
+                  <button
+                    className="chat-file-remove"
+                    title="Remove file"
+                    aria-label={`Remove ${f.name}`}
+                    onMouseDown={(ev) => {
+                      ev.preventDefault();
+                      removeFile(f.key);
+                    }}
+                  >
+                    <X size={10} weight="bold" />
+                  </button>
+                </div>
+              ))}
+              {uploading && <span className="chat-file-uploading">Uploading…</span>}
             </div>
           )}
           {images.length > 0 && (
@@ -1230,14 +1732,20 @@ export default memo(function ChatView({
               ))}
             </div>
           )}
+          <div className="chat-input-wrap">
           <textarea
             ref={inputRef}
             rows={1}
+            className={dictation.listening && dictView ? "dictating" : undefined}
+            onScroll={(ev) => {
+              if (dictMirrorRef.current)
+                dictMirrorRef.current.scrollTop = ev.currentTarget.scrollTop;
+            }}
             placeholder={
               placeholder ??
               (mode === "transcript"
-                ? `Message ${agent}…  ( / for commands · paste or drop an image )`
-                : `Message ${agent}…  ( / for commands )`)
+                ? `Message ${who}…  ( / for commands · paste or drop an image )`
+                : `Message ${who}…  ( / for commands )`)
             }
             onPaste={onPaste}
             onKeyDown={(ev) => {
@@ -1245,24 +1753,51 @@ export default memo(function ChatView({
               // Push-to-talk, matching Claude Code's own /voice binding: hold
               // Space on an empty box, since there is nothing to append a
               // space to yet. Once there's text, Space has to stay a space, so
-              // ⌥Space is the escape hatch for dictating mid-sentence.
+              // ⌥Space is the escape hatch for dictating mid-sentence — plus
+              // whatever combo Settings → Hotkeys → Push-to-talk records.
               //
               // Checked before everything else so a held key can't also open
               // the "/" menu or submit, and preventDefault'd because Space
               // would otherwise type (and ⌥Space a non-breaking space).
               // `repeat` fires while held — ignore it and let keyup be the
               // only thing that ends the phrase.
-              if (dictation.available && ev.code === "Space") {
+              if (dictation.available) {
+                const held = dictHoldActive();
                 const bare =
                   !ev.altKey && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey;
                 // trim(), not === "": a box holding only whitespace still has
                 // nothing to append a space to, and treating it as non-empty
                 // is what makes repeated Space presses pile up instead of
-                // starting a phrase.
-                if (ev.altKey || (bare && ev.currentTarget.value.trim() === "")) {
+                // starting a phrase. During a hold the empty-box test is
+                // skipped — partials have already filled the box, and letting
+                // the repeats fall through here is what used to sprinkle
+                // spaces into the phrase as you spoke.
+                const space =
+                  ev.code === "Space" &&
+                  (ev.altKey ||
+                    (bare && (held || ev.currentTarget.value.trim() === "")));
+                const combo =
+                  dictPrefs.key && matchesHotkey(ev, dictPrefs.key);
+                if (space || combo) {
                   ev.preventDefault();
-                  if (!ev.repeat) startDictation(true);
+                  if (!ev.repeat) beginHold();
                   return;
+                }
+                // Another key while a mid-text Space is still deciding means
+                // it was just a space — fast typing rolls onto the next key
+                // before Space comes up.
+                if (dictSoftRef.current != null && !ev.repeat) endHold(false);
+                // A bare Space mid-text types as normal, but holding it
+                // dictates at the caret instead, like the empty-box case.
+                const box = ev.currentTarget;
+                if (
+                  ev.code === "Space" &&
+                  bare &&
+                  !ev.repeat &&
+                  !dictation.listening &&
+                  box.selectionStart === box.selectionEnd
+                ) {
+                  beginHold(box.selectionStart);
                 }
               }
               if (dictation.listening && ev.key === "Escape") {
@@ -1298,24 +1833,22 @@ export default memo(function ChatView({
               if (ev.key === "Escape" && working) stop();
             }}
             onKeyUp={(ev) => {
-              // Releasing either half of the chord ends a held phrase —
-              // letting go of ⌥ first is common and shouldn't strand the mic.
-              if (
-                dictHoldRef.current &&
-                dictation.listening &&
-                (ev.code === "Space" || ev.key === "Alt")
-              ) {
+              // Releasing any piece of the chord ends a held phrase (or,
+              // within the delay window, quietly disarms it) — letting go of
+              // ⌥ first is common and shouldn't strand the mic.
+              if (dictHoldActive() && endsHold(ev)) {
                 ev.preventDefault();
-                dictation.stop();
+                endHold(true);
               }
             }}
             onFocus={() => publishDraft(true)}
             onBlur={() => {
               publishDraft(false);
               // A held chord can't deliver its keyup once focus is gone, so
-              // the mic would stay open forever; drop the phrase. A tapped
-              // session is deliberate and survives clicking away.
-              if (dictHoldRef.current && dictation.listening) dictation.cancel();
+              // the mic would stay open forever; drop the phrase (or a still
+              // pending hold timer). A tapped session is deliberate and
+              // survives clicking away.
+              if (dictHoldActive()) endHold(false);
             }}
             onInput={(ev) => {
               publishDraft();
@@ -1325,16 +1858,30 @@ export default memo(function ChatView({
               syncCmdMenu(el.value);
             }}
           />
+          {dictation.listening && dictView && (
+            <div className="chat-dict-mirror" ref={dictMirrorRef} aria-hidden="true">
+              {dictView.head}
+              <span className="chat-dict-meter" ref={meterRef}>
+                <i /><i /><i /><i /><i />
+              </span>
+              {dictView.tail}
+            </div>
+          )}
+          </div>
           <div className="chat-composer-bar">
             <span
               className={`chat-composer-hint${dictError ? " chat-composer-hint-error" : ""}`}
             >
               {dictError
                 ? dictError
+                : dictation.listening && dictStatus
+                  ? dictStatus
                 : dictation.listening
                   ? touch
                     ? "listening — mic to insert, ✕ to discard"
-                    : "listening — esc to discard"
+                    : dictHoldRef.current
+                      ? "listening — release to insert · esc to discard"
+                      : "listening — esc to discard"
                   : working
                     ? touch
                       ? "working…" // the stop button is right there; naming it just wraps the bar
@@ -1343,13 +1890,14 @@ export default memo(function ChatView({
                       ? "tap send"
                       : "enter to send"}
             </span>
-            {agent !== "Codex" && <div className="chat-model-wrap">
+            <AutoReadToggle />
+            <div className="chat-model-wrap">
               {modelMenuOpen && (
                 <div
                   className="chat-model-menu"
                   onMouseDown={(ev) => ev.stopPropagation()}
                 >
-                  {MODELS.map((m) => (
+                  {modelList.map((m) => (
                     <button
                       key={m.id}
                       className={`chat-model-item${(activeModel ?? "default") === m.id ? " sel" : ""}`}
@@ -1377,31 +1925,31 @@ export default memo(function ChatView({
                 }}
               >
                 <Cpu size={13} />
-                {MODELS.find((m) => m.id === activeModel)?.label ??
+                {modelList.find((m) => m.id === activeModel)?.label ??
                   activeModel ??
                   "Model"}
                 <CaretUp size={8} weight="bold" />
               </button>
-            </div>}
+            </div>
             {allowImages && (
               <>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/*"
+                  accept={allowFiles ? undefined : "image/*"}
                   multiple
                   hidden
                   onChange={(ev) => {
-                    Array.from(ev.target.files ?? []).forEach(addImageFile);
+                    Array.from(ev.target.files ?? []).forEach(addAnyFile);
                     ev.target.value = "";
                   }}
                 />
                 <button
                   className="chat-attach-btn"
-                  title="Attach an image"
+                  title={allowFiles ? "Attach files" : "Attach an image"}
                   onClick={() => fileInputRef.current?.click()}
                 >
-                  <ImageSquare size={14} />
+                  <Paperclip size={14} />
                 </button>
               </>
             )}
@@ -1425,7 +1973,9 @@ export default memo(function ChatView({
                 title={
                   dictation.listening
                     ? "Stop dictating and insert (Esc discards)"
-                    : "Dictate — click to toggle, or hold ⌥Space"
+                    : `Dictate — click to toggle, or hold Space${
+                        dictPrefs.key ? ` or ${formatHotkey(dictPrefs.key)}` : ""
+                      }`
                 }
                 aria-pressed={dictation.listening}
                 // mousedown so the textarea keeps focus, matching the attach
@@ -1456,3 +2006,10 @@ export default memo(function ChatView({
     </div>
   );
 });
+
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}

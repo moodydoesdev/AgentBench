@@ -3,7 +3,7 @@ import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@/lib/ipc";
 import { X, Stop } from "@phosphor-icons/react";
 import ChatView from "./chat/ChatView";
 import { TransportProvider } from "./lib/TransportContext";
@@ -172,6 +172,7 @@ function RemoteChat({ machine, pane, status }) {
       id={pane.id}
       cwd={pane.cwd}
       mode={headless ? "stream" : "transcript"}
+      name={pane.team?.role || pane.title}
       initialLines={lines}
       allowImages
       placeholder={`Message Claude on ${machine.machine ?? machine.name}…`}
@@ -205,7 +206,9 @@ export default function RemotePane({ machine, pane, status, termTheme, defaultVi
   const [view, setView] = useState(isChat ? "chat" : showToggle ? defaultView : "term");
   const chatVisible = isChat || (showToggle && view === "chat");
   const name =
-    pane.title || (isRun ? pane.harness?.slice(4) || "run" : `${pane.harness ?? "agent"} ${pane.id}`);
+    pane.team?.role ||
+    pane.title ||
+    (isRun ? pane.harness?.slice(4) || "run" : `${pane.harness ?? "agent"} ${pane.id}`);
 
   return (
     <TransportProvider transport={machine.transport}>

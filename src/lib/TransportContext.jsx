@@ -1,5 +1,6 @@
 import { createContext, useContext } from "react";
 import { tauriTransport } from "./transport";
+import { getWebTransport, isTauri } from "./ipc";
 
 /**
  * Which backend the chat components talk to. Unset means the desktop app, so
@@ -23,5 +24,10 @@ export function TransportProvider({ transport, children }) {
 }
 
 export function useTransport() {
-  return useContext(TransportContext) ?? desktopTransport();
+  const fromContext = useContext(TransportContext);
+  if (fromContext) return fromContext;
+  // Browser without a provider in scope: the socket WebGate installed after
+  // login is the only backend there is.
+  if (!isTauri) return getWebTransport() ?? desktopTransport();
+  return desktopTransport();
 }

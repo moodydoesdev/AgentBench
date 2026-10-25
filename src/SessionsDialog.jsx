@@ -4,7 +4,7 @@
 // for the browse list, search_sessions for the ripgrep-style content search
 // (case-insensitive substring over what was actually said, not raw JSON).
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/ipc";
 import {
   X,
   ClockCounterClockwise,

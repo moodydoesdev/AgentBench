@@ -3,9 +3,11 @@
 //! app restarts; the Tauri backend is just a client.
 
 pub mod schedules;
+mod decisions;
 
 mod codex;
 pub mod resources;
+mod ttyprompt;
 
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -19,6 +21,33 @@ use std::time::Instant;
 
 pub const IDENTIFIER: &str = "com.connor.agentbench";
 const SCROLLBACK_CAP: usize = 512 * 1024;
+
+/// Claude Code's per-session markers. Claude sets these for everything it
+/// launches; a process that inherits them reads as a *child* of that session.
+/// Claude then turns transcript saving off ("inherited
+/// CLAUDE_CODE_CHILD_SESSION marker"). So a broker started from inside an
+/// agent's shell (a restart typed by an agent) handed the marker to every
+/// pane after it: no transcripts, frozen chat views, nothing to resume.
+pub const CLAUDE_SESSION_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+];
+
+/// Drop [`CLAUDE_SESSION_ENV`] from this process. Call first thing in a
+/// daemon's `main`, before any thread exists.
+pub fn scrub_claude_env() {
+    for k in CLAUDE_SESSION_ENV {
+        std::env::remove_var(k);
+    }
+}
 
 pub fn config_dir() -> PathBuf {
     // dirs reads XDG_CONFIG_HOME then HOME; a systemd unit with neither set
@@ -49,6 +78,10 @@ pub struct Core {
     /// pane opened right after must never inherit that conversation.
     pub claimed: Mutex<HashSet<String>>,
     pub colors: Mutex<HashMap<u32, String>>,
+    /// Latest context-size snapshot per pane, read from the transcript tail
+    /// alongside colors: { context, input, cache_read, cache_create, output,
+    /// model } — context is the prompt side of the last main-chain turn.
+    pub usage: Mutex<HashMap<u32, Value>>,
     /// Per-pane timestamps of the last Stop hook and the last real user
     /// keystroke. If no input followed the last "done", a needs_input event
     /// can only be the idle ping — not an actual prompt — so it's squelched.
@@ -71,6 +104,9 @@ pub struct Core {
     /// launching shell or the TUI's terminal-mode setup. Clients that type
     /// (the phone's composer) hold their sends until the pane appears here.
     pub ready: Mutex<HashSet<u32>>,
+    /// Terminal-only selection dialogs (trust folder, computer-use access…)
+    /// currently on a pane's screen, as surfaced by `ttyprompt`.
+    pub tty_prompts: Mutex<HashMap<u32, Value>>,
     pub config_dir: PathBuf,
     pub home_dir: PathBuf,
 }
@@ -97,6 +133,8 @@ pub struct Pane {
     harness: String,
     team: Option<TeamSeat>,
     buffer: Arc<Mutex<Vec<u8>>>,
+    /// Screen model the tty-prompt detector reads; kept here for resizes.
+    screen: Arc<Mutex<ttyprompt::Screen>>,
     /// When the harness was spawned — lets the transcript watcher adopt a
     /// session by file mtime when the hooks never deliver a session id
     /// (observed on Windows).
@@ -125,6 +163,18 @@ pub struct TeamSeat {
     pub team_id: String,
     pub team: String,
     pub role: String,
+    /// Machine-unique session name (role qualified by project) for --name;
+    /// panes saved before it existed fall back to the bare role.
+    #[serde(default)]
+    pub session_name: Option<String>,
+    /// The team's manager seat — may drive /clear · /compact on itself or a
+    /// teammate via the hook server's `command` endpoint.
+    #[serde(default)]
+    pub manager: bool,
+    /// Non-manager seat of a managed team: kept out of the user's inbox and
+    /// notifications by the frontend.
+    #[serde(default)]
+    pub muted: bool,
     #[serde(default)]
     pub model: Option<String>,
     /// Full system-prompt addition (team roster + the role's instructions).
@@ -201,6 +251,7 @@ impl Core {
             sessions: Mutex::new(HashMap::new()),
             claimed: Mutex::new(HashSet::new()),
             colors: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
             last_done: Mutex::new(HashMap::new()),
             last_input: Mutex::new(HashMap::new()),
             saved: Mutex::new(load_saved(&config_dir)),
@@ -210,6 +261,7 @@ impl Core {
             schedules: Mutex::new(Vec::new()),
             runs: Mutex::new(Vec::new()),
             ready: Mutex::new(HashSet::new()),
+            tty_prompts: Mutex::new(HashMap::new()),
             config_dir,
             home_dir: dirs::home_dir()
                 .expect("cannot locate a home directory — set HOME (systemd: Environment=HOME=/home/you)"),
@@ -297,6 +349,22 @@ fn persist_panes(core: &Core) {
         .collect();
     let path = core.config_dir.join("panes.json");
     let _ = std::fs::write(path, serde_json::to_string_pretty(&entries).unwrap());
+}
+
+/// Expand a leading `~` to the home directory. Web/phone clients type project
+/// paths by hand; a literal `~/…` cwd makes the pty spawn somewhere else and
+/// puts the session's transcripts under the wrong project slug, so the chat
+/// view and resume never find them.
+pub fn expand_home(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home
+                .join(path.trim_start_matches('~').trim_start_matches('/'))
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    path.to_string()
 }
 
 /// Claude Code's project-dir slug: cwd with every non-alphanumeric char
@@ -606,14 +674,33 @@ fn harness_command(
     // Team values reach the command line as env var references, never
     // spliced text — role names and instructions can hold any character.
     let mut team_env: Vec<(&str, &str)> = Vec::new();
+    // One Claude Code task list per team (~/.claude/tasks/<id>/), so every
+    // member's TaskCreate/TaskUpdate lands on the same board — which is
+    // what the team sidebar reads to show who is on what, and how far along.
+    // Keep in sync with taskListId() in src/teams/teams.js.
+    let task_list = spec.team.as_ref().map(|seat| format!("agentbench-{}", seat.team_id));
     if let Some(seat) = &spec.team {
         let var = |name: &str| env_ref(&shell, name);
         let model = seat.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         let prompt = seat.prompt.as_deref().filter(|p| !p.trim().is_empty());
+        let session_name = seat
+            .session_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&seat.role);
         team_env.push(("AGENTBENCH_TEAM", &seat.team));
         team_env.push(("AGENTBENCH_TEAM_ROLE", &seat.role));
+        if let Some(list) = &task_list {
+            team_env.push(("CLAUDE_CODE_TASK_LIST_ID", list));
+            // Claude Code only exposes TaskCreate/TaskUpdate/TaskList to
+            // older models unless this is set; without it the agents have no
+            // way to write the list the team sidebar reads.
+            team_env.push(("CLAUDE_CODE_ENABLE_TODO_TOOLS", "true"));
+        }
+        team_env.push(("AGENTBENCH_TEAM_NAME", session_name));
         if spec.claude {
-            line.push_str(&format!(" --name {}", var("AGENTBENCH_TEAM_ROLE")));
+            line.push_str(&format!(" --name {}", var("AGENTBENCH_TEAM_NAME")));
             if let Some(m) = model {
                 team_env.push(("AGENTBENCH_TEAM_MODEL", m));
                 line.push_str(&format!(" --model {}", var("AGENTBENCH_TEAM_MODEL")));
@@ -685,6 +772,11 @@ fn harness_command(
     }
     // let agents (and their skills) reach the hook server, e.g. to publish
     // visual plans: POST /event/{pane_id}/plan
+    // belt and braces with scrub_claude_env: a pane must never inherit a
+    // Claude session's child marker (it switches transcripts off)
+    for k in CLAUDE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
     cmd.env("AGENTBENCH_PANE_ID", pane_id.to_string());
     cmd.env("AGENTBENCH_HOOK_PORT", hook_port.to_string());
     cmd
@@ -700,6 +792,7 @@ pub fn create_pane(
     harness: Option<HarnessSpec>,
     shell: Option<String>,
 ) -> Result<u32, String> {
+    let cwd = expand_home(&cwd);
     let spec = harness.unwrap_or_else(HarnessSpec::claude_default);
     let id = core.next_id.fetch_add(1, Ordering::SeqCst);
     let port = core.hook_port.load(Ordering::SeqCst) as u16;
@@ -765,10 +858,55 @@ pub fn create_pane(
         });
     }
 
+    // Terminal-only dialogs -> chat view. The reader feeds the screen model;
+    // a slow ticker reads it, so a burst of redraw chunks costs one scan and a
+    // half-drawn frame never flickers the card away (absence must hold for
+    // two ticks before the prompt is cleared).
+    let screen = Arc::new(Mutex::new(ttyprompt::Screen::new(cols, rows)));
+    let screen_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    if spec.id != "terminal" {
+        let (core, screen, dirty, alive) = (core.clone(), screen.clone(), screen_dirty.clone(), alive.clone());
+        std::thread::spawn(move || {
+            let mut misses = 0;
+            while alive.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if !dirty.swap(false, Ordering::SeqCst) && misses == 0 {
+                    continue;
+                }
+                let found = ttyprompt::detect(&screen.lock().unwrap());
+                let mut prompts = core.tty_prompts.lock().unwrap();
+                match found {
+                    Some(p) => {
+                        misses = 0;
+                        if prompts.get(&id) != Some(&p) {
+                            let fresh = prompts.get(&id).is_none_or(|old| old["sig"] != p["sig"]);
+                            prompts.insert(id, p.clone());
+                            drop(prompts);
+                            core.broadcast(&json!({ "ev": "tty-prompt", "id": id, "prompt": p, "fresh": fresh }));
+                        }
+                    }
+                    None if prompts.contains_key(&id) => {
+                        misses += 1;
+                        if misses >= 2 {
+                            misses = 0;
+                            prompts.remove(&id);
+                            drop(prompts);
+                            core.broadcast(&json!({ "ev": "tty-prompt", "id": id, "prompt": null }));
+                        }
+                    }
+                    None => misses = 0,
+                }
+            }
+        });
+    }
+
     // pty output -> subscribers (base64 so split UTF-8 survives the trip)
     let out_core = core.clone();
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let out_buffer = buffer.clone();
+    let out_screen = screen.clone();
+    let out_dirty = screen_dirty.clone();
     std::thread::spawn(move || {
         // Claude's TUI enables bracketed paste (ESC [ ? 2004 h) when its input
         // box comes up — the earliest observable "typing now lands" moment,
@@ -792,6 +930,8 @@ pub fn create_pane(
                             b.drain(..excess);
                         }
                     }
+                    out_screen.lock().unwrap().feed(&buf[..n]);
+                    out_dirty.store(true, Ordering::SeqCst);
                     if !ready_seen {
                         // another signal (hook, grace timer) may have beaten
                         // the sniff — stop scanning once anything marked it
@@ -824,6 +964,8 @@ pub fn create_pane(
     let exit_core = core.clone();
     std::thread::spawn(move || {
         let code = child.wait().ok().map(|s| s.exit_code());
+        alive.store(false, Ordering::SeqCst);
+        exit_core.tty_prompts.lock().unwrap().remove(&id);
         exit_core.panes.lock().unwrap().remove(&id);
         resources::exited(&exit_core, id);
         exit_core.sessions.lock().unwrap().remove(&id);
@@ -844,6 +986,7 @@ pub fn create_pane(
             harness: spec.id,
             team: spec.team,
             buffer,
+            screen,
             spawned: std::time::SystemTime::now(),
         },
     );
@@ -887,6 +1030,7 @@ pub fn write_pane(core: &Core, id: u32, data: &str) -> Result<(), String> {
 pub fn resize_pane(core: &Core, id: u32, cols: u16, rows: u16) -> Result<(), String> {
     let panes = core.panes.lock().unwrap();
     let pane = panes.get(&id).ok_or("no such pane")?;
+    pane.screen.lock().unwrap().resize(cols, rows);
     pane.master
         .resize(PtySize {
             rows,
@@ -895,6 +1039,32 @@ pub fn resize_pane(core: &Core, id: u32, cols: u16, rows: u16) -> Result<(), Str
             pixel_height: 0,
         })
         .map_err(|e| e.to_string())
+}
+
+/// Pick option `index` of the terminal dialog on screen. The broker drives
+/// the keys itself, from the pointer position it last saw, so a client never
+/// has to guess where someone at the desk left the selection. Refused when
+/// the dialog on screen is no longer the one the client was looking at.
+fn answer_tty_prompt(core: &Arc<Core>, id: u32, sig: &str, index: usize) -> Result<(), String> {
+    let (from, count) = {
+        let prompts = core.tty_prompts.lock().unwrap();
+        let p = prompts.get(&id).ok_or("That prompt was already answered")?;
+        if p["sig"] != sig {
+            return Err("The prompt changed — check the latest one".into());
+        }
+        (
+            p["selected"].as_u64().unwrap_or(0) as usize,
+            p["options"].as_array().map_or(0, Vec::len),
+        )
+    };
+    if index >= count {
+        return Err("No such option".into());
+    }
+    for key in ttyprompt::answer_keys(from, index) {
+        write_pane(core, id, key)?;
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+    Ok(())
 }
 
 pub fn kill_pane(core: &Core, id: u32) {
@@ -926,6 +1096,7 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
     let panes = core.panes.lock().unwrap();
     let chat_panes = core.chat_panes.lock().unwrap();
     let colors = core.colors.lock().unwrap();
+    let usages = core.usage.lock().unwrap();
     let sessions = core.sessions.lock().unwrap();
     let ready = core.ready.lock().unwrap();
     let mut out: Vec<_> = panes
@@ -938,6 +1109,7 @@ pub fn list_panes(core: &Core) -> Vec<Value> {
                 "harness": p.harness,
                 "team": p.team,
                 "color": colors.get(id),
+                "usage": usages.get(id),
                 // Newest known session id. Clients that cannot see a terminal
                 // (the mobile app) use it to name a pane from its transcript
                 // instead of showing "claude 17".
@@ -978,17 +1150,27 @@ pub fn saved_panes(core: &Core) -> Vec<SavedPane> {
     ).collect()
 }
 
-/// `/color` appends {"type":"agent-color","agentColor":"red"} lines to the
-/// session transcript; poll each pane's transcript tail for the latest.
-fn read_agent_color(core: &Core, cwd: &str, sid: &str) -> Option<String> {
+/// One pass over a transcript tail for everything the 2s watcher wants:
+/// the latest `/color` choice ({"type":"agent-color","agentColor":"red"}
+/// lines) and the newest main-chain assistant turn's token usage. Sidechain
+/// (sub-agent) records are skipped — their usage is the sub-agent's context,
+/// not this pane's — as are synthetic/error records with empty usage.
+fn read_transcript_tail(
+    core: &Core,
+    cwd: &str,
+    sid: &str,
+) -> Option<(Option<String>, Option<Value>)> {
     use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(transcript_path(core, cwd, sid)).ok()?;
     let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(64 * 1024))).ok()?;
+    // 256KB: one oversized tool_result in a user record can push the last
+    // assistant line well past a smaller window, silently freezing the badge
+    f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).ok()?;
     let mut raw = Vec::new();
     f.read_to_end(&mut raw).ok()?;
     let text = String::from_utf8_lossy(&raw);
     let mut color = None;
+    let mut usage = None;
     for line in text.lines() {
         if line.contains("\"agent-color\"") {
             if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -996,35 +1178,95 @@ fn read_agent_color(core: &Core, cwd: &str, sid: &str) -> Option<String> {
                     color = Some(c.to_string());
                 }
             }
+        } else if line.contains("\"usage\"") {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            if v["type"] != "assistant" || v["isSidechain"] == true {
+                continue;
+            }
+            let msg = &v["message"];
+            let model = msg["model"].as_str().unwrap_or_default();
+            if model.is_empty() || model == "<synthetic>" {
+                continue;
+            }
+            let u = &msg["usage"];
+            let n = |k: &str| u[k].as_u64().unwrap_or(0);
+            let context =
+                n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+            if context == 0 {
+                continue;
+            }
+            usage = Some(json!({
+                "context": context,
+                "input": n("input_tokens"),
+                "cache_read": n("cache_read_input_tokens"),
+                "cache_create": n("cache_creation_input_tokens"),
+                "output": n("output_tokens"),
+                "model": model,
+            }));
         }
     }
-    color
+    Some((color, usage))
 }
 
 fn start_color_watcher(core: Arc<Core>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let entries: Vec<(u32, String, Vec<String>)> = {
-            let panes = core.panes.lock().unwrap();
-            let sessions = core.sessions.lock().unwrap();
-            panes
-                .iter()
-                .filter_map(|(id, p)| sessions.get(id).map(|h| (*id, p.cwd.clone(), h.clone())))
-                .collect()
-        };
-        for (id, cwd, hist) in entries {
-            let Some(sid) = hist.iter().find(|sid| session_exists(&core, &cwd, sid)) else {
-                continue;
+    std::thread::spawn(move || {
+        // pane id -> (sid, file len) at the last parse; an unchanged file has
+        // nothing new, so each quiet pane costs one stat per tick
+        let mut seen: HashMap<u32, (String, u64)> = HashMap::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let entries: Vec<(u32, String, Vec<String>)> = {
+                let panes = core.panes.lock().unwrap();
+                let sessions = core.sessions.lock().unwrap();
+                panes
+                    .iter()
+                    .filter_map(|(id, p)| sessions.get(id).map(|h| (*id, p.cwd.clone(), h.clone())))
+                    .collect()
             };
-            if let Some(color) = read_agent_color(&core, &cwd, sid) {
-                let changed = {
-                    let mut colors = core.colors.lock().unwrap();
-                    let changed = colors.get(&id) != Some(&color);
-                    colors.insert(id, color.clone());
-                    changed
+            seen.retain(|id, _| entries.iter().any(|(e, _, _)| e == id));
+            for (id, cwd, hist) in entries {
+                let Some(sid) = hist.iter().find(|sid| session_exists(&core, &cwd, sid)) else {
+                    continue;
                 };
-                if changed {
-                    core.broadcast(&json!({ "ev": "pane-color", "id": id, "color": color }));
+                let len = std::fs::metadata(transcript_path(&core, &cwd, sid))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if seen.get(&id) == Some(&(sid.clone(), len)) {
+                    continue;
+                }
+                let sid_changed = seen.get(&id).is_some_and(|(s, _)| s != sid);
+                let Some((color, usage)) = read_transcript_tail(&core, &cwd, sid) else {
+                    continue;
+                };
+                seen.insert(id, (sid.clone(), len));
+                if let Some(color) = color {
+                    let changed = {
+                        let mut colors = core.colors.lock().unwrap();
+                        let changed = colors.get(&id) != Some(&color);
+                        colors.insert(id, color.clone());
+                        changed
+                    };
+                    if changed {
+                        core.broadcast(&json!({ "ev": "pane-color", "id": id, "color": color }));
+                    }
+                }
+                if let Some(usage) = usage {
+                    let changed = {
+                        let mut usages = core.usage.lock().unwrap();
+                        let changed = usages.get(&id) != Some(&usage);
+                        usages.insert(id, usage.clone());
+                        changed
+                    };
+                    if changed {
+                        core.broadcast(&json!({ "ev": "pane-usage", "id": id, "usage": usage }));
+                    }
+                } else if sid_changed {
+                    // a fresh session (/clear, resume fork) with no assistant
+                    // turn yet: the old count is another conversation's — drop
+                    // it rather than show it against the empty window
+                    if core.usage.lock().unwrap().remove(&id).is_some() {
+                        core.broadcast(&json!({ "ev": "pane-usage", "id": id, "usage": Value::Null }));
+                    }
                 }
             }
         }
@@ -1262,6 +1504,7 @@ pub fn create_chat_pane(
     resume: Option<String>,
     shell_pref: Option<&str>,
 ) -> Result<u32, String> {
+    let cwd = expand_home(&cwd);
     let id = core.next_id.fetch_add(1, Ordering::SeqCst);
     let port = core.hook_port.load(Ordering::SeqCst) as u16;
     let mut line = "claude -p --input-format stream-json --output-format stream-json \
@@ -1288,6 +1531,9 @@ pub fn create_chat_pane(
     {
         cmd = std::process::Command::new(shell);
         cmd.arg("-lc").arg(format!("exec {line}"));
+    }
+    for k in CLAUDE_SESSION_ENV {
+        cmd.env_remove(k);
     }
     #[cfg(windows)]
     {
@@ -1490,6 +1736,38 @@ fn write_chat_pane(core: &Core, id: u32, text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Spoken-readout instructions, shaped by the i-have-adhd rules: the win,
+/// where things stand, the one next action — short enough to hear in a few
+/// seconds. The chat view pulls the `<spoken>` line out and reads it aloud.
+const READOUT_PROMPT: &str = "AgentBench reads your replies aloud to the user with a local voice. \
+End the final message of every turn with exactly one spoken readout line:\n\
+<spoken>...</spoken>\n\
+The user has ADHD; shape the readout for listening:\n\
+- 25 words or fewer, plain speech. No markdown, code, file paths, hashes, URLs or symbols; say numbers naturally.\n\
+- Order: the concrete win or outcome first (\"Login works now\"), then where things stand if the work has steps (\"step 3 of 5\"), then the one next action for the user, or \"nothing needed from you\".\n\
+- Failures are matter-of-fact: what broke and what happens next. No \"uh oh\", no filler, no pleasantries.\n\
+- Only on the turn's final message, never mid-turn. Don't mention the readout or the voice.";
+
+/// SessionStart context for a pane: the readout instructions when spoken
+/// readouts are on (`<config>/speech.json`). A managed team's developer seats
+/// report to their manager, not the user, so only the manager speaks.
+fn readout_context(core: &Core, id: u32) -> Option<String> {
+    let prefs: Value = std::fs::read_to_string(core.config_dir.join("speech.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())?;
+    if prefs["readouts"].as_bool() != Some(true) {
+        return None;
+    }
+    let muted = core
+        .panes
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|p| p.team.as_ref())
+        .is_some_and(|t| t.muted && !t.manager);
+    (!muted).then(|| READOUT_PROMPT.to_string())
+}
+
 /// Local sink for Claude Code hook events: POST /event/{pane_id}/{kind}
 fn start_hook_server(core: Arc<Core>) -> u16 {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("bind hook server");
@@ -1504,6 +1782,9 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             let parts: Vec<&str> = url.trim_matches('/').split('/').collect();
+            // what the hook's curl prints back — SessionStart output becomes
+            // context for the session (spoken-readout instructions)
+            let mut reply: Option<String> = None;
             if parts.len() == 3 && parts[0] == "event" {
                 if let (Ok(id), kind) = (parts[1].parse::<u32>(), parts[2]) {
                     let resource_payload = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
@@ -1521,6 +1802,74 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                     // hook implies a turn is flowing, i.e. input works.
                     if kind != "session" && core.panes.lock().unwrap().contains_key(&id) {
                         mark_pane_ready(&core, id);
+                    }
+                    if kind == "session" {
+                        reply = readout_context(&core, id);
+                    }
+                    // Team decisions: a manager files a question for the
+                    // user once (`decision`), drops it (`decision-withdraw`),
+                    // or reads back what's open/settled (`decisions`). The
+                    // curl prints the reply, so it is plain text for the agent.
+                    if matches!(kind, "decision" | "decision-withdraw" | "decisions") {
+                        let v = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+                        let out = match kind {
+                            "decision" => decisions::file(&core, id, &v),
+                            "decision-withdraw" => decisions::withdraw(&core, id, &v),
+                            _ => decisions::list_for(&core, id),
+                        };
+                        let (status, text) = match out {
+                            Ok(t) => (200, t),
+                            Err((code, e)) => (code, format!("{e}\n")),
+                        };
+                        let _ = req.respond(tiny_http::Response::from_string(text).with_status_code(status));
+                        continue;
+                    }
+                    // A team manager housekeeping context: type the slash
+                    // command into its own pty, or — with "target" — into a
+                    // teammate's. Whitelisted commands only, only from panes
+                    // launched as a manager seat, only within its own team.
+                    if kind == "command" {
+                        let v = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+                        let cmd = v["command"].as_str().unwrap_or_default().to_string();
+                        let allowed = {
+                            let panes = core.panes.lock().unwrap();
+                            let seat = |pid: u32| panes.get(&pid).and_then(|p| p.team.clone());
+                            match seat(id) {
+                                // target: teammate's pane id, or the session
+                                // name / role the manager knows them by
+                                Some(me) if me.manager => match &v["target"] {
+                                    Value::Null => Some(id),
+                                    Value::Number(n) => n
+                                        .as_u64()
+                                        .map(|t| t as u32)
+                                        .filter(|&t| seat(t).is_some_and(|s| s.team_id == me.team_id)),
+                                    Value::String(name) => panes
+                                        .iter()
+                                        .find(|(_, p)| {
+                                            p.team.as_ref().is_some_and(|s| {
+                                                s.team_id == me.team_id
+                                                    && (s.session_name.as_deref() == Some(name.as_str())
+                                                        || s.role == *name)
+                                            })
+                                        })
+                                        .map(|(&pid, _)| pid),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        };
+                        let status = if !matches!(cmd.as_str(), "/clear" | "/compact") {
+                            400
+                        } else if allowed.is_none() {
+                            403
+                        } else {
+                            // same paste-then-Enter dance as the frontend's
+                            // pasteAndSubmit
+                            let _ = decisions::type_line(&core, allowed.unwrap(), &cmd);
+                            200
+                        };
+                        let _ = req.respond(tiny_http::Response::empty(status));
+                        continue;
                     }
                     // agent published (or updated) a visual plan: forward the
                     // file path to the frontend so it opens a plan pane
@@ -1622,7 +1971,10 @@ fn start_hook_server(core: Arc<Core>) -> u16 {
                     }
                 }
             }
-            let _ = req.respond(tiny_http::Response::empty(200));
+            let _ = match reply {
+                Some(text) => req.respond(tiny_http::Response::from_string(text)),
+                None => req.respond(tiny_http::Response::empty(200)),
+            };
         }
     });
     port
@@ -1728,12 +2080,29 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
         Some("saved") => Some(json!({ "result": saved_panes(core) })),
         Some("ping") => Some(json!({ "result": "pong" })),
         Some("resources") => Some(json!({ "result": resources::snapshot(core) })),
+        Some("tty-prompt") => {
+            let id = req["id"].as_u64().unwrap_or(0) as u32;
+            Some(json!({ "result": core.tty_prompts.lock().unwrap().get(&id).cloned() }))
+        }
+        Some("answer-tty-prompt") => Some(match answer_tty_prompt(
+            core,
+            req["id"].as_u64().unwrap_or(0) as u32,
+            req["sig"].as_str().unwrap_or_default(),
+            req["index"].as_u64().unwrap_or(0) as usize,
+        ) {
+            Ok(()) => json!({ "result": null }),
+            Err(e) => json!({ "error": e }),
+        }),
         Some("resource-policy") => Some(match serde_json::from_value::<resources::Policy>(req["policy"].clone())
             .map_err(|e| e.to_string()).and_then(|p| resources::set_policy(core, p)) {
                 Ok(()) => json!({"result":null}), Err(e) => json!({"error":e}),
             }),
         Some("resource-draft") => Some(match resources::draft(core,req["id"].as_u64().unwrap_or(0) as u32,req["owner"].as_str().unwrap_or("unknown"),req["present"].as_bool().unwrap_or(false)) {
             Ok(()) => json!({"result":null}), Err(e) => json!({"error":e}),
+        }),
+        Some("stop-command") => Some(match resources::stop_command(core,req["id"].as_u64().unwrap_or(0) as u32,req["pid"].as_u64().unwrap_or(0) as u32,req["start"].as_u64().unwrap_or(0)) {
+            Ok(()) => json!({"result": true}),
+            Err(e) => json!({"error": e}),
         }),
         Some("resource-pin") => Some(match resources::pin(core,req["id"].as_u64().unwrap_or(0) as u32,req["pinned"].as_bool().unwrap_or(false)) {
             Ok(()) => json!({"result":null}), Err(e) => json!({"error":e}),
@@ -1743,6 +2112,11 @@ pub fn handle_request(core: &Arc<Core>, req: &Value) -> Option<Value> {
         }),
         Some("resume-hibernated") => Some(match resources::resume(core,req["id"].as_u64().unwrap_or(0) as u32) {
             Ok(v) => json!({"result":v}), Err(e) => json!({"error":e}),
+        }),
+        Some("decisions") => Some(json!({ "result": decisions::state_json(core) })),
+        Some("decision-answer") => Some(match decisions::answer_op(core, req) {
+            Ok(v) => json!({ "result": v }),
+            Err(e) => json!({ "error": e }),
         }),
         Some("schedules") => Some(json!({ "result": schedules::state_json(core) })),
         Some("schedule-save") => Some(match schedules::save_op(core, req) {
@@ -1792,6 +2166,9 @@ mod team_launch_tests {
             team_id: "t1".into(),
             team: "Hexa".into(),
             role: "Dev 'one' $(x)".into(),
+            session_name: Some("Dev 'one' $(x) (proj)".into()),
+            manager: false,
+            muted: false,
             model: model.map(String::from),
             prompt: Some("Line one\n\"quoted\" `tick`".into()),
         }
@@ -1809,12 +2186,26 @@ mod team_launch_tests {
         spec.team = Some(seat(Some("opus")));
         let (line, cmd) = line_and_env(&spec);
         assert!(line.ends_with(
-            " --name \"$AGENTBENCH_TEAM_ROLE\" --model \"$AGENTBENCH_TEAM_MODEL\" --append-system-prompt \"$AGENTBENCH_TEAM_PROMPT\""
+            " --name \"$AGENTBENCH_TEAM_NAME\" --model \"$AGENTBENCH_TEAM_MODEL\" --append-system-prompt \"$AGENTBENCH_TEAM_PROMPT\""
         ), "{line}");
         assert!(!line.contains("Dev 'one'"));
         assert_eq!(cmd.get_env("AGENTBENCH_TEAM_ROLE").unwrap(), "Dev 'one' $(x)");
+        assert_eq!(cmd.get_env("AGENTBENCH_TEAM_NAME").unwrap(), "Dev 'one' $(x) (proj)");
         assert_eq!(cmd.get_env("AGENTBENCH_TEAM_MODEL").unwrap(), "opus");
+        assert_eq!(cmd.get_env("CLAUDE_CODE_TASK_LIST_ID").unwrap(), "agentbench-t1");
+        assert_eq!(cmd.get_env("CLAUDE_CODE_ENABLE_TODO_TOOLS").unwrap(), "true");
         assert_eq!(cmd.get_env("AGENTBENCH_TEAM").unwrap(), "Hexa");
+    }
+
+    #[test]
+    fn seat_without_session_name_falls_back_to_role() {
+        let mut spec = HarnessSpec::claude_default();
+        let mut s = seat(None);
+        s.session_name = None;
+        spec.team = Some(s);
+        let (line, cmd) = line_and_env(&spec);
+        assert!(line.contains(" --name \"$AGENTBENCH_TEAM_NAME\""), "{line}");
+        assert_eq!(cmd.get_env("AGENTBENCH_TEAM_NAME").unwrap(), "Dev 'one' $(x)");
     }
 
     #[test]

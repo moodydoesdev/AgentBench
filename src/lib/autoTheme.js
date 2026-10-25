@@ -2,7 +2,7 @@
 // image, find its dominant hue, and build a dark palette tinted with it.
 // Bytes come through a Rust command because drawing asset:// images onto a
 // canvas can taint it and block getImageData.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/ipc";
 
 const MIME = {
   png: "image/png",

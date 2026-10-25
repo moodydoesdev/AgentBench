@@ -1,7 +1,14 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
+import { invoke, isTauri } from "@/lib/ipc";
 import { getVersion } from "@tauri-apps/api/app";
-import { emit, listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@/lib/ipc";
+import {
+  loadSpeechPrefs,
+  onSpeaking,
+  playUrl,
+  saveSpeechPrefs,
+  speak,
+} from "./lib/speech";
 import { applyUiScale } from "./lib/uiScale";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -9,6 +16,9 @@ import {
   BellSimple,
   DeviceMobile,
   Keyboard,
+  Play,
+  SpeakerHigh,
+  Stop as StopIcon,
   Laptop,
   PaintBrushBroad,
   Robot,
@@ -80,7 +90,7 @@ const NAV_MOD_SYMBOL = { ctrl: "⌃", alt: "⌥", meta: "⌘" };
 
 // Click to arm, then the next modifier+key combo becomes the hotkey.
 // Escape cancels; bare keys are ignored so recording can't eat typing.
-function HotkeyRecorder({ value, onChange }) {
+function HotkeyRecorder({ value, placeholder, onChange }) {
   const [recording, setRecording] = useState(false);
 
   useEffect(() => {
@@ -107,7 +117,13 @@ function HotkeyRecorder({ value, onChange }) {
       className={`hotkey-recorder ${recording ? "recording" : ""}`}
       onClick={() => setRecording((r) => !r)}
     >
-      {recording ? "Press keys…" : <kbd>{formatHotkey(value)}</kbd>}
+      {recording ? (
+        "Press keys…"
+      ) : value ? (
+        <kbd>{formatHotkey(value)}</kbd>
+      ) : (
+        (placeholder ?? "Set…")
+      )}
     </button>
   );
 }
@@ -191,14 +207,23 @@ function MobileAccess() {
   const [pairing, setPairing] = useState(null); // { qr, code, url, expiresAt }
   const [error, setError] = useState(null);
   const [chosenUrl, setChosenUrl] = useState("");
+  const [tun, setTun] = useState(null); // tunnel_status payload
+  const [tunBusy, setTunBusy] = useState(false);
+  const [tunError, setTunError] = useState(null);
+  const [tunnelName, setTunnelName] = useState("");
+  const [pw, setPw] = useState("");
+  const [pwMsg, setPwMsg] = useState(null);
 
   const refresh = () =>
-    invoke("gateway_status")
-      .then((s) => {
-        setStatus(s);
-        if (!chosenUrl && s?.urls?.length) setChosenUrl(s.urls[0].url);
-      })
-      .catch(() => setStatus({ running: false }));
+    Promise.allSettled([
+      invoke("gateway_status"),
+      invoke("tunnel_status"),
+    ]).then(([gs, ts]) => {
+      const s = gs.status === "fulfilled" ? gs.value : { running: false };
+      setStatus(s);
+      if (ts.status === "fulfilled") setTun(ts.value);
+      if (!chosenUrl && s?.urls?.length) setChosenUrl(s.urls[0].url);
+    });
 
   useEffect(() => {
     refresh();
@@ -208,9 +233,74 @@ function MobileAccess() {
   }, []);
 
   const running = status?.running === true;
-  const urls = status?.urls ?? [];
+  // A live tunnel is the best address there is — it works from anywhere and
+  // carries Cloudflare's TLS — so it leads the QR candidates.
+  const urls = [
+    ...(tun?.running && tun?.url ? [{ url: tun.url, kind: "tunnel" }] : []),
+    ...(status?.urls ?? []),
+  ];
   const devices = status?.devices ?? [];
   const tailscale = urls.find((u) => u.kind === "tailscale");
+
+  const toggleWebUi = async () => {
+    try {
+      await invoke("gateway_webui", { enabled: !(status?.webUi === true) });
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const savePassword = async () => {
+    setPwMsg(null);
+    try {
+      await invoke("gateway_set_password", { password: pw });
+      setPw("");
+      setPwMsg("Saved.");
+      await refresh();
+    } catch (err) {
+      setPwMsg(String(err));
+    }
+  };
+
+  const clearPassword = async () => {
+    try {
+      await invoke("gateway_clear_password");
+      setPwMsg("Removed — password login is off.");
+      await refresh();
+    } catch (err) {
+      setPwMsg(String(err));
+    }
+  };
+
+  const startTunnel = async () => {
+    setTunBusy(true);
+    setTunError(null);
+    try {
+      const named = tunnelName.trim();
+      const s = await invoke("tunnel_start", {
+        mode: named ? "named" : "quick",
+        name: named || null,
+      });
+      setTun(s);
+      if (s?.url) setChosenUrl(s.url);
+    } catch (err) {
+      setTunError(String(err));
+    } finally {
+      setTunBusy(false);
+    }
+  };
+
+  const stopTunnel = async () => {
+    setTunBusy(true);
+    try {
+      setTun(await invoke("tunnel_stop"));
+    } catch (err) {
+      setTunError(String(err));
+    } finally {
+      setTunBusy(false);
+    }
+  };
 
   const start = async () => {
     setBusy("start");
@@ -259,7 +349,7 @@ function MobileAccess() {
 
   return (
     <section className="settings-section">
-      <h2>Mobile access</h2>
+      <h2>Remote access</h2>
 
       <Card title="Gateway">
         <Row
@@ -336,6 +426,154 @@ function MobileAccess() {
       </Card>
 
       {running && (
+        <Card title="Web UI in the browser">
+          <Row
+            title="Serve the desktop UI"
+            sub="When on, the gateway's root URL is the full bench — grid, terminals, chat — behind a login. The phone app moves to /m and installed PWAs keep working."
+          >
+            <button className="btn-sm" onClick={toggleWebUi}>
+              {status?.webUi === true ? "On — turn off" : "Off — turn on"}
+            </button>
+          </Row>
+          <Row
+            title="Login password"
+            sub={
+              status?.hasPassword
+                ? "Set. Signing in mints a revocable device token — web sessions appear under Paired devices. Five wrong guesses lock login for 15 minutes."
+                : "Not set — the web login screen only accepts one-time pairing codes until you set one. Minimum 8 characters."
+            }
+            stack
+          >
+            <div className="webui-password">
+              <input
+                className="mobile-url-input"
+                type="password"
+                placeholder={status?.hasPassword ? "New password (replaces the old one)" : "Password"}
+                value={pw}
+                onChange={(ev) => setPw(ev.target.value)}
+              />
+              <button className="btn-sm" disabled={pw.length < 8} onClick={savePassword}>
+                Save
+              </button>
+              {status?.hasPassword && (
+                <button className="btn-sm danger" onClick={clearPassword}>
+                  Remove
+                </button>
+              )}
+            </div>
+            {pwMsg && <div className="settings-hint">{pwMsg}</div>}
+          </Row>
+          <Row
+            title="Passkeys"
+            sub={
+              (status?.passkeys ?? []).length
+                ? "Sign in with Face ID, Touch ID or a device PIN. Each passkey works only on the address it was made on."
+                : "None yet. Sign in at your tunnel address (https, a real host name) and the browser offers to create one; a phone can also add one from the app's Settings."
+            }
+            stack
+          >
+            {(status?.passkeys ?? []).map((k) => (
+              <div key={k.id} className="webui-password">
+                <span>
+                  {k.name} · {k.rpId}
+                  {k.lastUsed ? ` · used ${new Date(k.lastUsed).toLocaleDateString()}` : ""}
+                </span>
+                <button
+                  className="btn-sm danger"
+                  onClick={async () => {
+                    try {
+                      await invoke("gateway_remove_passkey", { id: k.id });
+                      await refresh();
+                    } catch (err) {
+                      setPwMsg(String(err));
+                    }
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </Row>
+        </Card>
+      )}
+
+      {running && (
+        <Card title="Cloudflare tunnel">
+          {!tun?.installed ? (
+            <Row
+              title="cloudflared is not installed"
+              sub="The tunnel needs Cloudflare's connector on this machine. Install it yourself, then come back here:"
+              stack
+            >
+              <code className="mobile-cmd">brew install cloudflared</code>
+            </Row>
+          ) : tun?.running ? (
+            <>
+              <Row
+                title={tun.mode === "named" ? "Named tunnel running" : "Quick tunnel running"}
+                sub={
+                  tun.url
+                    ? "Open this address in any browser, sign in with the password, and you have the bench. Quick-tunnel URLs change on every start."
+                    : tun.mode === "named"
+                      ? "Running. The address is the hostname you routed to this tunnel in Cloudflare — type it into the Address box above for the pairing QR."
+                      : "Waiting for Cloudflare to assign the public URL…"
+                }
+                stack
+              >
+                {tun.url && (
+                  <div className="webui-password">
+                    <code className="mobile-cmd">{tun.url}</code>
+                    <button
+                      className="btn-sm"
+                      onClick={() => navigator.clipboard?.writeText(tun.url).catch(() => {})}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                )}
+              </Row>
+              <Row title="Stop" sub="Takes the public address down immediately. Until you stop it, AgentBench relaunches the tunnel if it ever dies.">
+                <button className="btn-sm danger" disabled={tunBusy} onClick={stopTunnel}>
+                  {tunBusy ? "Stopping…" : "Stop tunnel"}
+                </button>
+              </Row>
+            </>
+          ) : (
+            <Row
+              title="Start a tunnel"
+              sub="A quick tunnel needs no Cloudflare account — you get a random trycloudflare.com address, new on each start. For a stable address on your own domain, set up a named tunnel once (cloudflared login, then create + route it) and enter its name."
+              stack
+            >
+              <div className="webui-password">
+                <input
+                  className="mobile-url-input"
+                  placeholder="Named tunnel (optional — blank = quick tunnel)"
+                  value={tunnelName}
+                  onChange={(ev) => setTunnelName(ev.target.value)}
+                  spellCheck={false}
+                  autoCapitalize="off"
+                />
+                <button className="btn-sm" disabled={tunBusy} onClick={startTunnel}>
+                  {tunBusy ? "Starting…" : "Start tunnel"}
+                </button>
+              </div>
+            </Row>
+          )}
+          {(tunError || (!tun?.running && tun?.log?.length > 0)) && (
+            <Row
+              title="Tunnel output"
+              sub={tunError || "The last run ended; its final log lines:"}
+              stack
+            >
+              {!tun?.running && tun?.log?.length > 0 && (
+                <code className="mobile-cmd">{tun.log.join("\n")}</code>
+              )}
+            </Row>
+          )}
+        </Card>
+      )}
+
+      {running && (
         <Card title="Pair a phone">
           {!pairing ? (
             <Row
@@ -408,7 +646,7 @@ function MobileAccess() {
       <Card title="Security">
         <Row
           title="This is remote control of a permission-skipped agent"
-          sub="Anyone who reaches the gateway with a valid device token can run code on this machine as you. Keep it on your tailnet, never port-forward it to the internet, and revoke devices you no longer use."
+          sub="Anyone who reaches the gateway with a valid device token or the login password can run code on this machine as you. Keep it on your tailnet or behind the Cloudflare tunnel — never port-forward it raw — use a long password, and revoke devices you no longer use."
         />
       </Card>
     </section>
@@ -833,14 +1071,270 @@ const SECTIONS = [
   { id: "appearance", label: "Appearance", icon: PaintBrushBroad },
   { id: "workspace", label: "Workspace", icon: SquaresFour },
   { id: "agents", label: "Agents", icon: Robot },
-  { id: "mobile", label: "Mobile access", icon: DeviceMobile },
+  { id: "mobile", label: "Remote access", icon: DeviceMobile },
   { id: "remote", label: "Remote hosts", icon: Laptop },
   { id: "benches", label: "Linked benches", icon: Laptop },
   { id: "notifications", label: "Notifications", icon: BellSimple },
+  { id: "voice", label: "Voice", icon: SpeakerHigh },
   { id: "keyboard", label: "Keyboard", icon: Keyboard },
 ];
 
-export default function SettingsWindow() {
+// Kokoro voice ids: a/b = American/British, f/m = female/male.
+const ACCENTS = { a: "American", b: "British" };
+const voiceName = (id) => id.slice(3).replace(/^./, (c) => c.toUpperCase());
+// What a generated preview says: an actual readout, so you hear the voice
+// doing the job
+const PREVIEW = (name) =>
+  `Hi, I'm ${name}. Login works now, step three of five is done. Next: run the tests.`;
+const ENGINES = [
+  ["elevenlabs", "ElevenLabs"],
+  ["kokoro", "Kokoro (local)"],
+];
+const ELEVEN_MODEL_LABEL = { eleven_v4: "v4 · most natural", eleven_v4_turbo: "v4 Turbo · fastest" };
+
+// Spoken readouts: Claude ends each turn with a one-line <spoken> summary
+// (shaped by the i-have-adhd rules) that the chat reads aloud. Engine, voice
+// and speed are the machine's (speech.json); autoplay is this device's.
+function VoiceSection() {
+  const [prefs, setPrefs] = useState(null);
+  const [playing, setPlaying] = useState(null);
+  const [busy, setBusy] = useState(false); // generating, not yet playing
+  const [err, setErr] = useState(null);
+  const [keyDraft, setKeyDraft] = useState("");
+  const [editingKey, setEditingKey] = useState(false);
+  const [eleven, setEleven] = useState(null); // voices from the account
+  const speedTimer = useRef(null);
+  useEffect(() => {
+    loadSpeechPrefs(invoke, true).then(setPrefs);
+    return onSpeaking((key, generating) => {
+      setPlaying(key);
+      setBusy(!!generating);
+    });
+  }, []);
+  const engine = prefs?.engine;
+  useEffect(() => {
+    if (engine !== "elevenlabs" || !prefs?.hasKey) return;
+    invoke("speech_voices")
+      .then(setEleven)
+      .catch((e) => setErr(String(e?.message ?? e)));
+  }, [engine, prefs?.hasKey]);
+
+  const save = (patch) => {
+    setErr(null);
+    setPrefs((p) => ({ ...p, ...patch }));
+    return saveSpeechPrefs(invoke, patch)
+      .then(setPrefs)
+      .catch((e) => setErr(String(e?.message ?? e)));
+  };
+  const saveKey = async () => {
+    await save({ elevenlabsKey: keyDraft.trim(), engine: "elevenlabs" });
+    setKeyDraft("");
+    setEditingKey(false);
+    setEleven(null);
+  };
+  const tryVoice = () => {
+    setErr(null);
+    const name = engine === "elevenlabs" ? prefs.elevenVoiceName : voiceName(prefs.voice);
+    speak(invoke, PREVIEW(name), { key: "try", raw: true }).catch((e) => setErr(String(e?.message ?? e)));
+  };
+  const previewKokoro = (id) => {
+    setErr(null);
+    speak(invoke, PREVIEW(voiceName(id)), { key: `preview:${id}`, voice: id, engine: "kokoro", raw: true }).catch(
+      (e) => setErr(String(e?.message ?? e)),
+    );
+  };
+
+  if (!prefs) return <section className="settings-section"><h2>Voice</h2></section>;
+  const kokoroGroups = {};
+  for (const id of prefs.voices ?? []) {
+    const g = `${ACCENTS[id[0]] ?? "Other"} · ${id[1] === "f" ? "female" : "male"}`;
+    (kokoroGroups[g] ??= []).push(id);
+  }
+  const playIcon = (key) =>
+    playing === key ? (
+      busy ? <span className="voice-spin" aria-label="generating" /> : <StopIcon size={11} weight="fill" />
+    ) : (
+      <Play size={11} weight="fill" />
+    );
+
+  return (
+    <section className="settings-section">
+      <h2>Voice</h2>
+      <Card title="Spoken readouts">
+        <Row
+          title="Readouts"
+          sub="Claude ends each turn with a one-line spoken summary: the win, where things stand, your one next step. On a team only the manager speaks. Applies to sessions started (or /clear-ed) after switching on."
+        >
+          <Toggle on={!!prefs.readouts} onClick={() => save({ readouts: !prefs.readouts })} />
+        </Row>
+        <Row
+          title="Play readouts automatically"
+          sub="Every screen showing the chat — desktop, phone, browser — speaks new readouts. Off: tap a readout to hear it."
+        >
+          <Toggle on={!!prefs.autoplay} onClick={() => save({ autoplay: !prefs.autoplay })} />
+        </Row>
+        <Row title="Speed" sub={`${Number(prefs.speed ?? 1).toFixed(2)}×`} stack>
+          <Slider
+            value={prefs.speed ?? 1}
+            min={0.7}
+            max={1.2}
+            step={0.05}
+            onChange={(v) => {
+              // debounced: a drag (mouse or touch) saves once it settles
+              setPrefs((p) => ({ ...p, speed: v }));
+              clearTimeout(speedTimer.current);
+              speedTimer.current = setTimeout(() => save({ speed: v }), 400);
+            }}
+          />
+        </Row>
+      </Card>
+
+      <Card title="Engine">
+        <Row
+          title="Voice engine"
+          sub={
+            engine === "elevenlabs"
+              ? "Natural and fast. Readout text is sent to ElevenLabs and uses your account's credits."
+              : "Runs on this machine, nothing leaves it. Slow and flatter-sounding while agents keep the CPU busy."
+          }
+        >
+          <Segmented value={engine} options={ENGINES} onChange={(v) => save({ engine: v })} />
+        </Row>
+        {engine === "elevenlabs" && (
+          <>
+            <Row
+              title="API key"
+              sub={prefs.hasKey && !editingKey ? "Saved on this machine only" : "From elevenlabs.io → Developers → API keys"}
+            >
+              {prefs.hasKey && !editingKey ? (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button className="btn-sm" onClick={() => setEditingKey(true)}>Change</button>
+                  <button className="btn-sm" onClick={() => save({ elevenlabsKey: "" })}>Remove</button>
+                </div>
+              ) : (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <input
+                    className="mobile-url-input voice-key-input"
+                    type="password"
+                    placeholder="sk_…"
+                    value={keyDraft}
+                    onChange={(ev) => setKeyDraft(ev.target.value)}
+                    onKeyDown={(ev) => ev.key === "Enter" && keyDraft.trim() && saveKey()}
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoComplete="off"
+                  />
+                  <button className="btn-sm" disabled={!keyDraft.trim()} onClick={saveKey}>Save</button>
+                </div>
+              )}
+            </Row>
+            {prefs.hasKey && (
+              <Row title="Model">
+                <Segmented
+                  value={prefs.elevenModel}
+                  options={(prefs.elevenModels ?? []).map((m) => [m, ELEVEN_MODEL_LABEL[m] ?? m])}
+                  onChange={(v) => save({ elevenModel: v })}
+                />
+              </Row>
+            )}
+          </>
+        )}
+        {prefs.available && (
+          <Row
+            title="Try it"
+            sub={`${engine === "elevenlabs" ? prefs.elevenVoiceName : voiceName(prefs.voice)} reading a sample readout${engine === "elevenlabs" ? " (uses a few credits)" : ""}`}
+          >
+            <button className="btn-sm voice-try" onClick={tryVoice}>
+              {playIcon("try")} {playing === "try" ? (busy ? "Generating…" : "Stop") : "Play sample"}
+            </button>
+          </Row>
+        )}
+        {err && <div className="voice-err" role="alert">{err}</div>}
+      </Card>
+
+      {engine === "elevenlabs" && prefs.hasKey && (
+        <Card title="Voice">
+          {!eleven ? (
+            <div className="settings-row-sub" style={{ padding: "10px 14px" }}>Loading your voices…</div>
+          ) : (
+            <div className="voice-group">
+              <div className="voice-grid wide">
+                {eleven.map((v) => {
+                  const on = prefs.elevenVoice === v.id;
+                  const key = `eleven:${v.id}`;
+                  const meta = [v.accent, v.gender, v.age, v.useCase].filter(Boolean).join(" · ");
+                  return (
+                    <div key={v.id} className={`voice-chip${on ? " on" : ""}`}>
+                      <button
+                        className="voice-pick"
+                        title={v.description || `Use ${v.name}`}
+                        onClick={() => save({ elevenVoice: v.id, elevenVoiceName: v.name })}
+                      >
+                        <span className="voice-pick-text">
+                          <span>{v.name}</span>
+                          {meta && <span className="voice-meta">{meta}</span>}
+                        </span>
+                      </button>
+                      {v.preview && (
+                        <button
+                          className="voice-play"
+                          aria-label={playing === key ? "Stop preview" : `Preview ${v.name}`}
+                          onClick={() => playUrl(v.preview, key)}
+                        >
+                          {playing === key ? <StopIcon size={11} weight="fill" /> : <Play size={11} weight="fill" />}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {engine === "kokoro" && (
+        <Card title="Voice">
+          {!prefs.kokoroAvailable && (
+            <div className="settings-row-sub" style={{ padding: "10px 14px" }}>
+              The voice model isn't installed on this machine. It lives in AgentBench's models
+              folder as <code>kokoro-int8-multi-lang-v1_0</code> (k2-fsa sherpa-onnx tts-models release).
+            </div>
+          )}
+          {Object.entries(kokoroGroups).map(([group, ids]) => (
+            <div key={group} className="voice-group">
+              <div className="voice-group-head">{group}</div>
+              <div className="voice-grid">
+                {ids.map((id) => {
+                  const on = prefs.voice === id;
+                  const key = `preview:${id}`;
+                  return (
+                    <div key={id} className={`voice-chip${on ? " on" : ""}`}>
+                      <button className="voice-pick" onClick={() => save({ voice: id })} title={`Use ${voiceName(id)}`}>
+                        {voiceName(id)}
+                        {id === "af_heart" && <span className="voice-tag">default</span>}
+                      </button>
+                      <button
+                        className="voice-play"
+                        disabled={!prefs.kokoroAvailable}
+                        aria-label={playing === key ? "Stop preview" : `Preview ${voiceName(id)}`}
+                        onClick={() => previewKokoro(id)}
+                      >
+                        {playIcon(key)}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </Card>
+      )}
+    </section>
+  );
+}
+
+export default function SettingsWindow({ asModal = false, onClose } = {}) {
   const [settings, setSettings] = useState(loadSettings);
   const [section, setSection] = useState("appearance");
   const [avail, setAvail] = useState(null); // Set of bins found on PATH
@@ -889,6 +1383,7 @@ export default function SettingsWindow() {
   // Settings → Workspace → Updates
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
+    if (!isTauri) return; // web build has no app handle to ask
     getVersion().then(setAppVersion).catch(() => {});
   }, []);
   const [updateState, setUpdateState] = useState(null); // null | "checking" | "none" | "error"
@@ -927,8 +1422,16 @@ export default function SettingsWindow() {
   }, [settings.theme, settings.autoThemeVars]);
 
   // The window is pre-spawned hidden and reused: Escape and the close
-  // button hide it so the next open is instant.
+  // button hide it so the next open is instant. As a web modal there is no
+  // window to hide — Escape just closes the overlay.
   useEffect(() => {
+    if (asModal) {
+      const onKey = (e) => {
+        if (e.key === "Escape") onClose?.();
+      };
+      window.addEventListener("keydown", onKey);
+      return () => window.removeEventListener("keydown", onKey);
+    }
     const win = getCurrentWindow();
     const onKey = (e) => {
       if (e.key === "Escape") win.hide();
@@ -994,15 +1497,21 @@ export default function SettingsWindow() {
   };
 
   return (
-    <div className="settings-window">
+    <div className={`settings-window${asModal ? " as-modal" : ""}`}>
       <header
-        className={`settings-titlebar${IS_MAC ? " mac" : ""}`}
+        className={`settings-titlebar${!asModal && IS_MAC ? " mac" : ""}`}
         data-tauri-drag-region
       >
         <span className="settings-titlebar-label" data-tauri-drag-region>
           Settings
         </span>
-        {IS_WINDOWS && <WindowControls />}
+        {asModal ? (
+          <button className="settings-modal-close" onClick={onClose} title="Close">
+            ✕
+          </button>
+        ) : (
+          IS_WINDOWS && <WindowControls />
+        )}
       </header>
 
       <div className="settings-body">
@@ -1452,6 +1961,8 @@ export default function SettingsWindow() {
           </section>
         )}
 
+        {section === "voice" && <VoiceSection />}
+
         {section === "keyboard" && (
           <section className="settings-section">
             <h2>Keyboard</h2>
@@ -1491,6 +2002,40 @@ export default function SettingsWindow() {
                 <HotkeyRecorder
                   value={settings.commandMenuKey ?? "mod+shift+p"}
                   onChange={(combo) => set({ commandMenuKey: combo })}
+                />
+              </Row>
+              <Row
+                title="Push-to-talk"
+                sub="Extra hold-to-dictate combo for chat panes. Holding Space anywhere in the box, or ⌥Space, always works."
+              >
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  {settings.dictationKey ? (
+                    <button
+                      className="btn-sm"
+                      title="Remove the custom combo"
+                      onClick={() => set({ dictationKey: "" })}
+                    >
+                      ✕
+                    </button>
+                  ) : null}
+                  <HotkeyRecorder
+                    value={settings.dictationKey ?? ""}
+                    placeholder="Off"
+                    onChange={(combo) => set({ dictationKey: combo })}
+                  />
+                </div>
+              </Row>
+              <Row
+                title="Push-to-talk delay"
+                sub={`Mic opens after the key is held ${settings.dictationHoldDelay ?? 250}ms — release sooner and nothing happens`}
+                stack
+              >
+                <Slider
+                  value={settings.dictationHoldDelay ?? 250}
+                  min={0}
+                  max={1000}
+                  step={50}
+                  onChange={(v) => set({ dictationHoldDelay: v })}
                 />
               </Row>
               <div className="settings-shortcuts">

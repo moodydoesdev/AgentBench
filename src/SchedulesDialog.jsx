@@ -2,8 +2,8 @@
 // schedule ops — the daemon owns the data and fires the runs, so everything
 // here re-renders from its `schedules` broadcast rather than local state.
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@/lib/ipc";
+import { listen } from "@/lib/ipc";
 import { X, Plus, Play, Trash, PauseCircle, PlayCircle, ArrowSquareOut } from "@phosphor-icons/react";
 import {
   DAY_LABELS,

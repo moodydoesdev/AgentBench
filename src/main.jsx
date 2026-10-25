@@ -10,6 +10,11 @@ const view = new URLSearchParams(window.location.search).get("window");
 const App = lazy(() => import("./App"));
 const SettingsWindow = lazy(() => import("./SettingsWindow"));
 
+// Served by the gateway to a plain browser (no Tauri internals): boot through
+// the login gate, which installs the WebSocket transport and mounts App.
+const IS_TAURI = "__TAURI_INTERNALS__" in window;
+const WebGate = !IS_TAURI ? lazy(() => import("./web/WebGate.jsx")) : null;
+
 // dev-only smoke test for the plan renderer (runs outside Tauri)
 const PlanTestHarness =
   import.meta.env.DEV && view === "plan-test"
@@ -27,6 +32,8 @@ ReactDOM.createRoot(document.getElementById("root")).render(
       <PlanTestHarness />
     ) : view === "settings" ? (
       <SettingsWindow />
+    ) : WebGate ? (
+      <WebGate />
     ) : (
       <App />
     )}

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@/lib/ipc";
+import { invoke } from "@/lib/ipc";
 import useWebDictation from "./useWebDictation";
+import useParakeetDictation from "./useParakeetDictation";
+import { useTransport } from "@/lib/TransportContext";
 
 // On-device dictation, driven by the Rust side (see src-tauri/src/dictation.rs).
 // One microphone means one session process-wide, so the backend emits to every
@@ -18,13 +20,18 @@ import useWebDictation from "./useWebDictation";
 // both places from one hook.
 const HAS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+// In the browser, the workstation's Parakeet wins when its gateway has the
+// model; the phone's recognizer is the fallback.
 export default function useDictation(options = {}) {
+  const transport = useTransport();
   const native = useNativeDictation(options);
+  const parakeet = useParakeetDictation(HAS_TAURI ? null : transport, options);
   const web = useWebDictation(options);
-  return HAS_TAURI ? native : web;
+  if (HAS_TAURI) return native;
+  return parakeet.available ? parakeet : web;
 }
 
-function useNativeDictation({ onPartial, onFinal, onError } = {}) {
+function useNativeDictation({ onPartial, onFinal, onError, onLevel, onStatus } = {}) {
   const [available, setAvailable] = useState(false);
   const [listening, setListening] = useState(false);
   // True between our own start() and the session ending. Gates the shared
@@ -34,7 +41,7 @@ function useNativeDictation({ onPartial, onFinal, onError } = {}) {
   // Keep the callbacks off the subscription's dependency list — they're
   // redefined every render, and resubscribing per keystroke would drop events.
   const handlers = useRef({});
-  handlers.current = { onPartial, onFinal, onError };
+  handlers.current = { onPartial, onFinal, onError, onLevel, onStatus };
 
   useEffect(() => {
     if (!HAS_TAURI) return;
@@ -59,6 +66,14 @@ function useNativeDictation({ onPartial, onFinal, onError } = {}) {
       }),
       listen("dictation://state", (e) => {
         if (mine.current) setListening(e.payload.listening);
+      }),
+      // Mic loudness 0–1, ~30/s. Only the macOS 26 engine sends it; callers
+      // must cope with never hearing one.
+      listen("dictation://level", (e) => {
+        if (mine.current) handlers.current.onLevel?.(e.payload.level);
+      }),
+      listen("dictation://status", (e) => {
+        if (mine.current) handlers.current.onStatus?.(e.payload.message);
       }),
     ];
     return () => subs.forEach((p) => p.then((un) => un()));

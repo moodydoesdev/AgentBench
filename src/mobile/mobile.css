@@ -42,6 +42,24 @@ body {
   );
 }
 
+/* Chrome around the transcript must not be selectable: a long-press near the
+   top grabbed the header, and dragging a selection handle up past the list
+   swept the title and tabs into it. Only the transcript and inputs select. */
+.mob-top,
+.mob-pane-tabs,
+.mob-tabs,
+.mob-kill-bar,
+.mob-chat-screen .chat-composer {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.mob-chat-screen .chat-composer textarea {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+}
+
 .mob-top {
   display: flex;
   align-items: center;
@@ -74,6 +92,24 @@ body {
   color: var(--text-dim);
   /* comfortable touch target even though the glyph is small */
   flex: 0 0 auto;
+}
+
+.mob-signout {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+}
+
+.mob-signout:active {
+  background: var(--panel);
 }
 
 .mob-icon:active {
@@ -295,6 +331,23 @@ body {
 
 .mob-agent-status.done {
   color: rgb(var(--blue));
+}
+
+.mob-agent-status.hibernated {
+  color: rgb(var(--blue));
+  opacity: 0.75;
+}
+
+.mob-hibernated > svg { color: rgb(var(--blue)); }
+.mob-hibernated .mob-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.mob-hibernated-error {
+  color: rgb(var(--red));
+  font-size: 13px;
+  max-width: 320px;
 }
 
 .mob-ask {
@@ -1253,6 +1306,220 @@ body {
   font-size: 15px;
 }
 
+/* Fleet search: filters every machine's agents by role/title/project. The
+   first pane row in the results card needs no divider under the field. */
+.mob-search {
+  width: 100%;
+}
+
+.mob-card .mob-agent:first-child {
+  border-top: none;
+}
+
+/* A team's seats sit together under the team's name; members indent a touch
+   so the cluster reads as one unit inside the project card. */
+.mob-team-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 4px 2px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.mob-agent.mob-team-member {
+  border-top: none;
+  padding-left: 14px;
+}
+
+/* A team's shared task list: progress line under the team header, tap to open
+   the kanban board. */
+.mob-tasks-sum {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 4px 8px 14px;
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: left;
+}
+
+.mob-tasks-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.mob-tasks-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent, currentColor);
+  transition: width 0.3s;
+}
+
+.mob-tasks-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- team kanban board ---- */
+
+.mob-board {
+  display: flex;
+  flex-direction: column;
+}
+
+.mob-board-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mob-board-progress {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mob-board-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mob-board-tab {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.mob-board-tab > span {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.mob-board-tab.on {
+  background: var(--panel-head);
+  color: var(--text);
+  border-color: var(--accent, var(--text-dim));
+}
+
+.mob-board-cols {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+
+.mob-board-cols::-webkit-scrollbar {
+  display: none;
+}
+
+.mob-board-col {
+  flex: none;
+  width: 100%;
+  min-width: 0;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  overflow-y: auto;
+  padding: 12px 12px calc(env(safe-area-inset-bottom) + 16px);
+}
+
+.mob-board-empty {
+  padding: 32px 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+}
+
+.mob-card-task {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 10px;
+  background: var(--panel-head);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.mob-board-col.task-in_progress .mob-card-task {
+  border-left-color: var(--accent, currentColor);
+}
+
+.mob-board-col.task-completed .mob-card-task {
+  opacity: 0.6;
+}
+
+.mob-board-col.task-completed .mob-card-task-text {
+  text-decoration: line-through;
+}
+
+.mob-card-task.blocked {
+  border-left-color: var(--warn, #d9a441);
+}
+
+.mob-card-task-desc {
+  color: var(--text-dim);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mob-card-task-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mob-card-task-owner {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+button.mob-card-task-owner {
+  color: var(--text);
+}
+
+.mob-card-task-blocked {
+  color: var(--warn, #d9a441);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 /* A titled agent row stacks: what the session is about, then which agent. */
 .mob-agent-title {
   display: block;
@@ -1360,4 +1627,435 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---- fleet toolbar: search, fold all, compact ---- */
+
+.mob-fleet-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mob-fleet-bar .mob-search {
+  flex: 1;
+  min-width: 0;
+}
+
+.mob-fleet-tool {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+}
+
+.mob-fleet-tool.on {
+  background: var(--panel);
+  color: var(--text);
+}
+
+/* The project head doubles as the fold toggle. */
+button.mob-card-head {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  text-align: left;
+  padding: 0 0 6px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mob-card-caret {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+
+.mob-card.folded .mob-card-caret {
+  transform: rotate(-90deg);
+}
+
+.mob-card.folded button.mob-card-head {
+  padding-bottom: 0;
+}
+
+/* Compact: denser rows, one-line agents, icon-only project actions. */
+.mob-compact {
+  gap: 12px;
+}
+
+.mob-compact .mob-machine {
+  gap: 6px;
+}
+
+.mob-compact .mob-card {
+  padding: 8px 10px;
+  border-radius: 11px;
+}
+
+.mob-compact button.mob-card-head {
+  font-size: 14px;
+  padding-bottom: 4px;
+}
+
+.mob-compact.mob-fleet .mob-card.folded button.mob-card-head {
+  padding-bottom: 0;
+}
+
+.mob-compact .mob-agent {
+  min-height: 34px;
+  padding: 5px 4px;
+  font-size: 13px;
+}
+
+.mob-compact .mob-agent-title + .mob-agent-id {
+  display: none;
+}
+
+.mob-compact .mob-card-actions .mob-agent {
+  justify-content: center;
+}
+
+.mob-compact .mob-card-actions .mob-agent-name {
+  display: none;
+}
+
+.mob-compact .mob-team-head {
+  padding-top: 4px;
+  padding-bottom: 2px;
+}
+
+/* ---- add project ---- */
+
+.mob-machine-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.mob-addproj-path {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 0;
+}
+
+.mob-addproj-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+}
+
+.mob-addproj-list {
+  max-height: 40vh;
+  overflow-y: auto;
+  margin: 4px 0;
+}
+
+.mob-addproj-dir {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mob-addproj-foot {
+  display: flex;
+  gap: 8px;
+  padding-top: 6px;
+}
+
+.mob-addproj-foot .mob-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.mob-addproj-foot .mob-primary {
+  flex: 0 0 auto;
+}
+
+.mob-addproj-create {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- usage tab (plan allowance; .mob-usage-* is the per-session view) ---- */
+
+.mob-plan {
+  gap: 0;
+  padding: 4px 16px;
+}
+
+.mob-plan-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 0;
+  border-top: 1px solid var(--border);
+}
+
+.mob-plan-row:first-child {
+  border-top: none;
+}
+
+.mob-plan-row-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mob-plan-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mob-plan-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.mob-plan-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.mob-plan-pct {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.mob-plan-pct small {
+  margin-left: 1px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.mob-plan-pct.warm {
+  color: rgb(var(--amber));
+}
+
+.mob-plan-pct.hot {
+  color: rgb(var(--red));
+}
+
+.mob-plan-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--panel-head);
+  overflow: hidden;
+}
+
+.mob-plan-bar > div {
+  height: 100%;
+  border-radius: inherit;
+  background: rgb(var(--green));
+}
+
+.mob-plan-bar.warm > div {
+  background: rgb(var(--amber));
+}
+
+.mob-plan-bar.hot > div {
+  background: rgb(var(--red));
+}
+
+.mob-plan-reset {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.mob-plan > .mob-plan-reset {
+  padding: 16px 0;
+}
+
+.mob-plan-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.mob-plan-foot .mob-pill {
+  border: none;
+  color: var(--text);
+}
+
+/* Term tab: the pane's real terminal + a key bar for keys phones lack */
+.mob-term {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--theme-term-bg, var(--panel));
+}
+/* .pane-term (the shared terminal host) is flex:1 with its own padding */
+.mob-term-screen {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.mob-term-keys {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.mob-term-keys::-webkit-scrollbar { display: none; }
+.mob-term-key {
+  flex: 1 0 auto;
+  min-width: 40px;
+  height: 36px;
+  padding: 0 8px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: 600 12.5px var(--font-mono, ui-monospace, monospace);
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.mob-term-key:active { background: rgba(var(--blue), 0.18); border-color: rgba(var(--blue), 0.5); }
+
+/* Team decisions waiting on the user, under the team header. */
+.mob-decisions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 4px 8px 14px;
+}
+
+.mob-decisions-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mob-decisions-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--amber) 7%, transparent);
+  font-size: 14px;
+}
+
+.mob-decisions-q {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.mob-decisions-id {
+  margin-right: 6px;
+  color: var(--amber);
+  font: 12px var(--font-mono);
+}
+
+.mob-decisions-ctx {
+  color: var(--text-dim);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.mob-decisions-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mob-decisions-opt {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+}
+
+.mob-decisions-opt.on {
+  border-color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 18%, transparent);
+}
+
+.mob-decisions-row {
+  display: flex;
+  gap: 6px;
+}
+
+.mob-decisions-note {
+  flex: 1;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 16px; /* no iOS zoom-on-focus */
+}
+
+.mob-decisions-send {
+  min-height: 36px;
+  padding: 6px 14px;
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--amber) 20%, transparent);
+  color: var(--text);
+  font: inherit;
+}
+
+.mob-decisions-send:disabled {
+  opacity: 0.45;
+}
+
+.mob-decisions-err {
+  color: var(--red);
+  font-size: 13px;
 }

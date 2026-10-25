@@ -258,15 +258,50 @@ async fn main() {
         });
     }
 
+    // Keep the Cloudflare tunnel up. The gateway outlives the desktop app, so
+    // it is the right place to notice cloudflared died and relaunch it — a
+    // no-op unless a tunnel was started and not explicitly stopped.
+    tokio::spawn(async {
+        let mut wait = 2u64; // first look soon after boot, then settle
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            wait = match tokio::task::spawn_blocking(agentbench_lib::tunnel::ensure_running).await {
+                Ok(agentbench_lib::tunnel::Revive::Restarted) => {
+                    eprintln!("agentbench-gateway: tunnel had died — restarted it");
+                    15
+                }
+                // cloudflared missing or refusing to start: back off, don't spin
+                Ok(agentbench_lib::tunnel::Revive::Failed(e)) => {
+                    eprintln!("agentbench-gateway: tunnel restart failed: {e}");
+                    (wait.max(15) * 2).min(300)
+                }
+                _ => 15,
+            };
+        }
+    });
+
     eprintln!("agentbench-gateway: public :{port}, control 127.0.0.1:{local_port}");
 
     // Anything unauthenticated lives here and nowhere else: the pairing
     // exchange plus the static shell, which carries no data of its own. A
     // phone must be able to load the app and pair before it has a token.
     let public = Router::new()
+        .route("/", get(root_shell))
+        .route("/m", get(mobile_shell))
+        .route("/usage", get(usage_shell))
         .route("/api/pair", post(pair))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/passkey/login/start", post(passkey_login_start))
+        .route("/api/passkey/login/finish", post(passkey_login_finish))
+        .route("/api/passkey/register/start", post(passkey_register_start))
+        .route("/api/passkey/register/finish", post(passkey_register_finish))
+        .route("/api/passkeys", get(passkey_list))
+        .route("/api/passkeys/remove", post(passkey_remove))
         .route("/api/link-back", post(link_back))
         .route("/api/ws", any(ws_bridge))
+        .route("/api/dictate", any(dictate_ws))
+        .route("/api/dictate/status", get(dictate_status))
         .route("/api/health", get(health))
         .route("/api/push/key", get(push_key))
         .route("/api/push/subscribe", post(push_subscribe))
@@ -274,6 +309,14 @@ async fn main() {
         .route("/api/push/test", post(push_test))
         .route("/api/push/prefs", post(push_prefs))
         .route("/api/answer", post(answer))
+        .route("/api/usage", get(usage))
+        .route("/api/file", get(download))
+        .route(
+            "/api/upload",
+            post(upload).layer(axum::extract::DefaultBodyLimit::max(
+                gateway::uploads::MAX_UPLOAD_BYTES,
+            )),
+        )
         .fallback_service(pwa_service())
         .layer(
             // Multi-bench: the shell is served by whichever machine you
@@ -292,12 +335,19 @@ async fn main() {
         .route("/local/status", get(local_status))
         .route("/local/code", post(local_code))
         .route("/local/code", axum::routing::delete(local_clear_code))
+        .route(
+            "/local/password",
+            post(local_set_password).delete(local_clear_password),
+        )
+        .route("/local/webui", post(local_webui))
         .route("/local/devices", get(local_devices))
         .route(
             "/local/links",
             get(local_links).delete(local_forget_link),
         )
         .route("/local/revoke", post(local_revoke))
+        .route("/local/passkeys", get(local_passkeys))
+        .route("/local/passkeys/remove", post(local_remove_passkey))
         .route("/local/quit", post(local_quit))
         .with_state(gw.clone());
 
@@ -400,6 +450,169 @@ fn pwa_service() -> ServeDir<ServeFile> {
     ServeDir::new(dir)
         .append_index_html_on_directories(false)
         .fallback(ServeFile::new(shell))
+}
+
+/// What `/` serves is a runtime decision, not a route decision: with the web
+/// UI enabled it is the desktop bench (`index.html`), otherwise the phone
+/// shell — same behavior as before the web UI existed. The shell itself stays
+/// unauthenticated either way; it carries no data, and every API call it makes
+/// needs a device token.
+async fn root_shell(State(gw): State<Arc<Gateway>>) -> Response {
+    serve_shell(if gw.tokens.web_ui() {
+        "index.html"
+    } else {
+        "mobile.html"
+    })
+}
+
+/// The phone shell, always — so a paired phone keeps a stable address to
+/// install the PWA from even when `/` is the desktop bench.
+async fn mobile_shell() -> Response {
+    serve_shell("mobile.html")
+}
+
+/// The Claude usage page lives in the desktop bundle (WebGate renders it for
+/// this path), whether or not `/` serves the full bench.
+async fn usage_shell() -> Response {
+    serve_shell("index.html")
+}
+
+fn serve_shell(name: &str) -> Response {
+    match std::fs::read(pwa_dir().join(name)) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                // the shell decides what the origin serves; never cache it
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "shell not built").into_response(),
+    }
+}
+
+/// Exchange the login password (or a live pairing code) for a device token.
+/// The password path is what the browser login screen uses; lockout and
+/// rate-limiting live in the token store.
+async fn login(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
+    let device = body["deviceName"].as_str().unwrap_or("Web").trim();
+    let device = if device.is_empty() { "Web" } else { device };
+    let minted = if let Some(pw) = body["password"].as_str() {
+        gw.tokens.login(pw, device)
+    } else if let Some(code) = body["code"].as_str() {
+        gw.tokens
+            .redeem(code, device, Some("web"))
+            .ok_or_else(|| "bad or expired pairing code".to_string())
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "login needs a password or a pairing code" })),
+        )
+            .into_response();
+    };
+    match minted {
+        Ok(token) => Json(json!({
+            "token": token,
+            "machine": gw.machine,
+            "protocolVersion": gateway::PROTOCOL_VERSION,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Sign out: revoke the caller's own device token, so a forgotten machine
+/// does not leave a live credential behind in the browser.
+async fn logout(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
+    let Some(token) = require_device(&gw, &headers) else {
+        return unauthorized();
+    };
+    let id = agentbench_lib::gateway::tokens::token_id(&token);
+    Json(json!({ "ok": gw.tokens.revoke(&id) })).into_response()
+}
+
+/// The browser origin a passkey ceremony runs under. Browsers always send
+/// Origin on these POSTs; it becomes the relying-party id, and the signed
+/// client data must name the same origin, so a forged header buys nothing.
+fn request_origin(headers: &header::HeaderMap) -> String {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn bad_request(e: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response()
+}
+
+async fn passkey_login_start(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
+    match gw.passkeys.login_start(&request_origin(&headers)) {
+        Ok(opts) => Json(opts).into_response(),
+        Err(e) => bad_request(e),
+    }
+}
+
+/// A verified assertion mints a web device token, exactly as a password
+/// login does.
+async fn passkey_login_finish(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
+    match gw.passkeys.login_finish(&body) {
+        Ok(_) => {
+            let device = body["deviceName"].as_str().unwrap_or("Web");
+            Json(json!({
+                "token": gw.tokens.mint_web(device),
+                "machine": gw.machine,
+                "protocolVersion": gateway::PROTOCOL_VERSION,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Adding a passkey needs a signed-in device: a passkey is a new way in, so
+/// only someone already in may create one.
+async fn passkey_register_start(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    match gw.passkeys.register_start(&request_origin(&headers), &gw.machine) {
+        Ok(opts) => Json(opts).into_response(),
+        Err(e) => bad_request(e),
+    }
+}
+
+async fn passkey_register_finish(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    match gw.passkeys.register_finish(&body) {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => bad_request(e),
+    }
+}
+
+async fn passkey_list(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    Json(gw.passkeys.list()).into_response()
+}
+
+async fn passkey_remove(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    Json(json!({ "ok": gw.passkeys.remove(body["id"].as_str().unwrap_or_default()) })).into_response()
 }
 
 fn unauthorized() -> Response {
@@ -532,6 +745,112 @@ fn require_device(gw: &Gateway, headers: &header::HeaderMap) -> Option<String> {
     gw.tokens.verify(&token).then(|| token)
 }
 
+/// Claude plan usage (what `/usage` shows in Claude Code) for this machine's
+/// logged-in account.
+async fn usage(headers: header::HeaderMap, State(gw): State<Arc<Gateway>>) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    match gateway::usage::claude_usage().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// A file for an agent, sent from a browser: raw bytes in the body, the
+/// original name in `?name=`. Answers with the temp path the composer then
+/// hands Claude. Plain HTTP rather than a socket frame so large files skip
+/// base64 and the WebSocket frame cap.
+async fn upload(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    let name = q.get("name").cloned().unwrap_or_default();
+    match tokio::task::spawn_blocking(move || gateway::uploads::save_upload(&name, &body)).await {
+        Ok(Ok(path)) => Json(json!({ "path": path.to_string_lossy() })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+            .into_response(),
+    }
+}
+
+/// A workstation file an agent is handing over (a `[name](/abs/path)` link
+/// in its reply), streamed to the browser as a download. A device token
+/// already runs shells on this machine, so reading a file adds no reach.
+async fn download(
+    State(gw): State<Arc<Gateway>>,
+    headers: header::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if require_device(&gw, &headers).is_none() {
+        return unauthorized();
+    }
+    let raw = q.get("path").cloned().unwrap_or_default();
+    let path = match raw.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+        None => std::path::PathBuf::from(&raw),
+    };
+    let fail = |code: StatusCode, e: String| (code, Json(json!({ "error": e }))).into_response();
+    if !path.is_absolute() {
+        return fail(StatusCode::BAD_REQUEST, "path must be absolute".into());
+    }
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return fail(StatusCode::BAD_REQUEST, "not a file".into()),
+        Err(e) => return fail(StatusCode::NOT_FOUND, e.to_string()),
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::FORBIDDEN, e.to_string()),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    // RFC 5987 form so non-ASCII names survive; the plain one is a fallback
+    let ascii: String = name
+        .chars()
+        .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' { c } else { '_' })
+        .collect();
+    let encoded: String = name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let stream = futures_util::stream::unfold(file, |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 256 * 1024];
+        match f.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(buf)), f))
+            }
+            Err(e) => Some((Err(e), f)),
+        }
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, meta.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}"),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 async fn push_key(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -> Response {
     if require_device(&gw, &headers).is_none() {
         return unauthorized();
@@ -634,26 +953,161 @@ async fn push_test(State(gw): State<Arc<Gateway>>, headers: header::HeaderMap) -
 }
 
 /// Browsers cannot set headers on a WebSocket handshake, so the token rides
-/// the query string here (and only here). It is still the same device token,
-/// checked the same way, over the same TLS.
+/// the `Sec-WebSocket-Protocol` list: the client offers `["bearer", <token>]`
+/// and the server selects `bearer`. Unlike the older `?token=` query form
+/// (still accepted for existing paired phones), a subprotocol entry never
+/// lands in access logs — which matters once Cloudflare sits in front.
 async fn ws_bridge(
     ws: WebSocketUpgrade,
     State(gw): State<Arc<Gateway>>,
     Query(params): Query<HashMap<String, String>>,
     headers: header::HeaderMap,
 ) -> Response {
-    let token = params
-        .get("token")
-        .cloned()
-        .or_else(|| header_token(&headers));
-    let Some(token) = token else {
+    let Some(token) = socket_token(&gw, &params, &headers) else {
         return unauthorized();
     };
-    if !gw.tokens.verify(&token) {
+    let who = agentbench_lib::gateway::tokens::token_id(&token);
+    // Selecting "bearer" answers a subprotocol offer; with a plain query-token
+    // client nothing is offered, nothing is echoed, and this is a no-op.
+    ws.protocols(["bearer"])
+        .on_upgrade(move |socket| serve_socket(socket, gw, who))
+}
+
+/// The verified device token on a WebSocket handshake: the subprotocol offer
+/// first, then the older `?token=` query, then an Authorization header.
+fn socket_token(
+    gw: &Gateway,
+    params: &HashMap<String, String>,
+    headers: &header::HeaderMap,
+) -> Option<String> {
+    let proto_token = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|list| {
+            list.split(',')
+                .map(str::trim)
+                .find(|p| *p != "bearer" && !p.is_empty())
+                .map(String::from)
+        });
+    let token = proto_token
+        .or_else(|| params.get("token").cloned())
+        .or_else(|| header_token(headers))?;
+    gw.tokens.verify(&token).then_some(token)
+}
+
+/// Whether the browser mic should stream to Parakeet here or fall back to the
+/// phone's own recognizer.
+async fn dictate_status(headers: header::HeaderMap, State(gw): State<Arc<Gateway>>) -> Response {
+    if require_device(&gw, &headers).is_none() {
         return unauthorized();
     }
-    let who = agentbench_lib::gateway::tokens::token_id(&token);
-    ws.on_upgrade(move |socket| serve_socket(socket, gw, who))
+    Json(json!({ "available": gateway::dictate::available() })).into_response()
+}
+
+/// Browser dictation: 16 kHz mono PCM16 in as binary frames, `{type, text}`
+/// JSON out. A `"stop"` text frame asks for the final transcript, which is
+/// sent before the server closes.
+async fn dictate_ws(
+    ws: WebSocketUpgrade,
+    State(gw): State<Arc<Gateway>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: header::HeaderMap,
+) -> Response {
+    if socket_token(&gw, &params, &headers).is_none() {
+        return unauthorized();
+    }
+    if !gateway::dictate::available() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Parakeet is not installed on this machine" })),
+        )
+            .into_response();
+    }
+    ws.protocols(["bearer"]).on_upgrade(serve_dictation)
+}
+
+#[cfg(not(feature = "parakeet"))]
+async fn serve_dictation(_socket: WebSocket) {}
+
+#[cfg(feature = "parakeet")]
+async fn serve_dictation(socket: WebSocket) {
+    use futures_util::{SinkExt, StreamExt};
+    use gateway::dictate::{pcm16_to_f32, Event, Session};
+
+    enum In {
+        Audio(Vec<f32>),
+        Stop,
+    }
+    let (mut sink, mut stream) = socket.split();
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<In>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Event>();
+
+    // Decoding blocks for tens of milliseconds at a time, so the session lives
+    // on its own thread. Audio that queues up while it decodes is folded into
+    // one push rather than decoded chunk by chunk.
+    std::thread::spawn(move || {
+        let mut session = match Session::new() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = out_tx.send(Event::Error(e));
+                return;
+            }
+        };
+        while let Ok(first) = in_rx.recv() {
+            let mut audio = Vec::new();
+            let mut stop = false;
+            for msg in std::iter::once(first).chain(in_rx.try_iter()) {
+                match msg {
+                    In::Audio(a) => audio.extend(a),
+                    In::Stop => stop = true,
+                }
+            }
+            if let Some(ev) = session.push(&audio) {
+                let _ = out_tx.send(ev);
+            }
+            if stop {
+                let _ = out_tx.send(session.finish());
+                return;
+            }
+        }
+        // Socket dropped without a stop: nothing left to send to.
+    });
+
+    let reader = async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            match msg {
+                Message::Binary(b) => {
+                    if in_tx.send(In::Audio(pcm16_to_f32(&b))).is_err() {
+                        break;
+                    }
+                }
+                Message::Text(t) if t.as_str() == "stop" => {
+                    let _ = in_tx.send(In::Stop);
+                    break;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        // Dropping `in_tx` ends the session thread if no stop came.
+    };
+    let writer = async move {
+        while let Some(ev) = out_rx.recv().await {
+            let (kind, text, done) = match ev {
+                Event::Partial(t) => ("partial", t, false),
+                Event::Final(t) => ("final", t, true),
+                Event::Error(t) => ("error", t, true),
+            };
+            let frame = json!({ "type": kind, "text": text }).to_string();
+            if sink.send(Message::Text(frame.into())).await.is_err() || done {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    };
+    // The reader stops at "stop", but the final transcript is still owed:
+    // run both and let the writer decide when the socket is done.
+    let (_, ()) = tokio::join!(reader, writer);
 }
 
 /// One phone connection: broker passthrough in, event fan-out back.
@@ -704,7 +1158,25 @@ async fn serve_socket(socket: WebSocket, gw: Arc<Gateway>, who: String) {
         }
     });
 
-    while let Some(Ok(msg)) = stream.next().await {
+    // Revocation must bite now, not at the next reconnect: a revoked device
+    // with a live socket would keep full broker access for as long as it kept
+    // the tab open. Polling the device list every few seconds is crude but
+    // races nothing and costs nothing.
+    let mut revoked_check = tokio::time::interval(std::time::Duration::from_secs(5));
+    revoked_check.reset(); // no immediate tick; the handshake just verified
+    loop {
+        let msg = tokio::select! {
+            msg = stream.next() => match msg {
+                Some(Ok(m)) => m,
+                _ => break,
+            },
+            _ = revoked_check.tick() => {
+                if gw.tokens.device_exists(&who) {
+                    continue;
+                }
+                break;
+            }
+        };
         let Message::Text(text) = msg else {
             if matches!(msg, Message::Close(_)) {
                 break;
@@ -774,7 +1246,27 @@ async fn local_status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "devices": gw.tokens.list(),
         "pushSubscriptions": gw.push.count(),
         "pushDevices": gw.push.list(),
+        "hasPassword": gw.tokens.has_password(),
+        "passkeys": gw.passkeys.list(),
+        "webUi": gw.tokens.web_ui(),
     }))
+}
+
+async fn local_set_password(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
+    match gw.tokens.set_password(body["password"].as_str().unwrap_or_default()) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn local_clear_password(State(gw): State<Arc<Gateway>>) -> Json<Value> {
+    gw.tokens.clear_password();
+    Json(json!({ "ok": true }))
+}
+
+async fn local_webui(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Json<Value> {
+    gw.tokens.set_web_ui(body["enabled"].as_bool() == Some(true));
+    Json(json!({ "ok": true, "webUi": gw.tokens.web_ui() }))
 }
 
 async fn local_code(State(gw): State<Arc<Gateway>>, body: Option<Json<Value>>) -> Json<Value> {
@@ -841,6 +1333,14 @@ async fn local_forget_link(State(gw): State<Arc<Gateway>>, Json(body): Json<Valu
 async fn local_revoke(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Json<Value> {
     let id = body["id"].as_str().unwrap_or_default();
     Json(json!({ "ok": gw.tokens.revoke(id) }))
+}
+
+async fn local_passkeys(State(gw): State<Arc<Gateway>>) -> Json<Value> {
+    Json(gw.passkeys.list())
+}
+
+async fn local_remove_passkey(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Json<Value> {
+    Json(json!({ "ok": gw.passkeys.remove(body["id"].as_str().unwrap_or_default()) }))
 }
 
 async fn local_quit() -> Json<Value> {

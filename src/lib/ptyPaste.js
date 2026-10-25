@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/ipc";
 import { pasteChunks, IMAGE_SETTLE_MS, CHUNK_GAP_MS } from "./imageTokens";
 
 const IS_WINDOWS = navigator.userAgent.includes("Windows");

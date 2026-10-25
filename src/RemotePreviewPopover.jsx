@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { invoke } from "@/lib/ipc";
+import { openUrl } from "@/lib/ipc";
 import { Popover } from "radix-ui";
 import { Globe } from "@phosphor-icons/react";
 

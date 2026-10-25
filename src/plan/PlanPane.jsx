@@ -1,7 +1,7 @@
 // A plan document pane: same grid chrome as AgentPane (header, grips, drag
 // reorder), but the body renders an interactive MDX plan instead of a pty.
 import { memo, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/ipc";
 import { X, ArrowsOutLineHorizontal, FileText } from "@phosphor-icons/react";
 import PlanRenderer from "./PlanRenderer";
 import usePaneDrag from "../usePaneDrag";

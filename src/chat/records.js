@@ -28,6 +28,7 @@ export function createChatStore() {
     // background shells (Bash run_in_background). tool_use_id ->
     // { kind: "agent"|"shell", label, detail, msgKey, bg, bgId?, done }
     activity: new Map(),
+    taskSubjects: new Map(), // task id -> subject, learned from Task* results
     model: null, // full model id the session is actually on, once observed
     nextKey: 0,
     rev: 0, // bumped on every visible change — cheap render/scroll guard
@@ -194,6 +195,16 @@ function textOf(content) {
     .join("\n");
 }
 
+/** Image blocks of a tool result (a Read of a png/jpg, a screenshot tool…)
+ *  as displayable URLs. textOf only keeps the "[image]" placeholder. */
+function imagesOf(content) {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((b) => b?.type === "image")
+    .map((b) => imageUrlFromSource(b.source))
+    .filter(Boolean);
+}
+
 // A transcript user record whose text is pure harness plumbing, not the user.
 function isNoiseUserText(text) {
   const t = text.trimStart();
@@ -212,6 +223,29 @@ function isNoiseUserText(text) {
 // not render as a right-aligned user bubble (which reads as "someone sent
 // this"). Parse the ones worth surfacing into a plain-language system notice;
 // return null for anything we'd rather leave to isNoiseUserText to hide.
+// A message from another Claude session, delivered as a user turn:
+//   Another Claude session sent a message:
+//   <cross-session-message from="uds:…" from-name="Manager (Proj)" from-mode="…">
+//   body
+//   </cross-session-message>
+// One turn can carry several. Returns [{ from, text }] or null.
+function peerMessages(text) {
+  if (!text.includes("<cross-session-message")) return null;
+  const out = [];
+  for (const m of text.matchAll(/<cross-session-message\b([^>]*)>([\s\S]*?)<\/cross-session-message>/g)) {
+    const body = m[2].trim();
+    if (!body) continue;
+    out.push({ from: /from-name="([^"]*)"/.exec(m[1])?.[1] ?? null, text: body });
+  }
+  return out.length ? out : null;
+}
+
+function pushPeers(store, peers, sidechain, agentId, agent) {
+  for (const peer of peers) {
+    push(store, { role: "system", kind: "peer", peer, sidechain, agentId, agent });
+  }
+}
+
 function harnessNotice(text) {
   const t = text.trimStart();
   if (t.startsWith("<task-notification>")) {
@@ -393,6 +427,20 @@ function sidechainOf(store, rec) {
   };
 }
 
+// `<spoken>…</spoken>`: the short readout Claude ends a turn with when spoken
+// readouts are on (instructions come from the broker's SessionStart reply).
+// The chat shows it as a playable chip and reads it aloud; it never appears
+// in the message body.
+const SPOKEN_RE = /<spoken>([\s\S]*?)<\/spoken>/g;
+export function splitSpoken(raw) {
+  let spoken = null;
+  const text = raw.replace(SPOKEN_RE, (_, said) => {
+    spoken = said.trim() || spoken;
+    return "";
+  });
+  return spoken ? { text: text.trimEnd(), spoken } : { text: raw };
+}
+
 function applyAssistant(store, rec) {
   const blocks = rec.message?.content;
   if (!Array.isArray(blocks)) return false;
@@ -419,11 +467,15 @@ function applyAssistant(store, rec) {
   }
   for (const b of blocks) {
     if (b.type === "text") {
-      if (b.text?.trim()) {
+      // a spoken readout rides out of the visible text into its own field
+      const { text, spoken } = sidechain ? { text: b.text } : splitSpoken(b.text ?? "");
+      if (text.trim() || spoken) {
         push(store, {
           role: "assistant",
           kind: "text",
-          text: b.text,
+          text,
+          spoken,
+          at: Date.parse(rec.timestamp) || Date.now(),
           sidechain,
           agentId,
           agent,
@@ -447,6 +499,8 @@ function applyAssistant(store, rec) {
       // tool_result lands on the same card.
       if (!(b.name === "AskUserQuestion" && adoptSyntheticAsk(store, b))) {
         const tool = { id: b.id, name: b.name, input: b.input, done: false };
+        if (b.input?.taskId != null)
+          tool.subject = b.input.subject ?? store.taskSubjects.get(String(b.input.taskId));
         store.tools.set(b.id, tool);
         const msg = push(store, {
           role: "assistant",
@@ -620,17 +674,24 @@ function applyUser(store, rec) {
         const tool = store.tools.get(b.tool_use_id);
         if (tool) {
           tool.result = textOf(b.content);
+          const imgs = imagesOf(b.content);
+          if (imgs.length) tool.images = imgs;
           tool.isError = !!b.is_error;
           tool.done = true;
           const msg = store.toolMsg.get(b.tool_use_id);
           if (msg) msg.rev = ++store.rev;
           trackToolResult(store, b.tool_use_id, tool, tool.result, rec);
+          if (TASK_TOOLS.has(tool.name)) learnTasks(store, tool);
           changed = true;
         }
       } else if (b.type === "text" && b.text?.trim()) {
+        const peers = peerMessages(b.text);
         const notice = harnessNotice(b.text);
         const chip = commandChip(b.text);
-        if (notice) {
+        if (peers) {
+          pushPeers(store, peers, sidechain, agentId, agent);
+          changed = true;
+        } else if (notice) {
           completeNotifiedTasks(store, b.text);
           push(store, { role: "system", kind: "notice", notice, sidechain, agentId, agent });
           changed = true;
@@ -649,9 +710,13 @@ function applyUser(store, rec) {
       }
     }
   } else if (typeof content === "string" && content.trim()) {
+    const peers = peerMessages(content);
     const notice = harnessNotice(content);
     const chip = commandChip(content);
-    if (notice) {
+    if (peers) {
+      pushPeers(store, peers, sidechain, agentId, agent);
+      changed = true;
+    } else if (notice) {
       completeNotifiedTasks(store, content);
       push(store, { role: "system", kind: "notice", notice, sidechain, agentId, agent });
       changed = true;
@@ -787,7 +852,8 @@ export function toolSummary(tool) {
   const { name, input = {} } = tool;
   switch (name) {
     case "Bash":
-      return { label: "Ran command", detail: input.command ?? input.description };
+      // the description says why in words; the command itself is in the body
+      return { label: "Ran command", detail: input.description || input.command };
     case "Read":
       return { label: "Read file", detail: input.file_path };
     case "Edit":
@@ -813,6 +879,91 @@ export function toolSummary(tool) {
         label: name,
         detail: input.file_path ?? input.path ?? input.command ?? input.query,
       };
+  }
+}
+
+// Claude's shared task list tools. Their raw inputs are a bare task id and a
+// status, so the chat names the task by subject instead — learned from the
+// results of TaskCreate ("Task #7 created successfully: …"), TaskList
+// ("#7 [pending] … (owner)") and TaskGet ("Task #7: …").
+export const TASK_TOOLS = new Set(["TaskCreate", "TaskUpdate", "TaskList", "TaskGet"]);
+
+const TASK_LINE_RE = /^#(\d+) \[(\w+)\] (.+?)(?: \(((?:[^()]|\([^()]*\))*)\))?$/;
+
+/** TaskList result lines as { id, status, subject, owner }. */
+export function parseTaskList(text) {
+  return String(text ?? "")
+    .split("\n")
+    .map((l) => TASK_LINE_RE.exec(l.trim()))
+    .filter(Boolean)
+    .map(([, id, status, subject, owner]) => ({ id, status, subject, owner: owner ?? null }));
+}
+
+function learnTasks(store, tool) {
+  const text = tool.result ?? "";
+  const learned = new Map();
+  let m;
+  if (tool.name === "TaskCreate" && (m = /^Task #(\d+) created successfully: (.+)$/m.exec(text))) {
+    tool.taskId = m[1];
+    learned.set(m[1], m[2].trim());
+  } else if (tool.name === "TaskGet" && (m = /^Task #(\d+): (.+)$/m.exec(text))) {
+    learned.set(m[1], m[2].trim());
+  } else if (tool.name === "TaskList") {
+    for (const t of parseTaskList(text)) learned.set(t.id, t.subject);
+  } else if (tool.name === "TaskUpdate" && tool.input?.subject) {
+    learned.set(String(tool.input.taskId), tool.input.subject);
+  }
+  if (!learned.size) return;
+  for (const [id, subject] of learned) store.taskSubjects.set(id, subject);
+  // name earlier rows that only knew the bare id
+  for (const [toolId, t] of store.tools) {
+    if (t.subject || t.input?.taskId == null) continue;
+    const subject = learned.get(String(t.input.taskId));
+    if (!subject) continue;
+    t.subject = subject;
+    const msg = store.toolMsg.get(toolId);
+    if (msg) msg.rev = ++store.rev;
+  }
+}
+
+const TASK_VERBS = {
+  completed: "Completed task",
+  in_progress: "Started task",
+  pending: "Reopened task",
+  deleted: "Deleted task",
+};
+
+/** Label, detail and tone for a task tool row. */
+export function taskSummary(tool) {
+  const input = tool.input ?? {};
+  const named = (id, subject) => [id != null ? `#${id}` : null, subject].filter(Boolean).join(" ");
+  switch (tool.name) {
+    case "TaskCreate":
+      return { label: "New task", detail: named(tool.taskId, input.subject), tone: "new" };
+    case "TaskUpdate": {
+      const label = TASK_VERBS[input.status] ?? (input.owner ? "Assigned task" : "Updated task");
+      const owner = input.owner && !input.status ? ` → ${input.owner}` : "";
+      return {
+        label,
+        detail: named(input.taskId, tool.subject) + owner,
+        tone: input.status ?? "update",
+        owner: input.status ? input.owner : null,
+      };
+    }
+    case "TaskGet":
+      return { label: "Read task", detail: named(input.taskId, tool.subject), tone: "read" };
+    default: {
+      const tasks = parseTaskList(tool.result);
+      const n = (s) => tasks.filter((t) => t.status === s).length;
+      const detail = !tool.done
+        ? ""
+        : tasks.length
+          ? [`${tasks.length} task${tasks.length === 1 ? "" : "s"}`, n("in_progress") && `${n("in_progress")} in progress`, n("pending") && `${n("pending")} pending`]
+              .filter(Boolean)
+              .join(" · ")
+          : "empty";
+      return { label: "Checked task list", detail, tone: "read" };
+    }
   }
 }
 

@@ -508,6 +508,145 @@ fn tree_reason(sys: &System, r: &Runtime) -> Option<String> {
     }
     None
 }
+/// The agent itself within a pane's tree: the pty's root is often a login
+/// shell wrapping the harness, so step down through lone-child shells.
+fn agent_pid(sys: &System, root: u32) -> Pid {
+    let mut at = Pid::from_u32(root);
+    loop {
+        let Some(p) = sys.process(at) else { return at };
+        let name = p.name().to_string_lossy().to_lowercase();
+        let shell = matches!(
+            name.trim_start_matches('-'),
+            "sh" | "bash" | "zsh" | "fish" | "dash" | "login"
+        );
+        let children: Vec<Pid> = sys
+            .processes()
+            .iter()
+            .filter(|(_, c)| c.parent() == Some(at))
+            .map(|(pid, _)| *pid)
+            .collect();
+        match (shell, children.as_slice()) {
+            (true, [only]) => at = *only,
+            _ => return at,
+        }
+    }
+}
+
+/// What a command process is running, readably. Claude Code runs Bash tool
+/// calls as `zsh -c -l "source <snapshot> && eval '<command>' < /dev/null
+/// && pwd -P >| <file>"`; show just `<command>`.
+fn display_command(p: &sysinfo::Process) -> String {
+    let args: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    command_text(&args)
+}
+
+fn command_text(args: &[String]) -> String {
+    let script = args
+        .iter()
+        .position(|a| a == "-c")
+        .and_then(|_| args.iter().rev().find(|a| !a.starts_with('-')))
+        .cloned();
+    let text = match script {
+        Some(script) => match script.find("eval '") {
+            Some(at) => {
+                let body = &script[at + 6..];
+                let end = body
+                    .rfind("' \\< /dev/null")
+                    .or_else(|| body.rfind("' < /dev/null"))
+                    .or_else(|| body.rfind('\''))
+                    .unwrap_or(body.len());
+                body[..end].replace("'\\''", "'")
+            }
+            None => script,
+        },
+        None => args.join(" "),
+    };
+    let text = text.trim();
+    if text.chars().count() > 400 {
+        format!("{}…", text.chars().take(400).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+/// Long-lived processes an agent keeps for itself rather than running for
+/// the task: not worth listing as "running commands".
+fn housekeeping(p: &sysinfo::Process) -> bool {
+    helper(p) || matches!(p.name().to_string_lossy().as_ref(), "caffeinate")
+}
+
+/// Everything an agent is running right now, one entry per direct child of
+/// the agent process (a Bash tool call, a dev server, a build), with the
+/// whole subtree folded into its CPU and memory. The drawer in each pane
+/// lists these and can stop them via `stop_command`.
+fn commands(sys: &System, root: u32, cpus: f32) -> Vec<Value> {
+    let agent = agent_pid(sys, root);
+    let mut out: Vec<(u64, Value)> = sys
+        .processes()
+        .iter()
+        .filter(|(_, p)| p.parent() == Some(agent) && !housekeeping(p))
+        .map(|(pid, p)| {
+            let group: Vec<&sysinfo::Process> =
+                tree(sys, pid.as_u32()).iter().filter_map(|c| sys.process(*c)).collect();
+            let resident: u64 = group.iter().map(|c| c.memory()).sum();
+            let cpu: f32 = group.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus;
+            (
+                p.start_time(),
+                json!({"pid": pid.as_u32(), "start": p.start_time(), "command": display_command(p),
+                    "resident_bytes": resident, "cpu_percent": cpu, "processes": group.len()}),
+            )
+        })
+        .collect();
+    out.sort_by_key(|(start, _)| *start);
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Stop one of an agent's commands and everything under it: SIGINT (what
+/// Ctrl+C would send), then SIGTERM, then SIGKILL for anything still up. The
+/// pid must be in this pane's tree with the recorded start time, so a
+/// recycled pid is never signalled, and the agent itself is off limits.
+pub fn stop_command(core: &Core, id: u32, pid: u32, start: u64) -> Result<(), String> {
+    let root = core
+        .resources
+        .live
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|r| r.pid)
+        .ok_or("That agent isn't running")?;
+    let mut sys = System::new();
+    refresh(&mut sys);
+    let target = Pid::from_u32(pid);
+    if target == agent_pid(&sys, root) || pid == root {
+        return Err("Refusing to stop the agent itself — use its X or Esc instead".into());
+    }
+    if !tree(&sys, root).contains(&target) || !alive(&sys, pid, start) {
+        return Err("That command already finished".into());
+    }
+    let group: Vec<(u32, u64)> = tree(&sys, pid)
+        .into_iter()
+        .filter_map(|p| sys.process(p).map(|c| (p.as_u32(), c.start_time())))
+        .collect();
+    std::thread::spawn(move || {
+        let mut sys = System::new();
+        for signal in [Signal::Interrupt, Signal::Term, Signal::Kill] {
+            refresh(&mut sys);
+            let mut any = false;
+            for (p, s) in &group {
+                if alive(&sys, *p, *s) {
+                    any = true;
+                    let _ = sys.process(Pid::from_u32(*p)).unwrap().kill_with(signal);
+                }
+            }
+            if !any {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    });
+    Ok(())
+}
+
 fn session(core: &Core, id: u32, cwd: &str) -> Option<String> {
     super::newest_session(core, id, cwd)
 }
@@ -894,7 +1033,11 @@ pub fn start(core: Arc<Core>) {
                         candidates.push((*id, idle));
                     }
                     rows.push(json!({"id":id,"resident_bytes":resident,"cpu_percent":cpu,"processes":ids.len(),
-                        "idle_seconds":idle,"pinned":r.pinned,"eligible":eligible,"reason":reason,"hibernated":false}));
+                        "idle_seconds":idle,"pinned":r.pinned,"eligible":eligible,"reason":reason,"hibernated":false,
+                        "commands":commands(&sys, r.pid, cpus),
+                        // Claude Code background task ids — also the name of
+                        // each task's live output file (<id>.output)
+                        "background":r.background.iter().collect::<Vec<_>>()}));
                 }
             }
             for s in core.resources.sleepers.lock().unwrap().values() {
@@ -938,6 +1081,15 @@ pub fn start(core: Arc<Core>) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn command_text_unwraps_claude_bash_calls() {
+        let script = r#"source /Users/x/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cargo test --lib && echo '\''done'\''' < /dev/null && pwd -P >| /tmp/claude-9ac9-cwd"#;
+        let args: Vec<String> = vec!["/bin/zsh".into(), "-c".into(), script.into()];
+        assert_eq!(command_text(&args), "cargo test --lib && echo 'done'");
+        let plain: Vec<String> = vec!["npm".into(), "run".into(), "dev".into()];
+        assert_eq!(command_text(&plain), "npm run dev");
+    }
     static NEXT: AtomicU32 = AtomicU32::new(1);
     struct Fixture {
         core: Arc<Core>,
@@ -968,6 +1120,7 @@ mod tests {
                 schedules: Mutex::new(Vec::new()),
                 runs: Mutex::new(Vec::new()),
                 ready: Mutex::new(HashSet::new()),
+                tty_prompts: Mutex::new(HashMap::new()),
                 config_dir: dir.clone(),
                 home_dir: dir.clone(),
             });

@@ -11,6 +11,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { wsTransport } from "./transport";
 import { trackReadiness } from "./paneSend";
+import { attentionStatus } from "../teams/teams";
 
 const STORE_KEY = "agentbench.gateways";
 
@@ -139,6 +140,21 @@ export function useFleet(gateways) {
           asks: [...(c.asks ?? []).filter((a) => a.id !== payload.id), payload],
         })),
       );
+      // hibernate/resume: the gateway rebroadcasts the pane list for both;
+      // this just flips the badge without waiting on that round trip
+      t.listen("pane-hibernated", ({ payload }) =>
+        patch2(setConns, url, (c) => ({
+          statuses: { ...c.statuses, [payload.id]: "hibernated" },
+          asks: (c.asks ?? []).filter((a) => a.id !== payload.id),
+          panes: (c.panes ?? []).map((p) => (p.id === payload.id ? { ...p, hibernated: true } : p)),
+        })),
+      );
+      // a terminal dialog (folder trust, computer-use access) blocks the
+      // agent just like a question does — badge the pane until it's answered
+      t.listen("tty-prompt", ({ payload }) => {
+        if (payload.prompt)
+          patch2(setConns, url, (c) => ({ statuses: { ...c.statuses, [payload.id]: "input" } }));
+      });
       // The gateway rebroadcasts the pane list after a create — a pane
       // started on any device shows up everywhere without a reconnect.
       t.listen("panes", ({ payload }) =>
@@ -196,8 +212,18 @@ export function useFleet(gateways) {
     [gateways, conns],
   );
 
+  // Projects otherwise arrive only in the hello snapshot, and reconnectNow
+  // leaves an open socket alone — so a project added from the phone would
+  // stay invisible until the next reconnect.
   const refresh = () => {
-    for (const [, t] of transports.current) t.reconnectNow?.();
+    for (const [url, t] of transports.current) {
+      t.reconnectNow?.();
+      t.invoke("list_projects")
+        .then((projects) => {
+          if (Array.isArray(projects)) patch2(setConns, url, () => ({ projects }));
+        })
+        .catch(() => {});
+    }
   };
 
   return { machines, refresh };
@@ -215,6 +241,7 @@ export function rollupStatus(statuses) {
   if (statuses.includes("input")) return "input";
   if (statuses.includes("working")) return "working";
   if (statuses.includes("done")) return "done";
+  if (statuses.includes("hibernated")) return "hibernated";
   return statuses[0] ?? "exited";
 }
 
@@ -247,12 +274,15 @@ export function groupPanes(machine) {
       cwd,
       name: named.get(cwd) ?? baseName(cwd),
       panes,
-      status: panes.length ? rollupStatus(panes.map((p) => p.status)) : "idle",
+      // developer seats of a managed team don't light the project up
+      status: panes.length
+        ? rollupStatus(panes.map((p) => attentionStatus(p, p.status, machine.panes)))
+        : "idle",
     }))
     .sort((a, b) => rank(a.status) - rank(b.status) || a.name.localeCompare(b.name));
 }
 
-const rank = (s) => ({ input: 0, working: 1, done: 2, exited: 3, idle: 4 })[s] ?? 5;
+const rank = (s) => ({ input: 0, working: 1, done: 2, hibernated: 3, exited: 4, idle: 5 })[s] ?? 6;
 
 export function baseName(p) {
   return String(p).split(/[\\/]/).filter(Boolean).pop() ?? p;

@@ -17,17 +17,109 @@ pub fn projects_file() -> PathBuf {
 /// commands?, previewPort?, captureTargets? }]. Empty when the desktop has
 /// never run (or predates the mirror).
 pub fn read_projects() -> Vec<Value> {
-    std::fs::read_to_string(projects_file())
+    let list = std::fs::read_to_string(projects_file())
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    normalize_projects(list)
+}
+
+/// Hand-typed paths (web/phone "Add project") arrive as `~/…`; expand them so
+/// one directory is one project — a `~` twin gets its own pane set and its
+/// sessions land under a different slug than the absolute entry's.
+fn normalize_projects(list: Vec<Value>) -> Vec<Value> {
+    let mut index = std::collections::HashMap::new();
+    let mut out: Vec<Value> = Vec::with_capacity(list.len());
+    for mut p in list {
+        let Some(path) = p["path"].as_str().map(str::to_owned) else {
+            out.push(p);
+            continue;
+        };
+        let full = crate::broker::expand_home(&path);
+        p["path"] = json!(full);
+        match index.get(&full) {
+            // Duplicate of an earlier entry: keep whichever carries more
+            // detail (commands, color, …) — a `~` twin is usually the bare
+            // hand-typed one, but sidebar order doesn't guarantee it.
+            Some(&i) => {
+                let keys = |v: &Value| v.as_object().map_or(0, |o| o.len());
+                if keys(&p) > keys(&out[i]) {
+                    out[i] = p;
+                }
+            }
+            None => {
+                index.insert(full, out.len());
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 pub fn write_projects(projects: &Value) -> Result<(), String> {
     let dir = crate::broker::config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let text = serde_json::to_string_pretty(projects).map_err(|e| e.to_string())?;
+    let list = projects.as_array().cloned().unwrap_or_default();
+    let text = serde_json::to_string_pretty(&normalize_projects(list)).map_err(|e| e.to_string())?;
     std::fs::write(projects_file(), text).map_err(|e| e.to_string())
+}
+
+/// One level of folders for the phone's "Add project" browser: the phone has
+/// no picker for the workstation's disk, and typing absolute paths on a phone
+/// keyboard is miserable. Dotfolders are left out; `~` expands to home.
+pub fn list_dirs(path: &str) -> Result<Value, String> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let dir = browse_path(&home, path);
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        // metadata() follows symlinks, so a linked code folder still shows
+        .filter(|e| std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    Ok(json!({
+        "path": dir,
+        "parent": dir.parent(),
+        "home": home,
+        "git": dir.join(".git").exists(),
+        "dirs": names,
+    }))
+}
+
+/// `""`/`~` is home and `~/…` expands; anything else is taken as typed.
+fn browse_path(home: &Path, path: &str) -> PathBuf {
+    let path = path.trim();
+    if path.is_empty() || path == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        home.join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// "New folder" in the phone's project browser: one new folder directly
+/// inside `parent`, then that folder's listing so the browser steps into it.
+/// The name is a single segment — no separators or `..` — so this can't
+/// reach anywhere the browser wasn't already showing.
+pub fn make_dir(parent: &str, name: &str) -> Result<Value, String> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(format!("Not a valid folder name: {name:?}"));
+    }
+    let home = dirs::home_dir().unwrap_or_default();
+    let dir = browse_path(&home, parent);
+    if !dir.is_dir() {
+        return Err(format!("{}: not a folder", dir.display()));
+    }
+    let target = dir.join(name);
+    std::fs::create_dir(&target).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("{name} already exists"),
+        _ => format!("{}: {e}", target.display()),
+    })?;
+    list_dirs(&target.to_string_lossy())
 }
 
 fn mtime_ms(path: &Path) -> u64 {
@@ -519,6 +611,254 @@ pub fn session_stats(project: &str, sid: &str) -> Result<Value, String> {
 /// The agent's closing words in a session, for a notification body that says
 /// what happened instead of only that something did. Tail-bounded like
 /// `session_title` — this runs on every push.
+/// Where Claude Code keeps per-session scratch, including background tasks'
+/// live output: <tmp>/claude-<uid>/<cwd-slug>/<session>/tasks/<task>.output.
+#[cfg(not(unix))]
+fn claude_tmp_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn claude_tmp_roots() -> Vec<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for base in [PathBuf::from("/private/tmp"), PathBuf::from("/tmp"), std::env::temp_dir()] {
+        if let Ok(root) = base.join(format!("claude-{uid}")).canonicalize() {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+/// The live output file of one of a session's background tasks.
+pub fn task_output_path(cwd: &str, sid: &str, task: &str) -> Option<String> {
+    let name = format!("{task}.output");
+    if task.is_empty() || task.contains(['/', '.']) {
+        return None;
+    }
+    let roots = claude_tmp_roots();
+    for root in &roots {
+        let direct = root.join(cwd_slug(cwd)).join(sid).join("tasks").join(&name);
+        if direct.is_file() {
+            return Some(direct.to_string_lossy().into_owned());
+        }
+    }
+    // The slug scheme is Claude Code's to change; fall back to looking in
+    // every project and session directory for the task.
+    for root in &roots {
+        for project in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            for session in std::fs::read_dir(project.path()).into_iter().flatten().flatten() {
+                let candidate = session.path().join("tasks").join(&name);
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// New bytes of a command's output file from `offset` on, for the dock's log
+/// view and the chat's Bash cards to follow. Only output-like files are
+/// readable this way — *.output from background tasks, and the *.log / *.txt
+/// / *.out an agent redirects a long command into, wherever it put them (it
+/// picks /tmp, the scratchpad, or the project). That is no extra reach: a
+/// paired device can already fetch any file through read_file_base64 and
+/// /api/file; the extension check just keeps this op from being a general
+/// reader. A file that shrank (rewritten) restarts from
+/// the top; a first read of a big file starts near its end.
+pub fn tail_output(path: &str, offset: u64) -> Result<Value, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const FIRST: u64 = 256 * 1024;
+    const CHUNK: u64 = 1024 * 1024;
+    let real = Path::new(path).canonicalize().map_err(|e| e.to_string())?;
+    let allowed = real
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "output" | "log" | "txt" | "out"));
+    if !allowed {
+        return Err("not a Claude Code output file".into());
+    }
+    let mut f = std::fs::File::open(&real).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut from = if offset > len { 0 } else { offset };
+    if from == 0 && len > FIRST {
+        from = len - FIRST;
+    }
+    f.seek(SeekFrom::Start(from)).map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    f.take(CHUNK).read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    // Stop short of a UTF-8 sequence split across reads; the rest comes next time.
+    let keep = match std::str::from_utf8(&raw) {
+        Ok(_) => raw.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => raw.len(),
+    };
+    raw.truncate(keep);
+    Ok(json!({
+        "data": String::from_utf8_lossy(&raw),
+        "offset": from + keep as u64,
+        "size": len,
+        "restarted": offset > len,
+    }))
+}
+
+/// Every task on a Claude Code task list (~/.claude/tasks/<list>/<id>.json),
+/// in creation order. Teams share one list per team; see `taskListId`.
+pub fn task_list(list: &str) -> Vec<Value> {
+    let safe: String = list
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".claude").join("tasks").join(safe)) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut tasks: Vec<Value> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|t| t["id"].is_string())
+        .collect();
+    let num = |t: &Value| t["id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(u64::MAX);
+    tasks.sort_by_key(num);
+    tasks
+}
+
+/// One line on what a session is doing right now, for the team sidebar:
+/// its in-progress todo if it keeps a list, else its latest tool call
+/// ("Editing App.jsx", "Running tests"), else the start of what it last said
+/// or was asked. Reads only the transcript's tail, so it's cheap to poll.
+pub fn session_brief(cwd: &str, sid: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+    let path = dirs::home_dir()?
+        .join(".claude")
+        .join("projects")
+        .join(cwd_slug(cwd))
+        .join(format!("{sid}.jsonl"));
+    let mut f = std::fs::File::open(&path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+
+    let mut latest: Option<String> = None;
+    let mut todo: Option<String> = None;
+    for line in text.lines() {
+        let Ok(rec) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        // Sub-agent records describe the sub-agent, not this session.
+        if rec["isSidechain"] == true || rec["isMeta"] == true {
+            continue;
+        }
+        match rec["type"].as_str() {
+            Some("assistant") => {
+                let Value::Array(blocks) = &rec["message"]["content"] else {
+                    continue;
+                };
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("tool_use") => {
+                            let name = b["name"].as_str().unwrap_or("");
+                            if name == "TodoWrite" {
+                                todo = active_todo(&b["input"]);
+                            }
+                            latest = Some(describe_tool(name, &b["input"]));
+                        }
+                        Some("text") => {
+                            if let Some(t) = first_line(b["text"].as_str().unwrap_or("")) {
+                                latest = Some(t);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("user") => {
+                // A prompt (not a tool result) starts a new turn: until the
+                // agent acts on it, "what it's doing" is what it was asked.
+                let prompt = match &rec["message"]["content"] {
+                    Value::String(s) => Some(s.as_str()),
+                    Value::Array(blocks) => blocks
+                        .iter()
+                        .find(|b| b["type"] == "text")
+                        .and_then(|b| b["text"].as_str()),
+                    _ => None,
+                };
+                if let Some(t) = prompt.filter(|t| !is_noise_user_text(t.trim())).and_then(first_line) {
+                    latest = Some(format!("Asked: {t}"));
+                    todo = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    todo.or(latest)
+}
+
+const BRIEF_MAX: usize = 110;
+
+fn active_todo(input: &Value) -> Option<String> {
+    input["todos"].as_array()?.iter().find_map(|t| {
+        (t["status"] == "in_progress").then(|| {
+            t["activeForm"]
+                .as_str()
+                .or(t["content"].as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+    }).filter(|s| !s.is_empty())
+}
+
+fn describe_tool(name: &str, input: &Value) -> String {
+    let s = |k: &str| input[k].as_str().unwrap_or("").trim().to_string();
+    let file = |k: &str| {
+        let p = s(k);
+        Path::new(&p)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or(p)
+    };
+    let out = match name {
+        "Edit" | "MultiEdit" | "NotebookEdit" => format!("Editing {}", file("file_path")),
+        "Write" => format!("Writing {}", file("file_path")),
+        "Read" => format!("Reading {}", file("file_path")),
+        "Bash" => {
+            let d = s("description");
+            if d.is_empty() {
+                format!("Running {}", s("command"))
+            } else {
+                d
+            }
+        }
+        "Grep" => format!("Searching for “{}”", s("pattern")),
+        "Glob" => format!("Finding {}", s("pattern")),
+        "Task" | "Agent" => format!("Delegating: {}", s("description")),
+        "WebFetch" => format!("Fetching {}", s("url")),
+        "WebSearch" => format!("Searching the web: {}", s("query")),
+        "TodoWrite" => "Updating its todo list".to_string(),
+        "SendMessage" => "Messaging a teammate".to_string(),
+        n if n.starts_with("mcp__") => {
+            format!("Using {}", n.rsplit("__").next().unwrap_or(n))
+        }
+        n => format!("Using {n}"),
+    };
+    clip(&out, BRIEF_MAX)
+}
+
+fn first_line(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(clip(line.trim_start_matches('#').trim(), BRIEF_MAX))
+}
+
 pub fn last_assistant_text(cwd: &str, sid: &str) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 192 * 1024;

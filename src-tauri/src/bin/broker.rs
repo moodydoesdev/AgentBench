@@ -45,6 +45,9 @@ fn normalize_listen(raw: &str) -> String {
 }
 
 fn main() {
+    // agents launched from here must never look like children of whatever
+    // Claude session started the broker (see scrub_claude_env)
+    broker::scrub_claude_env();
     let mut listen = std::env::var("AGENTBENCH_BROKER_LISTEN")
         .ok()
         .map(|s| normalize_listen(&s))

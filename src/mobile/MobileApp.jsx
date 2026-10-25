@@ -1,30 +1,57 @@
 import { Fragment, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowClockwise,
+  ArrowUp,
+  ArrowsInLineVertical,
+  ArrowsOutLineVertical,
   Bell,
   CalendarCheck,
+  CaretDown,
   CaretLeft,
+  CaretRight,
   Desktop,
+  Folder,
+  FolderPlus,
+  Gauge,
   Gear,
   Globe,
   HandPalm,
+  House,
+  ListDashes,
+  Moon,
   Play,
   Plugs,
   Plus,
+  Rows,
+  SignOut,
   SquaresFour,
   Trash,
+  UsersThree,
   WarningCircle,
 } from "@phosphor-icons/react";
 import ChatView from "../chat/ChatView";
 import LogView from "./LogView";
 import ChangesView from "./ChangesView";
 import UsageView from "./UsageView";
+import TeamTasks, { TeamBoard } from "./TeamTasks";
+import Decisions from "../teams/Decisions";
 
 // The MDX toolchain behind plan rendering is the heaviest dependency in the
 // app; almost every session never opens a plan, so it loads on first use.
 const PlanView = lazy(() => import("./PlanView"));
+// xterm is heavy; only a visit that opens a terminal pays for it
+const MobileTerm = lazy(() => import("./MobileTerm"));
 import { TransportProvider } from "../lib/TransportContext";
 import { pairWithGateway } from "../lib/transport";
+import {
+  createPasskey,
+  listPasskeys,
+  passkeyCancelled,
+  passkeyDeviceName,
+  passkeySupported,
+  removePasskey,
+  signInWithPasskey,
+} from "../lib/passkey";
 import { sendToPane } from "../lib/paneSend";
 import {
   DAY_LABELS,
@@ -35,6 +62,7 @@ import {
   freshSchedule,
 } from "../lib/scheduleFormat";
 import { BUILTIN_HARNESSES } from "../settings";
+import { isMutedSeat } from "../teams/teams";
 import { THEMES, getTheme } from "../themes";
 import { applyTheme, loadThemeId, saveThemeId } from "./theme";
 import {
@@ -60,6 +88,7 @@ const STATUS_LABEL = {
   done: "done",
   input: "needs input",
   exited: "exited",
+  hibernated: "hibernated",
 };
 
 const ACTIVITY_KEY = "agentbench.activity";
@@ -83,22 +112,34 @@ function waitingItems(machines) {
   for (const m of machines) {
     for (const pane of m.panes ?? []) {
       const ask = (m.asks ?? []).some((a) => a.id === pane.id);
-      if (!ask && m.statuses?.[pane.id] !== "input") continue;
+      // a managed team's developer seats report to their manager, not here
+      if (!ask && (m.statuses?.[pane.id] !== "input" || isMutedSeat(pane, m.panes))) continue;
       out.push({ machine: m, pane, ask });
     }
   }
   return out;
 }
 
+/** A pane's display name: a team seat's role (matching the desktop, which
+    labels seat panes by role), else the session title, else harness + id. */
+function paneName(machine, pane) {
+  return (
+    pane.team?.role ||
+    (machine.titles?.[pane.id] ?? pane.title) ||
+    `${pane.harness ?? "agent"} ${pane.id}`
+  );
+}
+
 /** The one shape ChatScreen needs, built the same from every entry point. */
 function paneOpen(machine, pane) {
-  const title = machine.titles?.[pane.id] ?? pane.title;
   return {
     url: machine.url,
     paneId: pane.id,
     cwd: pane.cwd,
-    label: title || `${pane.harness ?? "agent"} ${pane.id}`,
-    subtitle: `${pane.harness ?? "agent"} ${pane.id}`,
+    label: paneName(machine, pane),
+    subtitle: pane.team
+      ? `${pane.team.team} · ${pane.harness ?? "agent"} ${pane.id}`
+      : `${pane.harness ?? "agent"} ${pane.id}`,
     kind: pane.kind,
     harness: pane.harness ?? null,
     chat: isChatPane(pane),
@@ -374,7 +415,7 @@ export default function MobileApp() {
   useEffect(() => {
     const q = new URLSearchParams(location.search);
     const t = q.get("tab");
-    if (t === "activity" || t === "settings") setTab(t);
+    if (t === "activity" || t === "usage" || t === "settings") setTab(t);
     if (t || q.get("pane"))
       // history.state, not null — see the pairing consume above
       history.replaceState(history.state, "", location.pathname + location.hash);
@@ -452,9 +493,16 @@ export default function MobileApp() {
   }, []);
 
   // Activity feed: one entry per agent event across every machine.
+  const machinesRef = useRef(machines);
+  machinesRef.current = machines;
   useEffect(() => {
     const offs = [];
-    const push = (m, paneId, kind) =>
+    const push = (m, paneId, kind) => {
+      // Only a managed team's manager reports to the user; read the live
+      // pane list, since this listener outlives the render that attached it.
+      const live = machinesRef.current.find((x) => x.url === m.url) ?? m;
+      const pane = (live.panes ?? []).find((p) => p.id === paneId);
+      if (kind !== "ask" && isMutedSeat(pane, live.panes)) return;
       setActivity((list) =>
         [
           {
@@ -469,6 +517,7 @@ export default function MobileApp() {
           ...list,
         ].slice(0, 100),
       );
+    };
     for (const m of machines) {
       if (!m.transport) continue;
       offs.push(
@@ -555,6 +604,7 @@ export default function MobileApp() {
               setPaneSheet({ url: machine.url, paneId: pane.id })
             }
             onAdd={() => setTab("settings")}
+            onRefresh={refresh}
           />
         )}
         {tab === "activity" && (
@@ -566,6 +616,7 @@ export default function MobileApp() {
             onClear={() => setActivity([])}
           />
         )}
+        {tab === "usage" && <UsageScreen machines={machines} />}
         {tab === "settings" && (
           <SettingsScreen
             gateways={gateways}
@@ -580,6 +631,7 @@ export default function MobileApp() {
       <nav className="mob-tabs">
         <TabButton icon={SquaresFour} label="Fleet" on={tab === "fleet"} onClick={() => setTab("fleet")} />
         <TabButton icon={Bell} label="Activity" badge={unread} on={tab === "activity"} onClick={() => setTab("activity")} />
+        <TabButton icon={Gauge} label="Usage" on={tab === "usage"} onClick={() => setTab("usage")} />
         <TabButton icon={Gear} label="Settings" on={tab === "settings"} onClick={() => setTab("settings")} />
       </nav>
 
@@ -606,6 +658,8 @@ export default function MobileApp() {
           pane={open}
           closing={closingPane}
           onBack={requestBack}
+          // a resumed agent comes back under a new pane id
+          onReopen={(id) => setOpen((o) => (o ? { ...o, paneId: id } : o))}
         />
       )}
     </div>
@@ -650,7 +704,6 @@ function WaitingSection({ waiting, onOpen, onActions }) {
         <span>Waiting on you</span>
       </div>
       {waiting.map(({ machine, pane, ask }) => {
-        const title = machine.titles?.[pane.id] ?? pane.title;
         return (
           <PaneRow
             key={`${machine.url}-${pane.id}`}
@@ -659,10 +712,9 @@ function WaitingSection({ waiting, onOpen, onActions }) {
             onHold={() => onActions(machine, pane)}
           >
             <span className="mob-agent-name">
-              <span className="mob-agent-title">
-                {title || `${pane.harness ?? "agent"} ${pane.id}`}
-              </span>
+              <span className="mob-agent-title">{paneName(machine, pane)}</span>
               <span className="mob-agent-id">
+                {pane.team ? `${pane.team.team} · ` : ""}
                 {baseName(pane.cwd)} · {machine.machine ?? machine.name}
               </span>
             </span>
@@ -674,7 +726,75 @@ function WaitingSection({ waiting, onOpen, onActions }) {
   );
 }
 
-function FleetScreen({ machines, waiting, onOpen, onActions, onAdd }) {
+/** Does one pane match the fleet search? Role and team included. */
+function paneMatches(machine, pane, needle) {
+  const hay = [
+    pane.team?.role,
+    pane.team?.team,
+    pane.title,
+    pane.harness,
+    String(pane.id),
+    machine.machine ?? machine.name,
+  ];
+  return hay.some((h) => h && String(h).toLowerCase().includes(needle));
+}
+
+/**
+ * Narrow a machine's projects to the search: a project whose name (or path)
+ * matches keeps every agent; otherwise only its matching agents stay, and a
+ * project with none drops out.
+ */
+function filterProjects(machine, projects, query) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return projects;
+  const out = [];
+  for (const proj of projects) {
+    if (proj.name.toLowerCase().includes(needle) || proj.cwd.toLowerCase().includes(needle)) {
+      out.push(proj);
+      continue;
+    }
+    const panes = proj.panes.filter((p) => paneMatches(machine, p, needle));
+    if (panes.length) out.push({ ...proj, panes });
+  }
+  return out;
+}
+
+const COMPACT_KEY = "agentbench.mobile.compact";
+const COLLAPSED_KEY = "agentbench.mobile.collapsed";
+
+function loadCollapsed() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY)) ?? []);
+  } catch {
+    return new Set();
+  }
+}
+
+function FleetScreen({ machines, waiting, onOpen, onActions, onAdd, onRefresh }) {
+  const [query, setQuery] = useState("");
+  const [compact, setCompact] = useState(() => localStorage.getItem(COMPACT_KEY) === "1");
+  // collapsed project cards, keyed `${machine url}|${cwd}` so the same folder
+  // on two machines folds independently
+  const [collapsed, setCollapsed] = useState(loadCollapsed);
+  const toggleCompact = () =>
+    setCompact((c) => {
+      localStorage.setItem(COMPACT_KEY, c ? "0" : "1");
+      return !c;
+    });
+  const toggleCollapsed = (key) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  const collapseAll = (fold) => {
+    const next = new Set();
+    if (fold)
+      for (const m of machines) for (const p of groupPanes(m)) next.add(`${m.url}|${p.cwd}`);
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...next]));
+    setCollapsed(next);
+  };
   if (machines.length === 0) {
     return (
       <div className="mob-empty">
@@ -690,11 +810,47 @@ function FleetScreen({ machines, waiting, onOpen, onActions, onAdd }) {
       </div>
     );
   }
+  const searching = !!query.trim();
+  const anyHit =
+    !searching || machines.some((m) => filterProjects(m, groupPanes(m), query).length > 0);
   return (
-    <div className="mob-fleet">
-      <WaitingSection waiting={waiting} onOpen={onOpen} onActions={onActions} />
+    <div className={`mob-fleet${compact ? " mob-compact" : ""}`}>
+      <div className="mob-fleet-bar">
+        <input
+          className="mob-input mob-search"
+          type="search"
+          placeholder="Search projects and agents…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <button
+          className="mob-icon mob-fleet-tool"
+          onClick={() => collapseAll(collapsed.size === 0)}
+          title={collapsed.size === 0 ? "Collapse all" : "Expand all"}
+        >
+          {collapsed.size === 0 ? <ArrowsInLineVertical size={18} /> : <ArrowsOutLineVertical size={18} />}
+        </button>
+        <button
+          className={`mob-icon mob-fleet-tool${compact ? " on" : ""}`}
+          onClick={toggleCompact}
+          title={compact ? "Comfortable list" : "Compact list"}
+        >
+          {compact ? <Rows size={18} /> : <ListDashes size={18} />}
+        </button>
+      </div>
+      {!searching && <WaitingSection waiting={waiting} onOpen={onOpen} onActions={onActions} />}
+      {!anyHit && <div className="mob-note">Nothing matches “{query.trim()}”.</div>}
       {machines.map((m) => (
-        <MachineSection key={m.url} machine={m} onOpen={onOpen} onActions={onActions} />
+        <MachineSection
+          key={m.url}
+          machine={m}
+          query={query}
+          collapsed={collapsed}
+          onToggle={toggleCollapsed}
+          onOpen={onOpen}
+          onActions={onActions}
+          onRefresh={onRefresh}
+        />
       ))}
     </div>
   );
@@ -1079,7 +1235,6 @@ function PreviewSheet({ project, machine, onClose }) {
 function PaneActionSheet({ machine, pane, onClose, onOpen }) {
   const [confirmKill, setConfirmKill] = useState(false);
   const [error, setError] = useState(null);
-  const title = machine.titles?.[pane.id] ?? pane.title;
   const status = machine.statuses?.[pane.id] ?? "working";
   const chat = isChatPane(pane);
 
@@ -1096,8 +1251,9 @@ function PaneActionSheet({ machine, pane, onClose, onOpen }) {
     <div className="mob-sheet-backdrop" onClick={onClose}>
       <div className="mob-sheet" onClick={(e) => e.stopPropagation()}>
         <div className="mob-sheet-head">
-          <strong>{title || `${pane.harness ?? "agent"} ${pane.id}`}</strong>
+          <strong>{paneName(machine, pane)}</strong>
           <small className="mob-mono">
+            {pane.team ? `${pane.team.team} · ` : ""}
             {baseName(pane.cwd)} · {machine.machine ?? machine.name} ·{" "}
             {STATUS_LABEL[status] ?? status}
           </small>
@@ -1149,16 +1305,49 @@ function PaneActionSheet({ machine, pane, onClose, onOpen }) {
   );
 }
 
-function MachineSection({ machine, onOpen, onActions }) {
-  const projects = groupPanes(machine);
+/**
+ * Cluster a project's panes so a team's seats sit together under the team's
+ * name, manager first, in the order the teams (and loose panes) appear.
+ */
+function clusterTeams(panes) {
+  const groups = [];
+  const byTeam = new Map();
+  for (const pane of panes) {
+    const tid = pane.team?.team_id;
+    if (!tid) {
+      groups.push({ key: `pane-${pane.id}`, name: null, panes: [pane] });
+      continue;
+    }
+    let g = byTeam.get(tid);
+    if (!g) {
+      g = { key: `team-${tid}`, name: pane.team.team, panes: [] };
+      byTeam.set(tid, g);
+      groups.push(g);
+    }
+    g.panes.push(pane);
+  }
+  for (const g of groups)
+    if (g.name)
+      g.panes.sort((a, b) => (b.team?.manager === true) - (a.team?.manager === true));
+  return groups;
+}
+
+function MachineSection({ machine, query = "", collapsed, onToggle, onOpen, onActions, onRefresh }) {
+  const searching = !!query.trim();
+  const projects = filterProjects(machine, groupPanes(machine), query);
+  const [adding, setAdding] = useState(false);
   const [spawnIn, setSpawnIn] = useState(null);
   const [previewIn, setPreviewIn] = useState(null);
   const [schedIn, setSchedIn] = useState(null);
+  const [boardIn, setBoardIn] = useState(null);
   useBackLayer(spawnIn != null, () => setSpawnIn(null));
   useBackLayer(previewIn != null, () => setPreviewIn(null));
   useBackLayer(schedIn != null, () => setSchedIn(null));
+  useBackLayer(boardIn != null, () => setBoardIn(null));
+  useBackLayer(adding, () => setAdding(false));
   const stale =
     machine.protocolVersion != null && machine.protocolVersion !== CLIENT_PROTOCOL;
+  if (searching && projects.length === 0) return null;
   return (
     <section className="mob-machine">
       <div className="mob-machine-head">
@@ -1171,6 +1360,12 @@ function MachineSection({ machine, onOpen, onActions }) {
         <span className="mob-machine-state">
           {machine.connected ? (machine.brokerConnected === false ? "no broker" : "online") : "offline"}
         </span>
+        {machine.connected && !stale && (
+          <button className="mob-machine-add" onClick={() => setAdding(true)}>
+            <Plus size={11} weight="bold" />
+            Project
+          </button>
+        )}
       </div>
 
       {stale && (
@@ -1193,52 +1388,107 @@ function MachineSection({ machine, onOpen, onActions }) {
       )}
 
       {!stale &&
-        projects.map((proj) => (
-          <div key={proj.cwd} className={`mob-card ${proj.status}`}>
-            <div className="mob-card-head">
+        projects.map((proj) => {
+          const key = `${machine.url}|${proj.cwd}`;
+          const folded = !searching && collapsed?.has(key);
+          const asking = proj.panes.some((p) => machine.asks?.some((a) => a.id === p.id));
+          return (
+          <div key={proj.cwd} className={`mob-card ${proj.status}${folded ? " folded" : ""}`}>
+            <button
+              className="mob-card-head"
+              onClick={() => onToggle?.(key)}
+              aria-expanded={!folded}
+            >
+              <CaretDown size={12} weight="bold" className="mob-card-caret" />
               <span className={`mob-dot ${proj.status}`} />
               <strong>{proj.name}</strong>
               <span className="mob-spacer" />
+              {folded && asking && <span className="mob-ask">question</span>}
               <span className="mob-pill">
                 {proj.panes.length
                   ? `${proj.panes.length} agent${proj.panes.length === 1 ? "" : "s"}`
                   : "idle"}
               </span>
-            </div>
-            {proj.panes.map((pane) => (
-              <PaneRow
-                key={pane.id}
-                className="mob-agent"
-                onTap={() => onOpen(paneOpen(machine, pane))}
-                onHold={() => onActions(machine, pane)}
-              >
-                {/* What the session is about beats what it is called: several
-                    agents per project is the norm and they all run the same
-                    harness, so "claude 17" says nothing. */}
-                <span className="mob-agent-name">
-                  {pane.title ? (
-                    <>
-                      <span className="mob-agent-title">{pane.title}</span>
-                      <span className="mob-agent-id">
-                        {pane.harness ?? "agent"} {pane.id}
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      {pane.harness ?? "agent"}{" "}
-                      <span className="mob-agent-id">{pane.id}</span>
-                    </>
-                  )}
-                </span>
-                {!isChatPane(pane) && <span className="mob-agent-kind">log</span>}
-                {machine.asks?.some((a) => a.id === pane.id) && (
-                  <span className="mob-ask">question</span>
+            </button>
+            {!folded && clusterTeams(proj.panes).map((group) => (
+              <Fragment key={group.key}>
+                {group.name && (
+                  <div className="mob-team-head">
+                    <UsersThree size={12} weight="bold" />
+                    <span>{group.name}</span>
+                  </div>
                 )}
-                <span className={`mob-agent-status ${pane.status}`}>
-                  {STATUS_LABEL[pane.status] ?? pane.status}
-                </span>
-              </PaneRow>
+                {group.name && group.panes[0]?.team?.team_id && (
+                  <Decisions
+                    transport={machine.transport}
+                    teamId={group.panes[0].team.team_id}
+                    enabled={machine.connected}
+                    cls="mob-decisions"
+                  />
+                )}
+                {group.name && group.panes[0]?.team?.team_id && (
+                  <TeamTasks
+                    transport={machine.transport}
+                    teamId={group.panes[0].team.team_id}
+                    enabled={machine.connected}
+                    onOpen={() =>
+                      setBoardIn({
+                        teamId: group.panes[0].team.team_id,
+                        name: group.name,
+                        panes: group.panes,
+                      })
+                    }
+                  />
+                )}
+                {group.panes.map((pane) => (
+                  <PaneRow
+                    key={pane.id}
+                    className={`mob-agent${group.name ? " mob-team-member" : ""}`}
+                    onTap={() => onOpen(paneOpen(machine, pane))}
+                    onHold={() => onActions(machine, pane)}
+                  >
+                    {/* What the session is about beats what it is called:
+                        several agents per project is the norm and they all run
+                        the same harness, so "claude 17" says nothing. A team
+                        seat is named by its role — Manager, Developer 1 —
+                        with the session title underneath. */}
+                    <span className="mob-agent-name">
+                      {pane.team ? (
+                        <>
+                          <span className="mob-agent-title">
+                            {pane.team.role}
+                            {pane.team.manager ? " · manager" : ""}
+                          </span>
+                          <span className="mob-agent-id">
+                            {pane.title ?? `${pane.harness ?? "agent"} ${pane.id}`}
+                          </span>
+                        </>
+                      ) : pane.title ? (
+                        <>
+                          <span className="mob-agent-title">{pane.title}</span>
+                          <span className="mob-agent-id">
+                            {pane.harness ?? "agent"} {pane.id}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          {pane.harness ?? "agent"}{" "}
+                          <span className="mob-agent-id">{pane.id}</span>
+                        </>
+                      )}
+                    </span>
+                    {!isChatPane(pane) && <span className="mob-agent-kind">log</span>}
+                    {machine.asks?.some((a) => a.id === pane.id) && (
+                      <span className="mob-ask">question</span>
+                    )}
+                    <span className={`mob-agent-status ${pane.status}`}>
+                      {STATUS_LABEL[pane.status] ?? pane.status}
+                    </span>
+                  </PaneRow>
+                ))}
+              </Fragment>
             ))}
+            {!folded && (
             <div className="mob-card-actions">
               <button className="mob-agent mob-new" onClick={() => setSpawnIn(proj)}>
                 <Plus size={13} weight="bold" />
@@ -1253,8 +1503,20 @@ function MachineSection({ machine, onOpen, onActions }) {
                 <span className="mob-agent-name">Schedules</span>
               </button>
             </div>
+            )}
           </div>
-        ))}
+          );
+        })}
+      {adding && (
+        <AddProjectSheet
+          machine={machine}
+          onClose={() => setAdding(false)}
+          onAdded={() => {
+            setAdding(false);
+            onRefresh?.();
+          }}
+        />
+      )}
       {spawnIn && (
         <NewAgentSheet
           project={spawnIn}
@@ -1273,6 +1535,19 @@ function MachineSection({ machine, onOpen, onActions }) {
           onClose={() => setPreviewIn(null)}
         />
       )}
+      {boardIn && (
+        <TeamBoard
+          transport={machine.transport}
+          teamId={boardIn.teamId}
+          name={boardIn.name}
+          panes={boardIn.panes}
+          onClose={() => setBoardIn(null)}
+          onOpenPane={(pane) => {
+            setBoardIn(null);
+            onOpen(paneOpen(machine, pane));
+          }}
+        />
+      )}
       {schedIn && (
         <SchedulesSheet
           project={schedIn}
@@ -1285,6 +1560,340 @@ function MachineSection({ machine, onOpen, onActions }) {
         />
       )}
     </section>
+  );
+}
+
+/** Join a folder name onto a workstation path in that path's own style. */
+function joinPath(dir, name) {
+  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir.endsWith(sep) ? dir + name : dir + sep + name;
+}
+
+/**
+ * Register a folder on the workstation as a project. The phone can't open a
+ * native picker on that disk, so this browses it a level at a time (or takes
+ * a typed path) and only ever adds a folder the gateway actually listed —
+ * including one it just created there for a brand-new project.
+ */
+function AddProjectSheet({ machine, onClose, onAdded }) {
+  const [listing, setListing] = useState(null);
+  const [manual, setManual] = useState("");
+  const [name, setName] = useState("");
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  // null = closed; a string = the new-folder name being typed
+  const [newDir, setNewDir] = useState(null);
+  const known = new Set((machine.projects ?? []).map((p) => p.path));
+
+  const show = (l) => {
+    setListing(l);
+    setManual(l.path);
+    setName(baseName(l.path));
+  };
+  // a typed path that failed to list, offered as "Create <name>" — the usual
+  // way a brand-new project starts is typing where it should live
+  const [missing, setMissing] = useState(null);
+  const browse = (path) => {
+    setError(null);
+    setMissing(null);
+    machine.transport
+      .invoke("list_dirs", { path })
+      .then(show)
+      .catch((e) => {
+        setError(String(e.message ?? e));
+        const m = path.trim().replace(/[\\/]+$/, "").match(/^(.*[\\/])([^\\/]+)$/);
+        if (m) setMissing({ parent: m[1], name: m[2] });
+      });
+  };
+  const makeDir = async (parent, dirName) => {
+    if (!parent || !dirName) return;
+    setBusy(true);
+    setError(null);
+    try {
+      // lands inside the new folder, ready for "Add this folder"
+      show(await machine.transport.invoke("make_dir", { parent, name: dirName }));
+      setNewDir(null);
+      setMissing(null);
+    } catch (e) {
+      setError(String(e.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => browse(""), [machine.url]);
+
+  const add = async () => {
+    const dir = listing?.path;
+    if (!dir) return;
+    setBusy(true);
+    setError(null);
+    try {
+      // read-modify-write against the registry on disk, not this phone's
+      // hello snapshot, so a project added at the desk meanwhile survives
+      const current = await machine.transport.invoke("list_projects");
+      const list = Array.isArray(current) ? current : [];
+      if (!list.some((p) => p.path === dir)) {
+        await machine.transport.invoke("save_projects", {
+          projects: [...list, { path: dir, name: name.trim() || baseName(dir) }],
+        });
+      }
+      onAdded();
+    } catch (e) {
+      setError(String(e.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const already = listing && known.has(listing.path);
+  return (
+    <div className="mob-sheet-backdrop" onClick={onClose}>
+      <div className="mob-sheet mob-addproj" onClick={(e) => e.stopPropagation()}>
+        <div className="mob-sheet-head">
+          <strong>Add project — {machine.machine ?? machine.name}</strong>
+          <small className="mob-mono">{listing?.path ?? "…"}</small>
+        </div>
+        <form
+          className="mob-addproj-path"
+          onSubmit={(e) => {
+            e.preventDefault();
+            browse(manual);
+          }}
+        >
+          <button
+            type="button"
+            className="mob-icon"
+            disabled={!listing?.parent}
+            onClick={() => browse(listing.parent)}
+            title="Up one folder"
+          >
+            <ArrowUp size={16} />
+          </button>
+          <button type="button" className="mob-icon" onClick={() => browse("")} title="Home">
+            <House size={16} />
+          </button>
+          <input
+            className="mob-input mob-addproj-input"
+            value={manual}
+            onChange={(e) => setManual(e.target.value)}
+            placeholder="~/Code/my-app"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          <button type="submit" className="mob-icon" title="Go">
+            <CaretRight size={16} />
+          </button>
+          <button
+            type="button"
+            className="mob-icon"
+            disabled={!listing}
+            onClick={() => setNewDir((v) => (v === null ? "" : null))}
+            title="New folder"
+          >
+            <FolderPlus size={16} />
+          </button>
+        </form>
+        {newDir !== null && (
+          <form
+            className="mob-addproj-path"
+            onSubmit={(e) => {
+              e.preventDefault();
+              makeDir(listing?.path, newDir.trim());
+            }}
+          >
+            <input
+              className="mob-input mob-addproj-input"
+              value={newDir}
+              onChange={(e) => setNewDir(e.target.value)}
+              placeholder="new-project"
+              autoFocus
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            <button type="submit" className="mob-primary" disabled={busy || !newDir.trim()}>
+              Create
+            </button>
+          </form>
+        )}
+        <div className="mob-addproj-list">
+          {listing?.dirs?.length === 0 && <div className="mob-note">No folders in here.</div>}
+          {listing?.dirs?.map((d) => {
+            const full = joinPath(listing.path, d);
+            return (
+              <button key={d} className="mob-sheet-item" onClick={() => browse(full)}>
+                <span className="mob-addproj-dir">
+                  <Folder size={15} weight={known.has(full) ? "fill" : "regular"} />
+                  {d}
+                </span>
+                {known.has(full) && <small>project</small>}
+              </button>
+            );
+          })}
+        </div>
+        <div className="mob-addproj-foot">
+          <input
+            className="mob-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Project name"
+          />
+          <button
+            className="mob-primary"
+            disabled={!listing || busy || already}
+            onClick={add}
+          >
+            {already ? "Already a project" : busy ? "Adding…" : "Add this folder"}
+          </button>
+        </div>
+        {listing?.git === false && !already && (
+          <div className="mob-sheet-sub">Not a git repo — changes view won't work here</div>
+        )}
+        {error && <div className="mob-warn">{error}</div>}
+        {missing && (
+          <button
+            className="mob-primary"
+            disabled={busy}
+            onClick={() => makeDir(missing.parent, missing.name)}
+          >
+            <FolderPlus size={16} /> Create “{missing.name}” in {missing.parent}
+          </button>
+        )}
+        <button className="mob-sheet-cancel" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Claude plan usage per machine — the same numbers as Claude Code's /usage,
+// read by each gateway for the account logged in there.
+const USAGE_WINDOWS = [
+  ["five_hour", "Current session", "5-hour window"],
+  ["seven_day", "Current week", "All models"],
+  ["seven_day_opus", "Current week", "Opus only"],
+  ["seven_day_sonnet", "Current week", "Sonnet only"],
+];
+
+function usageResets(iso) {
+  if (!iso) return null;
+  const at = new Date(iso);
+  const mins = Math.max(0, Math.round((at - Date.now()) / 60_000));
+  const d = Math.floor(mins / 1440);
+  const h = Math.floor((mins % 1440) / 60);
+  const m = mins % 60;
+  const rel = d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+  const when = at.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+  return `Resets in ${rel} · ${when}`;
+}
+
+function UsageMeterRow({ title, sub, pct, resets }) {
+  const v = Math.max(0, Math.min(100, pct ?? 0));
+  const tone = v >= 90 ? "hot" : v >= 70 ? "warm" : "ok";
+  return (
+    <div className="mob-plan-row">
+      <div className="mob-plan-row-head">
+        <span className="mob-plan-label">
+          <span className="mob-plan-title">{title}</span>
+          <span className="mob-plan-sub">{sub}</span>
+        </span>
+        <span className={`mob-plan-pct ${tone}`}>
+          {Math.round(v)}
+          <small>%</small>
+        </span>
+      </div>
+      <div className={`mob-plan-bar ${tone}`}>
+        <div style={{ width: `${Math.max(v, 1.5)}%` }} />
+      </div>
+      {resets && <div className="mob-plan-reset">{resets}</div>}
+    </div>
+  );
+}
+
+function MachineUsage({ machine }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = () => {
+    if (!machine.connected) return;
+    setBusy(true);
+    machine.transport
+      .invoke("claude_usage")
+      .then((v) => {
+        setData(v);
+        setError(null);
+      })
+      .catch((e) => setError(String(e.message ?? e)))
+      .finally(() => setBusy(false));
+  };
+  useEffect(() => {
+    load();
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, 60_000);
+    return () => clearInterval(t);
+  }, [machine.url, machine.connected]);
+
+  const plan = typeof data?.plan === "string" ? data.plan : null;
+  const extra = data?.extra_usage;
+  const scale = 10 ** (extra?.decimal_places ?? 2);
+  return (
+    <section className="mob-machine">
+      <div className="mob-machine-head">
+        <Desktop size={13} />
+        <span className="mob-machine-name">{machine.machine ?? machine.name ?? baseName(machine.url)}</span>
+        <span className="mob-spacer" />
+        {plan && <span className="mob-machine-state">Claude {plan[0].toUpperCase() + plan.slice(1)}</span>}
+      </div>
+      <div className="mob-card mob-plan">
+        {!machine.connected && <div className="mob-note">Can't reach this machine.</div>}
+        {error && <div className="mob-warn">{error}</div>}
+        {machine.connected && !data && !error && <div className="mob-plan-reset">Loading…</div>}
+        {data &&
+          USAGE_WINDOWS.filter(([k]) => data[k]).map(([k, title, sub]) => (
+            <UsageMeterRow
+              key={k}
+              title={title}
+              sub={sub}
+              pct={data[k].utilization}
+              resets={usageResets(data[k].resets_at)}
+            />
+          ))}
+        {extra?.is_enabled && (
+          <UsageMeterRow
+            title="Extra usage"
+            sub={`${(extra.used_credits / scale).toFixed(2)} / ${(extra.monthly_limit / scale).toFixed(2)} ${extra.currency ?? ""}`}
+            pct={extra.utilization}
+          />
+        )}
+        {machine.connected && (
+          <div className="mob-plan-foot">
+            <span>
+              {data?.fetchedAt &&
+                `Updated ${new Date(data.fetchedAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`}
+            </span>
+            <span className="mob-spacer" />
+            <button className="mob-pill" onClick={load} disabled={busy}>
+              {busy ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function UsageScreen({ machines }) {
+  if (machines.length === 0)
+    return <div className="mob-note">Pair a machine to see its Claude plan usage.</div>;
+  return (
+    <div className="mob-fleet">
+      {machines.map((m) => (
+        <MachineUsage key={m.url} machine={m} />
+      ))}
+    </div>
   );
 }
 
@@ -1605,6 +2214,7 @@ function ChatBody({ machine, pane, status }) {
       cwd={pane.cwd}
       mode={headless ? "stream" : "transcript"}
       agent={agent}
+      name={pane.title}
       initialLines={lines}
       // headless panes ingest images the same way — the gateway writes the
       // photo to a temp file and Claude reads it by path
@@ -1625,11 +2235,46 @@ function ChatBody({ machine, pane, status }) {
   );
 }
 
-function ChatScreen({ machine, pane, closing, onBack }) {
+// A hibernated agent has no process to talk to: its conversation is saved and
+// the pane is a placeholder until it's resumed. Resume relaunches it from the
+// checkpoint under a new pane id, and the screen follows it there.
+function HibernatedBody({ machine, pane, onResumed }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const resume = () => {
+    setBusy(true);
+    setError(null);
+    machine.transport
+      .invoke("resume_hibernated", { id: pane.paneId })
+      .then((res) => onResumed(res?.id ?? pane.paneId))
+      .catch((err) => {
+        setBusy(false);
+        setError(String(err?.message ?? err));
+      });
+  };
+  return (
+    <div className="mob-empty mob-hibernated">
+      <Moon size={34} weight="duotone" />
+      <h2>Hibernated</h2>
+      <p>
+        This agent was put to sleep to free memory. Its conversation is saved —
+        resume to pick up where it left off.
+      </p>
+      <button className="mob-primary" disabled={busy} onClick={resume}>
+        <Play size={14} weight="fill" /> {busy ? "Resuming…" : "Resume"}
+      </button>
+      {error && <p className="mob-hibernated-error">{error}</p>}
+    </div>
+  );
+}
+
+function ChatScreen({ machine, pane, closing, onBack, onReopen }) {
   const [confirmKill, setConfirmKill] = useState(false);
   const [killError, setKillError] = useState(null);
   // The action sheet can open a pane straight onto a tab ("View changes").
   const [view, setView] = useState(pane.view ?? "chat");
+  const termOpened = useRef(false);
+  if (view === "term") termOpened.current = true;
   if (!machine?.transport) {
     return (
       <div className={`mob mob-screen${closing ? " closing" : ""}`}>
@@ -1650,6 +2295,9 @@ function ChatScreen({ machine, pane, closing, onBack }) {
   }
   const status = machine.statuses?.[pane.paneId] ?? "working";
   const chat = pane.chat;
+  const hibernated =
+    status === "hibernated" ||
+    !!(machine.panes ?? []).find((p) => p.id === pane.paneId)?.hibernated;
   return (
     <div className={`mob mob-chat-screen mob-screen${closing ? " closing" : ""}`}>
       <header className="mob-top">
@@ -1704,9 +2352,15 @@ function ChatScreen({ machine, pane, closing, onBack }) {
           </button>
         </div>
       )}
+      {hibernated ? (
+        <HibernatedBody machine={machine} pane={pane} onResumed={(id) => onReopen(id)} />
+      ) : (
+      <>
       <nav className="mob-pane-tabs">
         {[
           ["chat", chat ? "Chat" : "Log"],
+          // headless panes have no pty, so no terminal to show
+          ...(pane.kind !== "chat" ? [["term", "Term"]] : []),
           ["changes", "Changes"],
           ...(chat ? [["plan", "Plan"]] : []),
           // session_stats sums a Claude transcript; Codex rollouts differ
@@ -1741,6 +2395,15 @@ function ChatScreen({ machine, pane, closing, onBack }) {
           />
         )}
       </div>
+      {/* mounted on first visit, then kept (hidden) so the scrollback and
+          the pty size survive a peek at another tab */}
+      {termOpened.current && (
+        <div className="mob-pane-view" style={view === "term" ? undefined : { display: "none" }}>
+          <Suspense fallback={<div className="mob-note" style={{ margin: 14 }}>Loading terminal…</div>}>
+            <MobileTerm transport={machine.transport} pane={pane} visible={view === "term"} />
+          </Suspense>
+        </div>
+      )}
       {view === "changes" && (
         <div className="mob-pane-view">
           <ChangesView transport={machine.transport} cwd={pane.cwd} />
@@ -1765,6 +2428,8 @@ function ChatScreen({ machine, pane, closing, onBack }) {
         <div className="mob-pane-view">
           <UsageView transport={machine.transport} cwd={pane.cwd} sid={pane.session} />
         </div>
+      )}
+      </>
       )}
     </div>
   );
@@ -1793,7 +2458,7 @@ function ActivityScreen({ items, readAt, machines, onOpen, onClear }) {
       {items.map((a) => {
         const m = machines.find((x) => x.url === a.url);
         const pane = m?.panes?.find((p) => String(p.id) === String(a.paneId));
-        const title = m?.titles?.[a.paneId] ?? pane?.title;
+        const title = pane && m ? paneName(m, pane) : m?.titles?.[a.paneId];
         return (
           <button
             key={a.key}
@@ -1997,7 +2662,113 @@ function PushRow({ gateway, machines }) {
   );
 }
 
+/**
+ * Passkeys for the machine serving this page. WebAuthn binds a passkey to the
+ * page's host, so only the same-origin gateway can have them managed here.
+ */
+function PasskeysCard({ gateway }) {
+  const [keys, setKeys] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState(null);
+
+  const refresh = () =>
+    listPasskeys(gateway.token)
+      .then(setKeys)
+      .catch((err) => setNote(String(err.message ?? err)));
+  useEffect(() => {
+    refresh();
+  }, [gateway.token]);
+
+  const add = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      await createPasskey(gateway.token, passkeyDeviceName());
+      setNote("Passkey created — use it next time you sign in.");
+      await refresh();
+    } catch (err) {
+      if (!passkeyCancelled(err)) setNote(String(err.message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const host = window.location.hostname;
+  const mine = (keys ?? []).filter((k) => k.rpId === host);
+  return (
+    <div className="mob-card">
+      <p className="mob-note" style={{ padding: "0 0 8px" }}>
+        Sign in to {host} with Face ID or your device PIN instead of the
+        password. Passkeys sync through your password manager.
+      </p>
+      {mine.map((k) => (
+        <div key={k.id} className="mob-card-head" style={{ padding: "4px 0" }}>
+          <strong>{k.name}</strong>
+          <span className="mob-spacer" />
+          <span className="mob-mono">
+            {k.lastUsed ? `used ${new Date(k.lastUsed).toLocaleDateString()}` : "unused"}
+          </span>
+          <button
+            className="mob-icon"
+            aria-label="Remove passkey"
+            disabled={busy}
+            onClick={async () => {
+              if (!confirm(`Remove the passkey "${k.name}"?`)) return;
+              await removePasskey(gateway.token, k.id).catch(() => {});
+              refresh();
+            }}
+          >
+            <Trash size={16} />
+          </button>
+        </div>
+      ))}
+      <button
+        className="mob-sheet-item"
+        style={{ justifyContent: "center", marginTop: 8, marginBottom: 0 }}
+        disabled={busy}
+        onClick={add}
+      >
+        {busy ? "…" : "Add a passkey"}
+      </button>
+      {note && <div className="mob-note">{note}</div>}
+    </div>
+  );
+}
+
+/** Sign in to the machine serving this page with a passkey, no QR needed. */
+function PasskeySignIn({ gateways, onChange }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const here = window.location.origin;
+  const signIn = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await signInWithPasskey(`${deviceName()} (passkey)`);
+      onChange([
+        ...gateways.filter((g) => g.url !== here),
+        { url: here, token: res.token, name: res.machine ?? here },
+      ]);
+    } catch (err) {
+      if (!passkeyCancelled(err)) setError(String(err.message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <button className="mob-primary" disabled={busy} onClick={signIn}>
+        {busy ? "Signing in…" : `Sign in to ${window.location.hostname} with a passkey`}
+      </button>
+      {error && <div className="mob-warn">{error}</div>}
+    </>
+  );
+}
+
 function SettingsScreen({ gateways, machines, onChange, theme, onTheme }) {
+  const here = passkeySupported()
+    ? gateways.find((g) => g.url === window.location.origin)
+    : null;
   const [url, setUrl] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -2035,17 +2806,32 @@ function SettingsScreen({ gateways, machines, onChange, theme, onTheme }) {
               <strong>{live?.machine ?? g.name}</strong>
               <span className="mob-spacer" />
               <button
-                className="mob-icon"
-                aria-label="Forget machine"
-                onClick={() => onChange(gateways.filter((x) => x.url !== g.url))}
+                className="mob-signout"
+                onClick={() => {
+                  if (!confirm(`Sign out of ${live?.machine ?? g.name}?`)) return;
+                  signOut(g);
+                  onChange(gateways.filter((x) => x.url !== g.url));
+                }}
               >
-                <Trash size={16} />
+                <SignOut size={16} />
+                Sign out
               </button>
             </div>
             <div className="mob-mono">{g.url}</div>
           </div>
         );
       })}
+
+      {passkeySupported() && !here && (
+        <PasskeySignIn gateways={gateways} onChange={onChange} />
+      )}
+
+      {here && (
+        <>
+          <h2>Passkeys</h2>
+          <PasskeysCard gateway={here} />
+        </>
+      )}
 
       <h2>Notifications</h2>
       {!pushSupported() ? (
@@ -2138,6 +2924,25 @@ function SettingsScreen({ gateways, machines, onChange, theme, onTheme }) {
       </button>
     </div>
   );
+}
+
+/**
+ * Revoke this phone's token on the machine (best effort — an unreachable
+ * machine is still forgotten locally) and drop the web login's copy, or the
+ * browser at that address would sign straight back in.
+ */
+function signOut(gateway) {
+  fetch(`${gateway.url.replace(/\/+$/, "")}/api/logout`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${gateway.token}` },
+  }).catch(() => {});
+  if (gateway.url === window.location.origin) {
+    try {
+      localStorage.removeItem("agentbench.web.token");
+    } catch {
+      /* nothing stored */
+    }
+  }
 }
 
 function deviceName() {

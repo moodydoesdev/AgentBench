@@ -7,12 +7,17 @@
 //! authentication, a phone-shaped event fan-out, and filesystem reads that
 //! never touch the broker at all.
 
+pub mod dictate;
+pub mod speak;
 pub mod links;
 pub mod net;
+pub mod passkeys;
 pub mod preview;
 pub mod push;
 pub mod rewrite;
 pub mod tokens;
+pub mod uploads;
+pub mod usage;
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -55,6 +60,20 @@ const ALLOWED_OPS: &[&str] = &[
     "schedule-save",
     "schedule-delete",
     "schedule-run",
+    "decisions",
+    "decision-answer",
+    // The web UI is the full desktop bench, so the resource panel and
+    // hibernation reach over the wire too. Still allowlisted, still no
+    // `shutdown` — taking the broker down belongs to whoever is at the desk.
+    "resources",
+    "resource-policy",
+    "resource-draft",
+    "resource-pin",
+    "stop-command",
+    "hibernate",
+    "resume-hibernated",
+    "tty-prompt",
+    "answer-tty-prompt",
 ];
 
 /// Broker ops that produce a response line. The rest are fire-and-forget —
@@ -80,6 +99,17 @@ const REQUEST_OPS: &[&str] = &[
     "schedule-save",
     "schedule-delete",
     "schedule-run",
+    "decisions",
+    "decision-answer",
+    "resources",
+    "resource-policy",
+    "resource-draft",
+    "resource-pin",
+    "stop-command",
+    "hibernate",
+    "resume-hibernated",
+    "tty-prompt",
+    "answer-tty-prompt",
 ];
 
 /// Reads the phone can make that bypass the broker's op vocabulary: plain
@@ -100,6 +130,28 @@ const FS_READS: &[&str] = &[
     "preview_stop",
     "preview_list",
     "preview_detect",
+    // Desktop-UI-in-a-browser additions. save_teams / save_projects are
+    // writes, but only to AgentBench's own registries — a device token
+    // already types into root shells, so these add no new reach.
+    "session_tail",
+    "session_brief",
+    "team_tasks",
+    "list_teams",
+    "save_teams",
+    "save_projects",
+    "list_dirs",
+    // phone "Add project" → New folder; one segment under a listed folder
+    "make_dir",
+    "read_image_data_url",
+    "read_file_base64",
+    "task_output_path",
+    "tail_output",
+    "claude_usage",
+    // local text-to-speech (Kokoro): spoken readouts + read-aloud
+    "speak_text",
+    "speech_prefs",
+    "set_speech_prefs",
+    "speech_voices",
 ];
 
 pub fn gateway_file() -> std::path::PathBuf {
@@ -321,6 +373,20 @@ impl Snapshot {
                     self.statuses.lock().unwrap().insert(id, "input".into());
                 }
             }
+            "pane-hibernated" => {
+                if let Some(id) = id {
+                    self.statuses.lock().unwrap().insert(id, "hibernated".into());
+                    self.asks.lock().unwrap().remove(&id);
+                }
+            }
+            "pane-resumed" => {
+                if let Some(old) = ev["old_id"].as_u64() {
+                    self.statuses.lock().unwrap().remove(&(old as u32));
+                }
+                if let Some(id) = id {
+                    self.statuses.lock().unwrap().insert(id, "working".into());
+                }
+            }
             "turn" => {
                 if let Some(id) = id {
                     let active = ev["active"].as_bool().unwrap_or(false);
@@ -387,11 +453,14 @@ struct PaneContext {
     title: Option<String>,
     cwd: Option<String>,
     sid: Option<String>,
+    /// developer seat of a managed team: reports to its manager, not the user
+    muted: bool,
 }
 
 pub struct Gateway {
     pub broker: Arc<BrokerLink>,
     pub tokens: TokenStore,
+    pub passkeys: passkeys::Passkeys,
     pub snapshot: Snapshot,
     pub push: push::Push,
     pub previews: preview::Previews,
@@ -406,6 +475,7 @@ impl Gateway {
         let gw = Arc::new(Gateway {
             broker,
             tokens: TokenStore::load(),
+            passkeys: passkeys::Passkeys::load(),
             snapshot: Snapshot::new(),
             push: push::Push::load(),
             previews: preview::Previews::new(),
@@ -433,7 +503,13 @@ impl Gateway {
                         // ourselves or phones stay blind to it until reconnect.
                         // Spawned: broadcast_panes round-trips the broker, and
                         // stalling this loop would delay every other event.
-                        if ev["ev"] == "schedule-run" {
+                        // Hibernate/resume change the pane list too (resume
+                        // even swaps the id), and neither comes with a create
+                        // op the gateway would see.
+                        if ev["ev"] == "schedule-run"
+                            || ev["ev"] == "pane-hibernated"
+                            || ev["ev"] == "pane-resumed"
+                        {
                             let gw = tracker.clone();
                             tokio::spawn(async move { gw.broadcast_panes().await });
                         }
@@ -464,12 +540,25 @@ impl Gateway {
             },
             // a pending question is the most interruption-worthy thing there is
             "ask" => ("Question waiting", "asked you something", "ask"),
+            // a team manager filed something only the user can settle
+            "decision" if ev["fresh"].as_bool() == Some(true) => {
+                ("Decision needed", "needs a decision", "decision")
+            }
+            // a terminal dialog (trust folder, computer-use access) appearing
+            "tty-prompt" if ev["fresh"].as_bool() == Some(true) && ev["prompt"].is_object() => {
+                ("Approval needed", "needs your approval", "input")
+            }
             _ => return,
         };
 
         // Name the pane by what it is working on; a bare number in a
         // notification is useless.
         let ctx = self.pane_context(id).await;
+        // a managed team's developers report to their manager; only the
+        // manager's turns are worth a phone buzz
+        if kind == "agent-event" && ctx.muted {
+            return;
+        }
         let heading = ctx
             .title
             .clone()
@@ -503,6 +592,14 @@ impl Gateway {
                 }
             }
             tool_id = ev["tool_id"].as_str().map(String::from);
+        } else if kind == "decision" {
+            if let Some(q) = ev["decision"]["question"].as_str() {
+                body = Some(format!("{}: {}", ev["decision"]["id"].as_str().unwrap_or("Decision"), q.trim()));
+            }
+        } else if kind == "tty-prompt" {
+            if let Some(t) = ev["prompt"]["title"].as_str() {
+                body = Some(format!("{heading}: {}", t.trim()));
+            }
         } else if tag == "done" {
             if let (Some(cwd), Some(sid)) = (&ctx.cwd, &ctx.sid) {
                 body = fsdata::last_assistant_text(cwd, sid)
@@ -563,7 +660,16 @@ impl Gateway {
                     .then(|| fsdata::newest_session_id(&cwd))
                     .flatten()
             });
+        let team = &pane["team"];
+        let muted = team.is_object()
+            && team["manager"].as_bool() != Some(true)
+            && (team["muted"].as_bool() == Some(true)
+                || panes.iter().any(|p| {
+                    p["team"]["manager"].as_bool() == Some(true)
+                        && p["team"]["team_id"] == team["team_id"]
+                }));
         PaneContext {
+            muted,
             title: pane_title(pane, &solo),
             project: name,
             sid,
@@ -647,9 +753,25 @@ impl Gateway {
                 let mut out = Vec::with_capacity(list.len());
                 for p in list {
                     if let Some(id) = p["id"].as_u64() {
-                        self.snapshot.seed_pane(id as u32);
+                        if p["hibernated"].as_bool() == Some(true) {
+                            self.snapshot.statuses.lock().unwrap().insert(id as u32, "hibernated".into());
+                        } else {
+                            self.snapshot.seed_pane(id as u32);
+                        }
                     }
                     let title = pane_title(&p, &solo);
+                    // A team seat names the pane (Manager, Developer 1, …).
+                    // Slim projection: the seat also carries its full launch
+                    // prompt, which would bloat every hello for nothing.
+                    let team = p["team"].as_object().map(|t| {
+                        json!({
+                            "team_id": t.get("team_id"),
+                            "team": t.get("team"),
+                            "role": t.get("role"),
+                            "manager": t.get("manager").and_then(Value::as_bool).unwrap_or(false),
+                            "muted": t.get("muted").and_then(Value::as_bool).unwrap_or(false),
+                        })
+                    });
                     out.push(json!({
                         "id": p["id"],
                         "cwd": p["cwd"],
@@ -659,11 +781,16 @@ impl Gateway {
                         // what the session is about, so the fleet can say more
                         // than "claude 17"
                         "title": title,
+                        // who the session is, when it holds a team seat
+                        "team": team,
                         // lets the phone ask for this session's stats
                         "session": p["session"],
                         // false while the harness is still booting — the
                         // composer holds sends until the pane-ready event
                         "ready": p["ready"],
+                        // asleep: transcript checkpointed, process gone — the
+                        // phone offers Resume instead of a dead chat
+                        "hibernated": p["hibernated"].as_bool().unwrap_or(false),
                     }));
                 }
                 Value::Array(out)
@@ -734,6 +861,11 @@ impl Gateway {
                 self.pane_buffer(id, limit.min(512 * 1024)).await
             }
             "save_image" => save_image(args["dataUrl"].as_str().unwrap_or_default()),
+            "claude_usage" => usage::claude_usage().await,
+            "speak_text" => speak::synth_json(args.clone()).await,
+            "speech_voices" => speak::eleven_voices().await,
+            "speech_prefs" => Ok(speak::prefs()),
+            "set_speech_prefs" => speak::set_prefs(&args["prefs"]),
             "git_changes" => fsdata::git_changes(args["cwd"].as_str().unwrap_or_default()),
             "session_stats" => fsdata::session_stats(
                 project,
@@ -764,6 +896,43 @@ impl Gateway {
             }
             "preview_list" => Ok(self.previews.list().await),
             "preview_detect" => self.preview_detect(args["cwd"].as_str().unwrap_or_default()).await,
+            // Desktop-UI-in-a-browser reads, mirroring the Tauri commands of
+            // the same names in lib.rs.
+            "session_tail" => Ok(json!(fsdata::last_assistant_text(
+                project,
+                args["sid"].as_str().unwrap_or_default(),
+            ))),
+            "session_brief" => Ok(json!(fsdata::session_brief(
+                project,
+                args["sid"].as_str().unwrap_or_default(),
+            ))),
+            "team_tasks" => Ok(json!(fsdata::task_list(
+                args["list"].as_str().unwrap_or_default(),
+            ))),
+            "list_teams" => fsdata::read_teams(project),
+            "save_teams" => fsdata::write_teams(project, &args["teams"]).map(|_| json!(true)),
+            "save_projects" => fsdata::write_projects(&args["projects"]).map(|_| json!(true)),
+            "list_dirs" => fsdata::list_dirs(args["path"].as_str().unwrap_or_default()),
+            "make_dir" => fsdata::make_dir(
+                args["parent"].as_str().unwrap_or_default(),
+                args["name"].as_str().unwrap_or_default(),
+            ),
+            "read_image_data_url" => read_image_data_url(args["path"].as_str().unwrap_or_default()),
+            "read_file_base64" => {
+                use base64::Engine;
+                std::fs::read(args["path"].as_str().unwrap_or_default())
+                    .map(|b| json!(base64::engine::general_purpose::STANDARD.encode(b)))
+                    .map_err(|e| e.to_string())
+            }
+            "task_output_path" => Ok(json!(fsdata::task_output_path(
+                project,
+                args["sid"].as_str().unwrap_or_default(),
+                args["task"].as_str().unwrap_or_default(),
+            ))),
+            "tail_output" => fsdata::tail_output(
+                args["path"].as_str().unwrap_or_default(),
+                args["offset"].as_u64().unwrap_or(0),
+            ),
             // Titles are refined while a session runs, so they are refreshable
             // rather than fixed at connect time.
             "pane_titles" => {
@@ -917,7 +1086,8 @@ impl Gateway {
             }
         }
         if REQUEST_OPS.contains(&op) || acked_write {
-            let result = self.broker.request(fwd).await?;
+            let mut result = self.broker.request(fwd).await?;
+            trim_for_the_wire(op, &mut result);
             if matches!(op, "create" | "create-chat") {
                 if let Some(id) = result.as_u64() {
                     self.snapshot.seed_pane(id as u32);
@@ -929,6 +1099,57 @@ impl Gateway {
             self.broker.send(fwd).await?;
             Ok(None)
         }
+    }
+}
+
+/// How much of a transcript snapshot a remote chat gets up front, and how
+/// many replayed stream-json lines a headless chat pane carries in `list`.
+const WATCH_SNAPSHOT_CAP: usize = 1_500_000;
+const LIST_CHAT_LINES_CAP: usize = 200;
+
+/// The broker's replies are sized for a desktop on loopback; through a tunnel
+/// they are the whole reason a chat "loads slowly". `list` carries every
+/// pane's scrollback (up to 512KB base64 each) plus headless chats' full
+/// stream-json history — terminals fetch their backlog lazily via
+/// `pane_buffer`, so the buffers are dropped outright and chat histories keep
+/// only their tail. `watch` carries the entire transcript JSONL; the tail is
+/// what a chat renders first, so older lines are cut at a line boundary and
+/// the reply says so.
+fn trim_for_the_wire(op: &str, result: &mut Value) {
+    match op {
+        "list" => {
+            if let Value::Array(panes) = result {
+                for p in panes {
+                    if let Some(o) = p.as_object_mut() {
+                        o.remove("buffer");
+                        if let Some(Value::Array(lines)) = o.get_mut("lines") {
+                            if lines.len() > LIST_CHAT_LINES_CAP {
+                                lines.drain(..lines.len() - LIST_CHAT_LINES_CAP);
+                                o.insert("linesTruncated".into(), json!(true));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "watch" => {
+            let Some(text) = result["text"].as_str() else { return };
+            if text.len() <= WATCH_SNAPSHOT_CAP {
+                return;
+            }
+            // land on a char boundary, then on a line boundary — a JSONL
+            // parser must never see half a record
+            let mut start = text.len() - WATCH_SNAPSHOT_CAP;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            let tail = &text[start..];
+            let cut = tail.find('\n').map(|i| i + 1).unwrap_or(0);
+            let trimmed = tail[cut..].to_string();
+            result["text"] = json!(trimmed);
+            result["truncated"] = json!(true);
+        }
+        _ => {}
     }
 }
 
@@ -963,6 +1184,36 @@ fn pane_title(pane: &Value, solo: &std::collections::HashSet<String>) -> Option<
         .map(String::from)
         .or_else(|| solo.contains(cwd).then(|| fsdata::newest_session_id(cwd))?)?;
     fsdata::session_title(cwd, &sid)
+}
+
+/// An image file as a data: URL — mirrors the desktop command of the same
+/// name so the browser's chat composer can stage dropped/staged images.
+fn read_image_data_url(path: &str) -> Result<Value, String> {
+    use base64::Engine;
+    const CAP: u64 = 32 * 1024 * 1024;
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() > CAP {
+        return Err("image is too large to stage (32MB cap)".into());
+    }
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => return Err("not a supported image type".into()),
+    };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(json!(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )))
 }
 
 /// Write an image sent from a phone to a temp file and return its path, so the
@@ -1057,6 +1308,37 @@ mod tests {
         for op in ["", "eval", "exec", "read-file"] {
             assert!(!ALLOWED_OPS.contains(&op));
         }
+    }
+
+    #[test]
+    fn wire_trim_strips_buffers_and_tails_transcripts() {
+        // list: buffers vanish, chat histories keep only their tail
+        let mut list = json!([
+            { "id": 1, "buffer": "AAAA", "cwd": "/x" },
+            { "id": 2, "lines": (0..300).map(|i| json!(i.to_string())).collect::<Vec<_>>() },
+        ]);
+        trim_for_the_wire("list", &mut list);
+        assert!(list[0]["buffer"].is_null());
+        assert_eq!(list[1]["lines"].as_array().unwrap().len(), LIST_CHAT_LINES_CAP);
+        assert_eq!(list[1]["lines"][0], json!("100"));
+        assert_eq!(list[1]["linesTruncated"], json!(true));
+
+        // watch: oversized snapshots are cut on a line boundary and flagged
+        let line = format!("{}\n", "x".repeat(999));
+        let big: String = std::iter::repeat(&line).take(2000).cloned().collect();
+        let mut watch = json!({ "sid": "s", "text": big });
+        trim_for_the_wire("watch", &mut watch);
+        let text = watch["text"].as_str().unwrap();
+        assert!(text.len() <= WATCH_SNAPSHOT_CAP);
+        assert!(text.starts_with('x') && text.ends_with('\n'));
+        assert_eq!(text.len() % 1000, 0, "must hold only whole lines");
+        assert_eq!(watch["truncated"], json!(true));
+
+        // small snapshots pass through untouched
+        let mut small = json!({ "sid": "s", "text": "one\ntwo\n" });
+        trim_for_the_wire("watch", &mut small);
+        assert_eq!(small["text"], json!("one\ntwo\n"));
+        assert!(small["truncated"].is_null());
     }
 
     #[test]

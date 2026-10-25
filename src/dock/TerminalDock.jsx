@@ -1,8 +1,9 @@
 import { useRef } from "react";
 import { ArrowsInSimple, ArrowsOutSimple, ArrowClockwise, Plus, X } from "@phosphor-icons/react";
 import { XtermInner } from "../AgentPane";
+import LogView from "./LogView";
 import { isTerminalReport } from "../lib/terminalReports";
-import { tauriTransport } from "../lib/transport";
+import { useTransport } from "../lib/TransportContext";
 
 // Bottom terminal dock, Claude-Code-Desktop style: a tab strip of plain
 // shells per project, outside the agent grid. Every dock pane stays mounted
@@ -16,7 +17,6 @@ import { tauriTransport } from "../lib/transport";
 // component driving a pty on the other end.
 
 const MIN_H = 120;
-const LOCAL_TRANSPORT = tauriTransport();
 
 export default function TerminalDock({
   panes, // all dock panes for this bench, every project
@@ -26,7 +26,7 @@ export default function TerminalDock({
   // pane ids collide across brokers.
   scope = activePath,
   visible, // this bench's project view is the one on screen
-  transport = LOCAL_TRANSPORT,
+  transport: transportProp,
   open,
   height,
   expanded,
@@ -50,6 +50,10 @@ export default function TerminalDock({
   onTitle,
 }) {
   const dockRef = useRef(null);
+  // Prop wins (linked benches pass their own socket); otherwise the ambient
+  // transport — Tauri IPC on the desktop, the gateway socket in the browser.
+  const ctxTransport = useTransport();
+  const transport = transportProp ?? ctxTransport;
 
   const tabs = panes.filter((p) => p.projectPath === activePath);
   const activeId = tabs.some((p) => p.id === activeTabs[scope])
@@ -129,7 +133,7 @@ export default function TerminalDock({
             <span
               className="dock-tab-x"
               role="button"
-              title="Kill shell and close tab"
+              title={p.kind === "log" ? "Close output tab" : "Kill shell and close tab"}
               onMouseDown={(ev) => {
                 ev.stopPropagation();
                 onCloseTerm(p.id);
@@ -176,6 +180,14 @@ export default function TerminalDock({
           onMouseDown={() => onActivity(p.id)}
           onContextMenu={(ev) => ev.preventDefault()}
         >
+          {p.kind === "log" ? (
+            <LogView
+              path={p.logPath}
+              text={p.logText}
+              termTheme={termTheme}
+              visible={pageVisible && shown && p.projectPath === activePath && p.id === activeId}
+            />
+          ) : (
           <XtermInner
             id={p.id}
             cwd={p.projectPath}
@@ -192,6 +204,7 @@ export default function TerminalDock({
             }}
             onTitle={(t) => onTitle(p.id, t)}
           />
+          )}
         </div>
       ))}
       {tabs.length === 0 && (

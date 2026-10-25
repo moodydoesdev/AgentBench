@@ -2,16 +2,21 @@
 // <project>/.agentbench/teams.json. Edits stay local until Save, which
 // rewrites the whole file. Start/Stop hand off to App, which owns panes.
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/ipc";
 import { X, Plus, Trash, UsersThree, CopySimple, Play, Stop } from "@phosphor-icons/react";
 import {
   blankAgent,
   blankTeam,
+  libraryAgent,
+  managerOf,
   normalizeTeams,
+  presetTeam,
+  ROLE_LIBRARY,
   serializeTeams,
   teamFromPanes,
   validateTeam,
 } from "./teams";
+import { CLAUDE_MODELS, CODEX_MODELS } from "../lib/models";
 
 export default function TeamsDialog({
   project, // {path, name}
@@ -20,11 +25,13 @@ export default function TeamsDialog({
   harnesses, // [{id, name}]
   onClose,
   onSaved, // file written
-  onLaunch, // (team) => start its missing agents
+  onLaunch, // (team, {fresh}) => start its missing agents
+  resumable, // (team) => how many missing agents would continue a saved session
   onStop, // (team) => kill its running agents
 }) {
   const [teams, setTeams] = useState(null); // null while loading
   const [selected, setSelected] = useState(null);
+  const [presetDevs, setPresetDevs] = useState(2);
   const [loadError, setLoadError] = useState(null);
   const [error, setError] = useState(null);
   const [dirty, setDirty] = useState(false);
@@ -64,6 +71,27 @@ export default function TeamsDialog({
         key === "role" && t.defaultTarget === t.agents[i].role ? e.target.value : t.defaultTarget;
       return { ...t, agents, defaultTarget };
     });
+  // one manager at most; making one demotes the previous, and messages
+  // route to it
+  const setManager = (i, on) =>
+    change((t) => {
+      const agents = t.agents.map((a, j) => ({ ...a, manager: j === i && on }));
+      return { ...t, agents, defaultTarget: on ? agents[i].role : t.defaultTarget };
+    });
+  // Append a library role with its preset instructions; a Manager entry
+  // becomes the team's manager only when it doesn't have one yet.
+  const addRole = (name) => {
+    const entry = ROLE_LIBRARY.find((r) => r.role === name);
+    if (!entry) return;
+    change((t) => {
+      const a = libraryAgent(entry, t);
+      return {
+        ...t,
+        agents: [...t.agents, a],
+        defaultTarget: a.manager ? a.role : t.defaultTarget,
+      };
+    });
+  };
   const removeAgent = (i) =>
     change((t) => {
       const agents = t.agents.filter((_, j) => j !== i);
@@ -101,7 +129,7 @@ export default function TeamsDialog({
 
   // Launching uses the saved file's version of the team, so unsaved edits
   // are saved first.
-  const save = async (launch = null) => {
+  const save = async (launch = null, launchOpts = undefined) => {
     for (const t of teams) {
       const problem = validateTeam(t, teams);
       if (problem) {
@@ -118,7 +146,7 @@ export default function TeamsDialog({
         onSaved?.();
       }
       onClose();
-      if (launch) onLaunch?.(launch);
+      if (launch) onLaunch?.(launch, launchOpts);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -182,6 +210,25 @@ export default function TeamsDialog({
               <button className="composer-btn" onClick={() => addTeam(blankTeam(""))}>
                 <Plus size={11} weight="bold" /> New team
               </button>
+              <div className="teams-preset">
+                <button
+                  className="composer-btn"
+                  title="New team with a manager, preset instructions, and messages locked to the manager"
+                  onClick={() => addTeam(presetTeam(presetDevs))}
+                >
+                  <UsersThree size={11} weight="bold" /> Manager +
+                </button>
+                <select
+                  className="composer-input"
+                  aria-label="Developers in the preset team"
+                  value={presetDevs}
+                  onChange={(e) => setPresetDevs(Number(e.target.value))}
+                >
+                  {[1, 2, 3, 4, 5, 6].map((n) => (
+                    <option key={n} value={n}>{n} dev{n > 1 ? "s" : ""}</option>
+                  ))}
+                </select>
+              </div>
               <button
                 className="composer-btn"
                 title="Make a team from the agent panes open in this project"
@@ -214,15 +261,24 @@ export default function TeamsDialog({
                   </label>
                   <label className="composer-label">
                     Messages go to
-                    <select
-                      className="composer-input"
-                      value={team.defaultTarget}
-                      onChange={setField("defaultTarget")}
-                    >
-                      {team.agents.map((a, i) => (
-                        <option key={i} value={a.role}>{a.role || `Agent ${i + 1}`}</option>
-                      ))}
-                    </select>
+                    {managerOf(team) ? (
+                      <input
+                        className="composer-input"
+                        value={`${managerOf(team).role || "Manager"} — runs the team`}
+                        disabled
+                        title="A managed team always fronts its manager; developers only take direction from them"
+                      />
+                    ) : (
+                      <select
+                        className="composer-input"
+                        value={team.defaultTarget}
+                        onChange={setField("defaultTarget")}
+                      >
+                        {team.agents.map((a, i) => (
+                          <option key={i} value={a.role}>{a.role || `Agent ${i + 1}`}</option>
+                        ))}
+                      </select>
+                    )}
                   </label>
                 </div>
 
@@ -248,7 +304,25 @@ export default function TeamsDialog({
                           value={a.model}
                           onChange={setAgent(i, "model")}
                           spellCheck={false}
+                          list={
+                            a.harness === "codex"
+                              ? "teams-models-codex"
+                              : a.harness === "claude"
+                                ? "teams-models-claude"
+                                : undefined
+                          }
                         />
+                        <label
+                          className={`teams-manager${a.manager ? " on" : ""}`}
+                          title="Manager — runs the team, is the only agent you message, and the only one that pings you"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={!!a.manager}
+                            onChange={(e) => setManager(i, e.target.checked)}
+                          />
+                          Manager
+                        </label>
                         <button className="btn-icon" title="Remove agent" onClick={() => removeAgent(i)}>
                           <Trash size={13} />
                         </button>
@@ -264,6 +338,18 @@ export default function TeamsDialog({
                   ))}
                 </div>
 
+                {/* datalists feed the model inputs above; "default" = leave empty */}
+                <datalist id="teams-models-claude">
+                  {CLAUDE_MODELS.filter((m) => m.id !== "default").map((m) => (
+                    <option key={m.id} value={m.id}>{m.label}</option>
+                  ))}
+                </datalist>
+                <datalist id="teams-models-codex">
+                  {CODEX_MODELS.map((m) => (
+                    <option key={m.id} value={m.id}>{m.label}</option>
+                  ))}
+                </datalist>
+
                 <div className="teams-actions">
                   <button
                     className="composer-btn"
@@ -271,6 +357,18 @@ export default function TeamsDialog({
                   >
                     <Plus size={11} weight="bold" /> Add agent
                   </button>
+                  <select
+                    className="composer-input teams-add-role"
+                    aria-label="Add a role from the library"
+                    title="Add a role with preset instructions"
+                    value=""
+                    onChange={(e) => addRole(e.target.value)}
+                  >
+                    <option value="" disabled>Add role…</option>
+                    {ROLE_LIBRARY.map((r) => (
+                      <option key={r.role} value={r.role}>{r.role}</option>
+                    ))}
+                  </select>
                   <button className="composer-btn teams-delete" onClick={deleteTeam}>
                     <Trash size={11} /> Delete team
                   </button>
@@ -284,14 +382,28 @@ export default function TeamsDialog({
                         <Stop size={11} weight="fill" /> Stop
                       </button>
                     )}
+                    {resumable?.(team) > 0 && (
+                      <button
+                        className="composer-btn"
+                        title="Start every missing agent in a new session, leaving their previous conversations behind"
+                        disabled={saving}
+                        onClick={() => save(team, { fresh: true })}
+                      >
+                        Start fresh
+                      </button>
+                    )}
                     <button
                       className="composer-btn primary"
-                      title={dirty ? "Save changes, then start the agents that aren't running" : "Start the agents that aren't running"}
+                      title={
+                        resumable?.(team) > 0
+                          ? "Start the agents that aren't running, continuing each one's last session"
+                          : dirty ? "Save changes, then start the agents that aren't running" : "Start the agents that aren't running"
+                      }
                       disabled={saving}
                       onClick={() => save(team)}
                     >
                       <Play size={11} weight="fill" />
-                      {runningCount(team) > 0 ? " Start missing" : dirty ? " Save & start" : " Start team"}
+                      {runningCount(team) > 0 ? " Start missing" : resumable?.(team) > 0 ? " Reopen team" : dirty ? " Save & start" : " Start team"}
                     </button>
                   </span>
                 </div>

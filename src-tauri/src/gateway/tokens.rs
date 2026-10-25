@@ -15,8 +15,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// manager.
 const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// Wrong password guesses before login locks, and for how long. A password is
+/// durable (unlike a pairing code) so the window has to close hard: five
+/// misses is a fat-fingered human, not a dictionary.
+const LOGIN_MAX_MISSES: u8 = 5;
+const LOGIN_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+
 pub fn tokens_file() -> PathBuf {
     crate::broker::config_dir().join("gateway-tokens.json")
+}
+
+/// Web-login config: the salted password hash plus whether the desktop UI is
+/// served at `/`. Separate from the device list so revoking devices and
+/// changing the password never race each other's writes.
+pub fn auth_file() -> PathBuf {
+    crate::broker::config_dir().join("gateway-auth.json")
 }
 
 fn now_ms() -> u64 {
@@ -53,7 +66,7 @@ pub fn random_code() -> String {
 }
 
 #[cfg(windows)]
-fn fill_random(buf: &mut [u8]) {
+pub(crate) fn fill_random(buf: &mut [u8]) {
     // BCryptGenRandom via the system preferred RNG, declared inline so the
     // gateway needs no extra crate for 32 bytes of entropy.
     #[link(name = "bcrypt")]
@@ -78,7 +91,7 @@ fn fill_random(buf: &mut [u8]) {
 }
 
 #[cfg(unix)]
-fn fill_random(buf: &mut [u8]) {
+pub(crate) fn fill_random(buf: &mut [u8]) {
     use std::io::Read;
     let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
     f.read_exact(buf).expect("read /dev/urandom");
@@ -96,6 +109,29 @@ pub struct Device {
     /// both kinds hold exactly the same capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AuthConfig {
+    /// Random per-password salt, hex. Regenerated whenever the password is set
+    /// so identical passwords across machines still hash differently.
+    #[serde(default)]
+    salt: String,
+    /// sha256(salt + password), hex. Empty means no password is configured and
+    /// password login is refused outright.
+    #[serde(default)]
+    hash: String,
+    /// Whether `/` serves the desktop web UI instead of the phone shell.
+    #[serde(default, rename = "webUi")]
+    web_ui: bool,
+}
+
+/// Wrong-password accounting. In memory only: a gateway restart clears it,
+/// which is fine — restarting requires being on the machine already.
+#[derive(Default)]
+struct LoginGuard {
+    misses: u8,
+    locked_until: u64,
 }
 
 struct PendingCode {
@@ -121,6 +157,9 @@ pub struct TokenStore {
     /// Where to persist. `None` means in-memory only, which is what tests use
     /// so they can exercise pairing without touching the real device list.
     path: Option<PathBuf>,
+    /// Password + web-UI config, persisted separately (see `auth_file`).
+    auth: Mutex<AuthConfig>,
+    login_guard: Mutex<LoginGuard>,
 }
 
 impl TokenStore {
@@ -129,11 +168,17 @@ impl TokenStore {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let auth: AuthConfig = std::fs::read_to_string(auth_file())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         TokenStore {
             devices: Mutex::new(devices),
             pending: Mutex::new(None),
             last_flush: Mutex::new(0),
             path: Some(tokens_file()),
+            auth: Mutex::new(auth),
+            login_guard: Mutex::new(LoginGuard::default()),
         }
     }
 
@@ -144,7 +189,112 @@ impl TokenStore {
             pending: Mutex::new(None),
             last_flush: Mutex::new(0),
             path: None,
+            auth: Mutex::new(AuthConfig::default()),
+            login_guard: Mutex::new(LoginGuard::default()),
         }
+    }
+
+    fn persist_auth(&self) {
+        if self.path.is_none() {
+            return; // ephemeral store (tests)
+        }
+        let auth = self.auth.lock().unwrap();
+        let path = auth_file();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&*auth) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    pub fn has_password(&self) -> bool {
+        !self.auth.lock().unwrap().hash.is_empty()
+    }
+
+    /// Set (or replace) the login password. Only ever called from the loopback
+    /// control surface — the public side can verify, never change.
+    pub fn set_password(&self, password: &str) -> Result<(), String> {
+        let password = password.trim();
+        if password.len() < 8 {
+            return Err("password must be at least 8 characters".into());
+        }
+        let mut salt_bytes = [0u8; 16];
+        fill_random(&mut salt_bytes);
+        let salt: String = salt_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        {
+            let mut auth = self.auth.lock().unwrap();
+            auth.hash = hash(&format!("{salt}{password}"));
+            auth.salt = salt;
+        }
+        *self.login_guard.lock().unwrap() = LoginGuard::default();
+        self.persist_auth();
+        Ok(())
+    }
+
+    pub fn clear_password(&self) {
+        {
+            let mut auth = self.auth.lock().unwrap();
+            auth.hash.clear();
+            auth.salt.clear();
+        }
+        self.persist_auth();
+    }
+
+    pub fn web_ui(&self) -> bool {
+        self.auth.lock().unwrap().web_ui
+    }
+
+    pub fn set_web_ui(&self, on: bool) {
+        self.auth.lock().unwrap().web_ui = on;
+        self.persist_auth();
+    }
+
+    /// Exchange the login password for a device token. Five misses lock the
+    /// endpoint for fifteen minutes — this is the one credential that lives on
+    /// the public internet when a tunnel is up, so the window slams shut.
+    pub fn login(&self, password: &str, device_name: &str) -> Result<String, String> {
+        {
+            let guard = self.login_guard.lock().unwrap();
+            if guard.locked_until > now_ms() {
+                let mins = (guard.locked_until - now_ms()) / 60_000 + 1;
+                return Err(format!("too many attempts — locked for {mins} min"));
+            }
+        }
+        let ok = {
+            let auth = self.auth.lock().unwrap();
+            !auth.hash.is_empty() && hash(&format!("{}{}", auth.salt, password)) == auth.hash
+        };
+        if !ok {
+            let mut guard = self.login_guard.lock().unwrap();
+            guard.misses += 1;
+            if guard.misses >= LOGIN_MAX_MISSES {
+                guard.locked_until = now_ms() + LOGIN_LOCKOUT.as_millis() as u64;
+                guard.misses = 0;
+            }
+            // same message whether no password is set or the guess was wrong —
+            // an unauthenticated caller learns nothing about the config
+            return Err("wrong password".into());
+        }
+        *self.login_guard.lock().unwrap() = LoginGuard::default();
+        Ok(self.mint_web(device_name))
+    }
+
+    /// A fresh device token for a browser that has already proven itself —
+    /// by password above, or by passkey assertion (see `passkeys`).
+    pub fn mint_web(&self, device_name: &str) -> String {
+        let token = random_token();
+        let name = device_name.trim();
+        let name = if name.is_empty() { "Web" } else { name };
+        self.devices.lock().unwrap().push(Device {
+            hash: hash(&token),
+            name: name.chars().take(60).collect(),
+            paired_at: now_ms(),
+            last_seen: now_ms(),
+            kind: Some("web".into()),
+        });
+        self.persist();
+        token
     }
 
     fn persist(&self) {
@@ -263,6 +413,16 @@ impl TokenStore {
             .collect::<Vec<_>>())
     }
 
+    /// Whether a device with this short id (see `token_id`) is still paired.
+    /// The WS bridge polls this so revoking a device drops its live sockets.
+    pub fn device_exists(&self, id: &str) -> bool {
+        self.devices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| d.hash.starts_with(id))
+    }
+
     /// Revoke by the short id shown in the desktop UI.
     pub fn revoke(&self, id: &str) -> bool {
         let mut devices = self.devices.lock().unwrap();
@@ -322,6 +482,53 @@ mod tests {
         let first = store.new_code(false);
         assert_eq!(first, store.new_code(false));
         assert_ne!(first, store.new_code(true));
+    }
+
+    #[test]
+    fn password_login_mints_a_web_device() {
+        let store = TokenStore::ephemeral();
+        // no password configured: login always refuses, and says nothing
+        assert!(store.login("anything", "Web").is_err());
+        store.set_password("correct horse").unwrap();
+        assert!(store.has_password());
+        let token = store.login("correct horse", "Web · test").unwrap();
+        assert!(store.verify(&token));
+        // clearing the password revokes future logins, not existing tokens
+        store.clear_password();
+        assert!(store.login("correct horse", "Web").is_err());
+        assert!(store.verify(&token));
+    }
+
+    #[test]
+    fn short_passwords_are_refused() {
+        let store = TokenStore::ephemeral();
+        assert!(store.set_password("short").is_err());
+        assert!(!store.has_password());
+    }
+
+    #[test]
+    fn five_wrong_passwords_lock_the_endpoint() {
+        let store = TokenStore::ephemeral();
+        store.set_password("correct horse").unwrap();
+        for _ in 0..LOGIN_MAX_MISSES {
+            assert!(store.login("wrong", "Web").is_err());
+        }
+        // even the right password is refused while locked
+        let err = store.login("correct horse", "Web").unwrap_err();
+        assert!(err.contains("locked"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_correct_login_resets_the_miss_counter() {
+        let store = TokenStore::ephemeral();
+        store.set_password("correct horse").unwrap();
+        for _ in 0..LOGIN_MAX_MISSES - 1 {
+            assert!(store.login("wrong", "Web").is_err());
+        }
+        assert!(store.login("correct horse", "Web").is_ok());
+        // the slate is clean: another few typos must not lock immediately
+        assert!(store.login("wrong", "Web").is_err());
+        assert!(store.login("correct horse", "Web").is_ok());
     }
 
     #[test]

@@ -11,6 +11,10 @@ pub mod remote;
 #[cfg(feature = "gui")]
 pub mod dictation;
 
+// Cloudflare tunnel lifecycle. The Settings window starts and stops it; the
+// gateway daemon runs the keep-alive watchdog, so this builds without the GUI.
+pub mod tunnel;
+
 #[cfg(feature = "gui")]
 mod app;
 
