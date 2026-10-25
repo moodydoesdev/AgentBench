@@ -202,7 +202,10 @@ pub fn start(gateway_port: u16) {
 }
 
 async fn listen(s: &Arc<State>, url: &str, gateway_port: u16) -> Result<(), String> {
-    let mut ws = connect_ws(&format!("{url}/v1/listen"), None).await?;
+    // The id rides along so a relay that shards by host (the Cloudflare
+    // Worker routes it to that host's Durable Object) can place us before
+    // we have proven anything; the signature below is still what counts.
+    let mut ws = connect_ws(&format!("{url}/v1/listen?id={}", s.identity.id()), None).await?;
     let challenge = match ws.next().await {
         Some(Ok(Message::Text(t))) => serde_json::from_str::<Value>(&t)
             .ok()

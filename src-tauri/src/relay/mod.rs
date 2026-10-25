@@ -107,9 +107,18 @@ pub async fn connect_ws(url: &str, protocols: Option<&str>) -> Result<Ws, String
     } else {
         Box::new(tcp)
     };
-    let (ws, _) = tokio_tungstenite::client_async(request, io)
-        .await
-        .map_err(|e| format!("{url}: {e}"))?;
+    let (ws, _) = tokio_tungstenite::client_async(request, io).await.map_err(|e| match e {
+        // A relay refuses with an HTTP error whose body says why.
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            let body = resp
+                .body()
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                .filter(|b| !b.is_empty() && b.len() < 200);
+            body.unwrap_or_else(|| format!("{url}: the relay answered {}", resp.status()))
+        }
+        e => format!("{url}: {e}"),
+    })?;
     Ok(ws)
 }
 

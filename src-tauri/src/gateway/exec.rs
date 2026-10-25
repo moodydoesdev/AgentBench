@@ -41,7 +41,11 @@ fn shell(command: &str) -> tokio::process::Command {
 
 pub async fn serve(socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
-    let command = match stream.next().await {
+    let first = stream.next().await;
+    if std::env::var_os("AGENTBENCH_RELAY_DEBUG").is_some() {
+        eprintln!("exec: first frame {first:?}");
+    }
+    let command = match first {
         Some(Ok(Message::Text(t))) => serde_json::from_str::<Value>(&t)
             .ok()
             .and_then(|v| v["command"].as_str().map(String::from)),
@@ -128,7 +132,12 @@ pub async fn serve(socket: WebSocket) {
                     }
                 }
                 Some(Ok(_)) => {}
-                _ => return,
+                other => {
+                    if std::env::var_os("AGENTBENCH_RELAY_DEBUG").is_some() {
+                        eprintln!("exec: client went away: {other:?}");
+                    }
+                    return;
+                }
             },
             status = child.wait(), if !outputs_open => {
                 let code = status.ok().and_then(|s| s.code()).unwrap_or(1);

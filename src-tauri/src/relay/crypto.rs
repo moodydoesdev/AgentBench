@@ -380,6 +380,13 @@ where
     ))
 }
 
+/// AGENTBENCH_RELAY_DEBUG=1 says why each encrypted pipe closed.
+fn debug(msg: &str) {
+    if std::env::var_os("AGENTBENCH_RELAY_DEBUG").is_some() {
+        eprintln!("relay pipe: {msg}");
+    }
+}
+
 fn nonce(counter: u64) -> [u8; 12] {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&counter.to_be_bytes());
@@ -411,30 +418,56 @@ where
                     }
                 }
                 n = pump.read(&mut buf) => {
-                    let n = match n { Ok(0) | Err(_) => break, Ok(n) => n };
+                    let n = match n {
+                        Ok(0) | Err(_) => {
+                            debug(&format!("local side closed after {rx_n} in / {tx_n} out"));
+                            break;
+                        }
+                        Ok(n) => n,
+                    };
                     let Ok(sealed) = send.encrypt(Nonce::from_slice(&nonce(tx_n)), &buf[..n]) else { break };
                     tx_n += 1;
-                    if sink.send(Message::Binary(sealed.into())).await.is_err() {
+                    if let Err(e) = sink.send(Message::Binary(sealed.into())).await {
+                        debug(&format!("send {tx_n} failed: {e}"));
                         break;
                     }
                 }
                 msg = stream.next() => {
                     match msg {
                         Some(Ok(Message::Binary(b))) => {
-                            let Ok(plain) = recv.decrypt(Nonce::from_slice(&nonce(rx_n)), b.as_ref()) else { break };
+                            let Ok(plain) = recv.decrypt(Nonce::from_slice(&nonce(rx_n)), b.as_ref()) else {
+                                debug(&format!("frame {rx_n} failed to decrypt ({} bytes)", b.len()));
+                                break;
+                            };
                             rx_n += 1;
                             if pump.write_all(&plain).await.is_err() {
                                 break;
                             }
                         }
                         Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Text(_))) => {}
-                        _ => break,
+                        other => {
+                            debug(&format!("socket ended after {rx_n} in / {tx_n} out: {other:?}"));
+                            break;
+                        }
                     }
                 }
             }
         }
-        let _ = sink.send(Message::Close(None)).await;
         let _ = pump.shutdown().await;
+        // Close gracefully: send our Close, then keep reading until the other
+        // end closes too. Dropping a TLS socket with its reply still unread
+        // makes the OS send a TCP reset, and a reset makes the far end throw
+        // away frames it had not processed yet — the tail of a command's
+        // output, typically. Bounded, so a silent peer cannot hold us.
+        let _ = sink.send(Message::Close(None)).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(Ok(msg)) = stream.next().await {
+                if msg.is_close() {
+                    break;
+                }
+            }
+        })
+        .await;
     });
     app
 }

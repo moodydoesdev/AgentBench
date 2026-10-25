@@ -19,14 +19,30 @@ linked bench, with its terminals and agents in your sidebar. It is also a
 
 Any server both machines can reach will do. It keeps no state.
 
-**Docker:**
+**On Cloudflare (no server).** `packaging/relay-worker` is the same relay as
+a Worker with Durable Objects. It speaks the same protocol and runs on the
+free plan. To deploy it to a hostname on one of your zones:
+
+```sh
+cd packaging/relay-worker
+npx wrangler@4.149.0 deploy --domain relay.example.com
+```
+
+Cloudflare issues the certificate and creates the DNS record. Check it with
+`curl https://relay.example.com/healthz`. One Durable Object holds each
+host's listening socket and the streams to it, and it only ever forwards
+ciphertext, as the Rust relay does.
+
+**On your own server:**
+
+Docker:
 
 ```sh
 docker build -f packaging/relay/Dockerfile -t agentbench-relay src-tauri
 docker run -d --name agentbench-relay --restart unless-stopped -p 127.0.0.1:8480:8480 agentbench-relay
 ```
 
-**Without Docker:**
+Without Docker:
 
 ```sh
 cd src-tauri && cargo build --release --no-default-features --bin agentbench-relay

@@ -1,0 +1,14 @@
+// The AgentBench relay as a Cloudflare Worker: same protocol as
+// agentbench-relay (src-tauri/src/relay/server.rs), no server to run.
+// Deploy with your own hostname, e.g.:
+//   npx wrangler@4.149.0 deploy --domain relay.example.com
+{
+  "name": "agentbench-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [{ "name": "HOSTS", "class_name": "HostRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HostRoom"] }],
+  "observability": { "enabled": true }
+}
