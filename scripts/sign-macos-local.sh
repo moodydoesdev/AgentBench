@@ -17,7 +17,7 @@ APP="${2:-/Applications/AgentBench.app}"
 [ -d "$APP" ] || { echo "no app at $APP" >&2; exit 1; }
 
 # helpers first (nested code must be signed before the bundle)
-for bin in agentbench-broker agentbench-gateway; do
+for bin in agentbench-broker agentbench-gateway agentbench-relay; do
   p="$APP/Contents/MacOS/$bin"
   [ -f "$p" ] || continue
   codesign --force --sign "$IDENTITY" \
