@@ -240,29 +240,41 @@ async fn listen(s: &Arc<State>, url: &str, gateway_port: u16) -> Result<(), Stri
     *s.error.lock().unwrap() = None;
     eprintln!("relay: listening at {url} as {}", s.identity.id());
 
+    // A connection that died without a close (sleep, a network change, a
+    // router forgetting it) still accepts our pings into the send buffer, so
+    // liveness is judged by what comes back: no frame for 70s, start over.
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(25));
+    let mut heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
-            msg = ws.next() => match msg {
-                Some(Ok(Message::Text(t))) => {
-                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
-                    if let Some(sid) = v["open"].as_str() {
-                        let sid = sid.to_string();
-                        if sid.len() <= 64 && sid.chars().all(|c| c.is_ascii_alphanumeric()) {
-                            let (s, url) = (s.clone(), url.to_string());
-                            tokio::spawn(async move {
-                                if let Err(e) = accept(&s, &url, &sid, gateway_port).await {
-                                    eprintln!("relay: refused a connection: {e}");
-                                }
-                            });
+            msg = ws.next() => {
+                if let Some(Ok(_)) = msg {
+                    heard = tokio::time::Instant::now();
+                }
+                match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                        if let Some(sid) = v["open"].as_str() {
+                            let sid = sid.to_string();
+                            if sid.len() <= 64 && sid.chars().all(|c| c.is_ascii_alphanumeric()) {
+                                let (s, url) = (s.clone(), url.to_string());
+                                tokio::spawn(async move {
+                                    if let Err(e) = accept(&s, &url, &sid, gateway_port).await {
+                                        eprintln!("relay: refused a connection: {e}");
+                                    }
+                                });
+                            }
                         }
                     }
+                    Some(Ok(Message::Close(_))) | None => return Err("the relay dropped the connection".into()),
+                    Some(Err(e)) => return Err(e.to_string()),
+                    _ => {}
                 }
-                Some(Ok(Message::Close(_))) | None => return Err("the relay dropped the connection".into()),
-                Some(Err(e)) => return Err(e.to_string()),
-                _ => {}
             },
             _ = keepalive.tick() => {
+                if heard.elapsed() > std::time::Duration::from_secs(70) {
+                    return Err("the relay stopped answering".into());
+                }
                 if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
                     return Err("the relay dropped the connection".into());
                 }

@@ -101,8 +101,19 @@ export class HostRoom {
       return new Response("too many connections to that bench", { status: 429 });
     }
     const sid = id + hex(crypto.getRandomValues(new Uint8Array(16)));
+    // A listener that went away without a close (the host slept, or its
+    // network changed) throws here; drop it rather than crash the request.
+    try {
+      host.send(JSON.stringify({ open: sid }));
+    } catch {
+      try {
+        host.close(1011, "gone");
+      } catch {
+        // already closed
+      }
+      return new Response("that bench is not connected to this relay", { status: 404 });
+    }
     const res = this.socketPair({ role: "client", sid, opened: Date.now() }, `c:${sid}`);
-    host.send(JSON.stringify({ open: sid }));
     this.ctx.storage.setAlarm(Date.now() + ACCEPT_TIMEOUT_MS);
     return res;
   }
