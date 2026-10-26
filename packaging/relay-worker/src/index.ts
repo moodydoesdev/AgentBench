@@ -50,7 +50,7 @@ export default {
 };
 
 type Attachment =
-  | { role: "listen"; id: string; challenge: string; verified: boolean }
+  | { role: "listen"; id: string; challenge: string; verified: boolean; since?: number }
   | { role: "client"; sid: string; opened: number }
   | { role: "host"; sid: string };
 
@@ -76,10 +76,20 @@ export class HostRoom {
     return res;
   }
 
+  // The newest verified listener. A host that reconnects can leave its old
+  // socket behind in this list when that socket died without a close, so
+  // picking any verified one could pick a dead one.
   private listener(): WebSocket | undefined {
-    return this.ctx
-      .getWebSockets("listen")
-      .find((ws) => (ws.deserializeAttachment() as Attachment & { verified?: boolean }).verified);
+    let best: WebSocket | undefined;
+    let bestSince = -1;
+    for (const ws of this.ctx.getWebSockets("listen")) {
+      const a = ws.deserializeAttachment() as Extract<Attachment, { role: "listen" }>;
+      if (a.verified && (a.since ?? 0) > bestSince) {
+        best = ws;
+        bestSince = a.since ?? 0;
+      }
+    }
+    return best;
   }
 
   // A host proves it owns `id` by signing a challenge with the key the id is
@@ -176,11 +186,17 @@ export class HostRoom {
     // The newest listener wins: a host reconnecting after a network blip
     // replaces its stale half-open socket.
     for (const old of this.ctx.getWebSockets("listen")) {
-      if (old !== ws && (old.deserializeAttachment() as { verified?: boolean }).verified) {
+      if (old === ws) continue;
+      const oa = old.deserializeAttachment() as Extract<Attachment, { role: "listen" }>;
+      if (!oa.verified) continue;
+      try {
+        old.serializeAttachment({ ...oa, verified: false });
         old.close(4000, "replaced by a newer connection");
+      } catch {
+        // already gone
       }
     }
-    ws.serializeAttachment({ ...a, verified: true });
+    ws.serializeAttachment({ ...a, verified: true, since: Date.now() });
     ws.send(JSON.stringify({ ok: true, id: a.id }));
   }
 
